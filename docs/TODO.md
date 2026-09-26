@@ -38,7 +38,7 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 ## Phase 0 · 环境与仓库准备（1 天）
 
-- [x] **T0.1｜安装 Go 工具链（ADR-001 已定案：Go 1.22+）** ｜ 0.5h ｜ 无依赖
+- [x] **T0.1｜安装 Go 工具链（已装 go1.27.0；go.mod 声明 Go 1.25+）** ｜ 0.5h ｜ 无依赖
   - 安装 **Go 1.22+** 并验证 `go version`；目标平台已确认（Windows 10 / 11 + Linux + macOS，见 PRD R9，已关闭）。
   - Rust + Axum 仅作备选记录，不再是默认路径（接口契约、数据模型、流程不变，切换成本可控）。
   - **验收**：`go version`、`go env GOHOSTOS GOHOSTARCH` 正常；版本号记入 DESIGN ADR-001。
@@ -128,28 +128,40 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 ## Phase 2 · 存储与安全加固（2–3 天）
 
-- [ ] **T2.1｜SQLite 接入与迁移** ｜ 3h ｜ 依赖 T1.3
+> **进度：已完成（T2.1–T2.8）**
+> 实测证据：
+> - `go test ./... -count=1` 全绿（新增 crypto / security / store / logging 用例）；
+> - `tools/smoke/phase2.ps1` 端到端冒烟 **19/19 通过**：首次启动生成主密钥、从引导配置导入供应商、
+>   打印网关 Key 明文（仅一次）、用数据库中的 Key 完成透传、错误 Key 401、请求日志落库、
+>   **agora.db 与 WAL 中均检索不到凭证明文**、重启不重复导入且原 Key 仍有效、
+>   `--reset-gateway-key` 后新 Key 可用而旧 Key 立即失效、`allow_internal=false` 时内网地址被拒并启动失败、
+>   **主密钥丢失时启动失败（不静默降级为明文）**；
+> - 依赖：`modernc.org/sqlite v1.59.0`（纯 Go，无 CGO），因此 `go.mod` 的 `go` 指令相应提升为 **1.25.0**
+>   （本机工具链为 go1.27.0，CI 通过 `go-version-file: go.mod` 自动对齐）；
+> - 行为变化：网关 Key 改由 `gateway_keys` 表管理（JSON 里的 `gateway.api_key` 在数据库模式下不再参与认证）；
+>   JSON 引导配置**仅在数据库中没有供应商时导入一次**，之后以数据库为准（避免覆盖后续 Web UI 的修改）。
+- [x] **T2.1｜SQLite 接入与迁移** ｜ 3h ｜ 依赖 T1.3
   - `modernc.org/sqlite`（纯 Go）+ `journal_mode=WAL`；`schema_migrations` 表；启动自动迁移。
   - **验收**：空目录首启自动建表；重复启动幂等。
-- [ ] **T2.2｜providers / settings DAO** ｜ 4h ｜ 依赖 T2.1
+- [x] **T2.2｜providers / settings DAO** ｜ 4h ｜ 依赖 T2.1
   - 按 DESIGN §4.1 建表；CRUD；配置快照改为从 DB 加载；变更后原子替换快照。
   - **验收**：新增/修改/删除供应商后，新请求立即按新配置路由（无需重启）。
-- [ ] **T2.3｜凭证加解密与掩码** ｜ 4h ｜ 依赖 T2.2
+- [x] **T2.3｜凭证加解密与掩码** ｜ 4h ｜ 依赖 T2.2
   - AES-256-GCM（`nonce||ct||tag`，AAD = `provider.id`）；主密钥来源 `GW_MASTER_KEY` > `master.key`(0600)；掩码函数。
   - **验收**：DB 中无可读明文；`master.key` 与库文件分离；主密钥缺失时启动失败且提示明确（不静默降级）。
-- [ ] **T2.4｜网关 Key 管理** ｜ 3h ｜ 依赖 T2.2
+- [x] **T2.4｜网关 Key 管理** ｜ 3h ｜ 依赖 T2.2
   - `gateway_keys` 表（存 `sha256` + hint）；首启自动生成并打印明文一次；支持重置（旧 Key 立即失效）。
   - **验收**：重置后旧 Key 返回 401；表中无明文。
-- [ ] **T2.5｜SSRF 校验** ｜ 3h ｜ 依赖 T2.2
+- [x] **T2.5｜SSRF 校验** ｜ 3h ｜ 依赖 T2.2
   - 保存时校验 scheme/host/IP 段；`allow_internal` 显式放行 + warn 日志（DESIGN §7.7）。
   - **验收**：`http://127.0.0.1:11434` 被拒；开启开关后可保存；单测覆盖 IPv6/loopback/link-local。
-- [ ] **T2.6｜请求日志与异步写入** ｜ 4h ｜ 依赖 T2.2
+- [x] **T2.6｜请求日志与异步写入** ｜ 4h ｜ 依赖 T2.2
   - `logs` 表 + channel 批量 flush（500ms/100 条）；失败必记、成功可选计数；队列满丢弃并计数（`/api/health` 暴露丢数）。
   - **验收**：4xx/5xx/超时/499 均有记录；磁盘慢时请求延迟不受影响。
-- [ ] **T2.7｜脱敏与进程日志** ｜ 2h ｜ 依赖 T2.6
+- [x] **T2.7｜脱敏与进程日志** ｜ 2h ｜ 依赖 T2.6
   - 出口结构体不含 Key 字段；正则过滤 `sk-*`/`gw-*`；`slog` 分级；错误体截断 1KB 入库。
   - **验收**：任何 API 响应、日志文件、进程 stdout 中检索不到明文 Key 形态字符串。
-- [ ] **T2.8｜管理操作审计日志** ｜ 2h ｜ 依赖 T2.6
+- [x] **T2.8｜管理操作审计日志** ｜ 2h ｜ 依赖 T2.6
   - 记录增删改、Key 重置、登录尝试（含失败）。
   - **验收**：日志页可见 `admin` 类型记录。
 

@@ -67,10 +67,7 @@ function Invoke-Curl {
     return [pscustomobject]@{ Code = $code; Body = $raw.Substring(0, $idx) }
 }
 
-$key = 'gw-smoke-key'
 $jsonHeader = @('-H', 'content-type: application/json')
-$openAIHeaders = $jsonHeader + @('-H', "authorization: Bearer $key")
-$anthropicHeaders = $jsonHeader + @('-H', "x-api-key: $key")
 $exeName = if ($env:OS -eq 'Windows_NT') { 'agoramodel-smoke.exe' } else { 'agoramodel-smoke' }
 $exe = Join-Path $tmp $exeName
 
@@ -90,13 +87,13 @@ $cfg = @"
   },
   "providers": [
     { "id": "mock", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "anthropic_base_url": "http://127.0.0.1:$MockPort/v1",
-      "api_key": "sk-mock-provider-key", "models": ["mock-gpt-4o", "mock-claude-sonnet-4-5"], "priority": 10, "timeout_seconds": 120 },
+      "api_key": "sk-mock-provider-key", "models": ["mock-gpt-4o", "mock-claude-sonnet-4-5"], "allow_internal": true, "priority": 10, "timeout_seconds": 120 },
     { "id": "mock-slow", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "api_key": "sk-slow",
-      "models": ["slow-model"], "priority": 10, "timeout_seconds": 1 },
+      "models": ["slow-model"], "allow_internal": true, "priority": 10, "timeout_seconds": 1 },
     { "id": "dead", "openai_base_url": "http://127.0.0.1:9998/v1", "api_key": "sk-dead",
-      "models": ["dead-model"], "priority": 10, "timeout_seconds": 5 },
+      "models": ["dead-model"], "allow_internal": true, "priority": 10, "timeout_seconds": 5 },
     { "id": "mock-extra", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "api_key": "sk-extra",
-      "models": ["extra-model"], "priority": 10, "timeout_seconds": 60,
+      "models": ["extra-model"], "allow_internal": true, "priority": 10, "timeout_seconds": 60,
       "extra_headers": { "x-tenant": "agora" }, "extra_body": { "temperature": 0.1, "top_p": 0.9 } }
   ]
 }
@@ -115,12 +112,36 @@ $bodyBig = Save-Text (Join-Path $tmp 'agora-req-big.json') ('{"model":"mock-gpt-
 
 $mockOut = Join-Path $tmp 'agora-mock.out'
 $gwOut = Join-Path $tmp 'agora-gw.out'
+$dataDir = Join-Path $tmp 'agora-smoke-data'
+if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }
 $env:PORT = "$MockPort"
 $mock = Start-Process node -ArgumentList 'tools/mock-upstream/server.mjs' -PassThru `
     -RedirectStandardOutput $mockOut -RedirectStandardError "$mockOut.err" -WindowStyle Hidden
-$gw = Start-Process $exe -ArgumentList '--config', $cfgFile, '--log-level', 'debug' -PassThru `
+$gw = Start-Process $exe -ArgumentList '--config', $cfgFile, '--data-dir', $dataDir, '--log-level', 'debug' -PassThru `
     -RedirectStandardOutput $gwOut -RedirectStandardError "$gwOut.err" -WindowStyle Hidden
 Start-Sleep -Seconds 2
+
+# Phase 2 起网关 Key 由数据库管理：从启动日志取回本次生成的明文
+function Read-SharedText([string]$path) {
+    if (-not (Test-Path $path)) { return '' }
+    $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $sr = New-Object System.IO.StreamReader($fs)
+        try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+    }
+    finally { $fs.Dispose() }
+}
+$bootLog = ''
+for ($i = 0; $i -lt 20; $i++) {
+    $bootLog = Read-SharedText $gwOut
+    if ($bootLog -match 'gateway_key=(gw-[0-9a-f]+)') { break }
+    Start-Sleep -Milliseconds 300
+}
+if ($bootLog -notmatch 'gateway_key=(gw-[0-9a-f]+)') { throw "未能从启动日志取得网关 Key：$bootLog" }
+$key = $Matches[1]
+Write-Host "  网关 Key 已取得：$($key.Substring(0, 7))***"
+$openAIHeaders = $jsonHeader + @('-H', "authorization: Bearer $key")
+$anthropicHeaders = $jsonHeader + @('-H', "x-api-key: $key")
 
 $base = "http://127.0.0.1:$GatewayPort"
 try {

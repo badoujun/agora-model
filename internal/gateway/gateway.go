@@ -14,20 +14,33 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"agora-model/internal/config"
+	"agora-model/internal/logging"
 	"agora-model/internal/route"
 )
 
 // errBodyTooLarge 表示入站请求体超过上限。
 var errBodyTooLarge = errors.New("请求体过大")
 
+// KeyStore 是网关 Key 的校验与使用记录接口（由 store 实现）。
+//
+// 为 nil 时退化为使用配置中的静态 Key（Phase 1 行为，便于单测与最小部署）。
+type KeyStore interface {
+	VerifyGatewayKey(ctx context.Context, provided string) (keyID string, ok bool, err error)
+	TouchGatewayKey(ctx context.Context, id string) error
+}
+
 // Gateway 实现双协议原样透传的数据面。
 type Gateway struct {
-	holder *config.Holder
-	client *http.Client
-	logger *slog.Logger
+	holder    *config.Holder
+	client    *http.Client
+	logger    *slog.Logger
+	keys      KeyStore
+	recorder  *logging.Recorder
+	lastTouch atomic.Int64 // 网关 Key 使用时间的节流（Unix 秒）
 }
 
 // New 创建网关。
@@ -39,6 +52,9 @@ type Gateway struct {
 // 不使用 http.Client.Timeout：它会把长时间推理的流一并掐断，
 // 超时改由每个请求的 context 控制（provider.timeout_seconds）。
 func New(holder *config.Holder, logger *slog.Logger) *Gateway {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	transport := &http.Transport{
 		Proxy:               nil,
 		DisableCompression:  true,
@@ -52,6 +68,18 @@ func New(holder *config.Holder, logger *slog.Logger) *Gateway {
 		client: &http.Client{Transport: transport},
 		logger: logger,
 	}
+}
+
+// WithKeyStore 注入网关 Key 存储（Phase 2 起使用）。
+func (g *Gateway) WithKeyStore(ks KeyStore) *Gateway {
+	g.keys = ks
+	return g
+}
+
+// WithRecorder 注入请求日志记录器。
+func (g *Gateway) WithRecorder(r *logging.Recorder) *Gateway {
+	g.recorder = r
+	return g
 }
 
 // Register 注册数据面端点。
@@ -68,6 +96,33 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		snap := g.holder.Get()
 		cfg := snap.Gateway()
 
+		// 包装 ResponseWriter：统一捕获状态码与首字节时间，供请求日志使用
+		rec := &statusWriter{ResponseWriter: w, started: started}
+		w = rec
+
+		var (
+			model        string
+			providerID   string
+			upstreamURL  string
+			streamServed bool
+		)
+		defer func() {
+			g.record(logging.Entry{
+				TS:              started,
+				RequestID:       requestID,
+				InboundProtocol: string(proto),
+				Model:           model,
+				ProviderID:      providerID,
+				UpstreamURL:     upstreamURL,
+				StatusCode:      rec.statusCode(),
+				LatencyMS:       time.Since(started).Milliseconds(),
+				FirstByteMS:     rec.firstByteMS(),
+				Stream:          streamServed,
+				ErrorMsg:        rec.errorMessage(),
+				ClientIP:        clientIP(r),
+			})
+		}()
+
 		if r.Method != http.MethodPost {
 			writeError(w, proto, http.StatusNotFound, codeNotFound,
 				fmt.Sprintf("%s 仅支持 POST，收到 %s", proto.Path(), r.Method), "")
@@ -75,7 +130,7 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		}
 
 		// 1) 入站鉴权
-		if !authorized(r, cfg.APIKey) {
+		if !g.authorize(r) {
 			g.logger.Warn("网关鉴权失败",
 				"request_id", requestID, "path", proto.Path(), "client_ip", clientIP(r))
 			writeError(w, proto, http.StatusUnauthorized, codeInvalidAPIKey,
@@ -97,7 +152,7 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		}
 
 		// 3) 探测 model 字段
-		model, err := probeModel(body)
+		model, err = probeModel(body)
 		if err != nil {
 			writeError(w, proto, http.StatusBadRequest, codeInvalidRequest, err.Error(), "model")
 			return
@@ -106,6 +161,7 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		// 4) 路由决策
 		decision, err := route.Resolve(snap, proto, model)
 		if err != nil {
+			rec.noteError(err.Error())
 			switch {
 			case errors.Is(err, route.ErrModelNotFound):
 				writeError(w, proto, http.StatusNotFound, codeModelNotFound, err.Error(), "model")
@@ -118,6 +174,9 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 				"request_id", requestID, "protocol", proto, "model", model, "err", err)
 			return
 		}
+		providerID = decision.Provider.ID
+		upstreamURL = decision.Upstream
+		streamServed = isStreamRequest(body)
 
 		// 5) 组装上游请求体（无 extra_body 且不改写 model 时零改写）
 		upstreamBody, err := prepareBody(body, decision, model)
@@ -143,11 +202,12 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		g.logger.Debug("路由决策",
 			"request_id", requestID, "protocol", proto, "model", model,
 			"provider", decision.Provider.ID, "upstream", decision.Upstream,
-			"stream", isStreamRequest(body))
+			"stream", streamServed)
 
 		// 6) 发送并透传响应
 		resp, err := g.client.Do(req)
 		if err != nil {
+			rec.noteError(err.Error())
 			g.logUpstreamFailure(requestID, proto, model, decision, started, err)
 			g.writeUpstreamError(w, r, proto, err)
 			return
@@ -155,6 +215,7 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		defer resp.Body.Close()
 
 		if isEventStream(resp) {
+			streamServed = true
 			stats, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle())
 			g.logCompletion(requestID, proto, model, decision, resp.StatusCode, started, stats, serr)
 			return
@@ -168,6 +229,107 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 			"stream", false, "err", errString(cerr))
 	}
 }
+
+// authorize 校验入站凭证：Phase 2 起查 gateway_keys 表，否则使用配置中的静态 Key。
+func (g *Gateway) authorize(r *http.Request) bool {
+	got := tokenFromRequest(r)
+	if got == "" {
+		return false
+	}
+	if g.keys != nil {
+		keyID, ok, err := g.keys.VerifyGatewayKey(r.Context(), got)
+		if err != nil {
+			g.logger.Warn("网关 Key 校验失败", "err", err)
+			return false
+		}
+		if ok {
+			g.touchKey(keyID)
+		}
+		return ok
+	}
+	want := g.holder.Get().Gateway().APIKey
+	return want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// touchKey 记录网关 Key 的最后使用时间；节流到最多每分钟一次，且不阻塞请求。
+func (g *Gateway) touchKey(keyID string) {
+	if keyID == "" {
+		return
+	}
+	now := time.Now().Unix()
+	last := g.lastTouch.Load()
+	if now-last < 60 {
+		return
+	}
+	if !g.lastTouch.CompareAndSwap(last, now) {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := g.keys.TouchGatewayKey(ctx, keyID); err != nil {
+			g.logger.Debug("更新网关 Key 使用时间失败", "err", err)
+		}
+	}()
+}
+
+// record 投递一条请求日志（失败必记由调用方保证：所有分支都经过 defer）。
+func (g *Gateway) record(e logging.Entry) {
+	if g.recorder == nil {
+		return
+	}
+	g.recorder.Enqueue(e)
+}
+
+// statusWriter 包装 ResponseWriter，捕获状态码、首字节时间与错误摘要。
+//
+// Unwrap 让 http.ResponseController 能找到底层实现（Flush / SetWriteDeadline）。
+type statusWriter struct {
+	http.ResponseWriter
+	started   time.Time
+	status    int
+	firstByte time.Duration
+	errMsg    string
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+		s.markFirstByte()
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+		s.markFirstByte()
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Unwrap 暴露底层 ResponseWriter（http.ResponseController 依赖）。
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func (s *statusWriter) markFirstByte() {
+	if s.firstByte == 0 {
+		s.firstByte = time.Since(s.started)
+	}
+}
+
+// statusCode 返回最终状态码；未写出任何响应（如客户端断开）记为 499。
+func (s *statusWriter) statusCode() int {
+	if s.status == 0 {
+		return 499
+	}
+	return s.status
+}
+
+func (s *statusWriter) firstByteMS() int64 { return s.firstByte.Milliseconds() }
+
+func (s *statusWriter) noteError(msg string) { s.errMsg = msg }
+
+func (s *statusWriter) errorMessage() string { return s.errMsg }
 
 // prepareBody 按需重写 JSON body：
 //   - 无 extra_body 且无需改写 model → 原样返回（零改写，保真度最高）
@@ -208,18 +370,6 @@ func isStreamRequest(body []byte) bool {
 	}
 	_ = json.Unmarshal(body, &probe)
 	return probe.Stream
-}
-
-// authorized 校验入站凭证：x-api-key（Anthropic 风格）或 Authorization: Bearer（OpenAI 风格）。
-func authorized(r *http.Request, want string) bool {
-	if want == "" {
-		return false
-	}
-	got := tokenFromRequest(r)
-	if got == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func tokenFromRequest(r *http.Request) string {
@@ -268,7 +418,6 @@ func probeModel(body []byte) (string, error) {
 func (g *Gateway) writeUpstreamError(w http.ResponseWriter, r *http.Request, proto config.Protocol, err error) {
 	switch {
 	case r.Context().Err() != nil:
-		// 客户端已断开，写响应无意义
 		return
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(w, proto, http.StatusGatewayTimeout, codeUpstreamTimeout,
@@ -298,11 +447,7 @@ func (g *Gateway) logUpstreamFailure(requestID string, proto config.Protocol, mo
 
 func (g *Gateway) logCompletion(requestID string, proto config.Protocol, model string, d route.Result, status int, started time.Time, stats streamStats, err error) {
 	level := slog.LevelInfo
-	switch {
-	case err == nil:
-	case errors.Is(err, context.Canceled):
-		level = slog.LevelWarn // 客户端断开
-	default:
+	if err != nil {
 		level = slog.LevelWarn
 	}
 	g.logger.Log(context.Background(), level, "流式请求完成",

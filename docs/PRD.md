@@ -257,7 +257,7 @@
 
 | 阶段 | 内容 | 预估 |
 | --- | --- | --- |
-| **P0 基础** | Go 1.22+ 安装、仓库骨架、三平台构建矩阵与 CI、mock 上游 | 1 天 |
+| **P0 基础** | Go 1.25+（实测 1.27.0）安装、仓库骨架、三平台构建矩阵与 CI、mock 上游 | 1 天 |
 | **Phase 1 核心透传网关** | 双端点、单网关 Key 鉴权、配置加载、按模型路由、SSE 直接透传、**SSE 心跳保活、context 取消** | 3–5 天 |
 | **Phase 2 存储与安全加固** | SQLite + 原子性、AES-256-GCM 凭证加密、SSRF 校验、错误日志表 | 2–3 天 |
 | **Phase 3 模型聚合与路由** | 自动拉取、去重、`/v1/models`、`provider/model` 命名空间路由 | 2–3 天 |
@@ -277,7 +277,7 @@
 | R3 | 兼容性 | 部分供应商的 OpenAI 兼容路径不是 `/v1/chat/completions` | 提供 `*_endpoint_override` 完整 URL 覆盖 |
 | R4 | 运维 | 反向代理默认缓冲 SSE，导致流式失效或被掐断 | 文档明确反代配置；网关侧 SSE 心跳兜底 |
 | R5 | 安全 | 网关集中持有全部上游 Key | AES-256-GCM 加密 + 掩码回显 + 主密钥不落库；定位为「防误传/防备份泄露」而非「防主机被攻陷」 |
-| R6 | 环境 | 技术栈已定案 **Go 1.22+**（跨平台基线：`CGO_ENABLED=0` + `modernc.org/sqlite`），但开发机（Windows）尚未安装 Go 工具链 | 列为 Phase 0 · T0.1 前置任务：安装 Go 1.22+ 并验证三平台（Windows / Linux / macOS × amd64 / arm64）交叉编译矩阵；Rust + Axum 仅作备选记录（见 DESIGN ADR-001） |
+| R6 | 环境 | 已关闭：已安装 go1.27.0；`go.mod` 声明 Go 1.25+（由 `modernc.org/sqlite v1.59.0` 决定），三平台六产物构建矩阵验证通过 | — |
 | R7 | 需求 | 「对外只提供一个 Key」与「多 Agent 分权/吊销」存在张力 | v1 单 Key；数据库用 `gateway_keys` 表预留结构，未来零改表升级 |
 | R8 | 数据 | 模型列表准确性依赖上游 `/models` 的可靠性 | 支持手动覆盖与排除；拉取失败保留上次结果并标注陈旧 |
 | R9 | 兼容性 | 目标 Windows 版本下限已确定为 **Windows 10 / 11**（明确不含 Win7/8 与 Server 2012，也不出 32 位产物） | 已关闭：Go 1.22+ 覆盖 Win10 1607+，无需旧系统兼容分支或退回 Go 1.20 |
@@ -296,6 +296,7 @@
 | 第 4 轮 | 对抗性审查报告（11 项） | 采纳 P0 修正：SSRF 校验、Key 加密、SSE 心跳、context 取消、错误日志、SQLite 原子写；采纳 P1：`gateway_keys` 表结构预留、`provider/model` 命名空间路由、请求体流式解析；明确拒绝：`/v1/models` 的 Anthropic 内容协商、水平扩展、把单 Key 当安全漏洞 |
 | 第 5 轮 | 明确要求「Windows 与 Linux 都能使用」 | 锁定跨平台基线：全量 `CGO_ENABLED=0` + 纯 Go SQLite 驱动 `modernc.org/sqlite` + 前端 `embed` 内嵌；新增「跨平台兼容性设计」（权限/信号/服务化/数据目录/代理/控制台等差异）与构建矩阵；技术栈定案 Go 1.22+ |
 | 第 6 轮 | 目标 Windows 下限收窄为 Win10 / Win11；服务化选定 `kardianos/service`；要求顺带产出 macOS 产物 | 目标矩阵扩为 Windows / Linux / macOS × amd64 / arm64（6 份产物）；服务化统一为 `kardianos/service`（Windows SCM / Linux systemd / macOS launchd）；跨平台清单补齐 macOS 特有项（Gatekeeper、launchd、数据目录、大小写敏感性） |
+| 第 7 轮 | Phase 1 / Phase 2 实施 | 网关 Key 改由数据库管理（JSON 中的 pi_key 不再参与认证）；引导配置仅在库为空时导入一次；供应商凭证 AES-256-GCM 加密落库；go.mod 的 Go 指令提升为 **1.25.0**（由 modernc.org/sqlite v1.59.0 决定） |
 
 ## 附录 B：最终用户使用方式（验收片段）
 

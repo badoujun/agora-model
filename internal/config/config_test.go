@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,17 +68,21 @@ func TestNormalizeDefaults(t *testing.T) {
 	}
 }
 
+func TestValidateStaticAPIKey(t *testing.T) {
+	if err := (File{Gateway: Gateway{APIKey: "   "}}).ValidateStaticAPIKey(); !errors.Is(err, ErrNoAPIKey) {
+		t.Fatalf("空白 Key 应返回 ErrNoAPIKey，得到 %v", err)
+	}
+	if err := (File{Gateway: Gateway{APIKey: "gw-x"}}).ValidateStaticAPIKey(); err != nil {
+		t.Fatalf("有效 Key 不应报错: %v", err)
+	}
+}
+
 func TestNormalizeErrors(t *testing.T) {
 	cases := []struct {
 		name string
 		file File
 		want string
 	}{
-		{
-			name: "缺少网关 Key",
-			file: File{Providers: []Provider{{ID: "a", OpenAIBaseURL: "http://x/v1"}}},
-			want: ErrNoAPIKey.Error(),
-		},
 		{
 			name: "没有启用的供应商",
 			file: File{Gateway: Gateway{APIKey: "k"}},

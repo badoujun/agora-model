@@ -114,12 +114,12 @@ agora-model/
 
 ### ADR-001：后端语言与跨平台基线（已定案）
 
-- **决定**：**Go 1.22+**，并把「Windows / Linux / macOS 三平台、单文件交付」作为硬约束。
+- **决定**：**Go 1.25+**（本机实测 go1.27.0），并把「Windows / Linux / macOS 三平台、单文件交付」作为硬约束。
 - **理由**：透传网关的核心是「读 → 写 → Flush」循环，Go 标准库开箱即用；开发效率高；`CGO_ENABLED=0` 时静态链接、可直接交叉编译，从任一开发机用一条命令产出两端产物。
 - **备选**（仅作记录）：Rust + Axum + Tokio（性能上限更高，但交叉编译需 `cargo-zigbuild` / `xwin` / musl target，构建链复杂度显著上升）；`ncruces/go-sqlite3`（WASM + wazero，modernc 的替代驱动，调试更直观、部分场景更快）。
 - **跨平台基线（三条硬约束）**：
   1. **全量 `CGO_ENABLED=0`** —— 不引入任何 CGO 依赖（SQLite 驱动、无 C 后端的密码库等）；
-  2. SQLite 使用 **`modernc.org/sqlite`**（SQLite C 源码的纯 Go 转译版），`sql.Open` 驱动名为 `"sqlite"`；**`modernc.org/libc` 版本必须与驱动 `go.mod` 声明一致，不得单独升级**（不一致会编译失败）；
+  2. SQLite 使用 **`modernc.org/sqlite`**（SQLite C 源码的纯 Go 转译版，当前锁定 **v1.59.0**），`sql.Open` 驱动名为 `"sqlite"`；**`modernc.org/libc` 版本必须与驱动 `go.mod` 声明一致，不得单独升级**（不一致会编译失败）；
   3. 前端产物 `web/dist` 由 `embed.FS` 内嵌，平台无关。
 - **目标矩阵**：`windows/amd64`、`windows/arm64`、`linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`（驱动另支持 `windows/386`、`linux/{386,arm,loong64,ppc64le,riscv64,s390x}`、`darwin/{amd64,arm64}`、`freebsd/*`，有余力可一并产出）。
 - **构建命令**（任一开发机即可完成全部产物）：
@@ -134,8 +134,8 @@ agora-model/
   ```
 
 - **已知代价**：modernc 的**写入**吞吐约为 CGO 驱动的 1/3（读与并发读通常持平甚至更好）。本项目的日志为「单写协程 + 批量 flush」，写入频率低，不构成瓶颈；若未来出现写瓶颈，可按 PocketBase 模式用 `//go:build cgo` 做本地开发回退，但**发布产物一律走纯 Go 路径**。
-- **环境前置（Phase 0 · T0.1）**：当前开发机（Windows）未安装 Go 工具链（仅有 `cargo`/`rustc`、`node`、`python`），需先安装 **Go 1.22+**，并验证 §12「跨平台兼容性设计」中的构建矩阵。
-- **平台版本下限（已确认）**：目标平台为 **Windows 10 / Windows 11** 与 Linux。Go 1.21+ 的 Windows 下限恰好是 Windows 10 1607+，因此 **Go 1.22+ 完全覆盖目标范围**，无需为旧系统退回 Go 1.20，也不需要任何 Win7/8、Server 2012 兼容分支。32 位 Windows 亦不在目标内，目标架构只保留 `amd64` / `arm64`。
+- **环境前置（Phase 0 · T0.1，已完成）**：已安装 **go1.27.0**；`go.mod` 的 `go` 指令为 **1.25.0**（由 `modernc.org/sqlite v1.59.0` 的最低要求决定），三平台构建矩阵已验证通过。
+- **平台版本下限（已确认）**：目标平台为 **Windows 10 / Windows 11** 与 Linux。Go 1.21+ 的 Windows 下限恰好是 Windows 10 1607+，因此 Go 1.25+（本项目实际使用 1.27.0）完全覆盖目标范围，无需为旧系统退回 Go 1.20，也不需要任何 Win7/8、Server 2012 兼容分支。32 位 Windows 亦不在目标内，目标架构只保留 `amd64` / `arm64`。
 
 ### ADR-002：透传 vs 协议转换
 

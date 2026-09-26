@@ -65,7 +65,18 @@ type Provider struct {
 	TimeoutSeconds            int               `json:"timeout_seconds"`
 	ExtraHeaders              map[string]string `json:"extra_headers"`
 	ExtraBody                 map[string]any    `json:"extra_body"`
-	Enabled                   *bool             `json:"enabled"`
+	// AllowInternal 显式放行内网地址（本地 Ollama / vLLM 等），默认 false（DESIGN §7.7）。
+	AllowInternal bool `json:"allow_internal"`
+	// ModelsExcluded 是模型排除列表（Phase 3 聚合时生效）。
+	ModelsExcluded []string `json:"models_excluded"`
+	// AutoFetchModels 控制是否自动拉取模型列表，缺省为 true。
+	AutoFetchModels *bool `json:"auto_fetch_models"`
+	Enabled         *bool `json:"enabled"`
+}
+
+// FetchModels 报告是否允许自动拉取模型列表（缺省 true）。
+func (p *Provider) FetchModels() bool {
+	return p.AutoFetchModels == nil || *p.AutoFetchModels
 }
 
 // IsEnabled 报告该供应商是否启用（缺省视为启用）。
@@ -162,6 +173,17 @@ func LoadFile(path string) (File, error) {
 	return f.Normalize()
 }
 
+// ValidateStaticAPIKey 校验引导配置中的静态网关 Key。
+//
+// Phase 1 的 JSON 直连模式需要它；Phase 2 起网关 Key 由 gateway_keys 表管理，
+// 因此该校验不再出现在 Normalize 中。
+func (f File) ValidateStaticAPIKey() error {
+	if strings.TrimSpace(f.Gateway.APIKey) == "" {
+		return ErrNoAPIKey
+	}
+	return nil
+}
+
 // Normalize 补齐默认值并校验，返回可直接构建快照的配置。
 func (f File) Normalize() (File, error) {
 	if f.Gateway.Listen == "" {
@@ -176,10 +198,6 @@ func (f File) Normalize() (File, error) {
 	if f.Gateway.MaxBodyBytes <= 0 {
 		f.Gateway.MaxBodyBytes = DefaultMaxBodyBytes
 	}
-	if strings.TrimSpace(f.Gateway.APIKey) == "" {
-		return File{}, ErrNoAPIKey
-	}
-
 	seen := make(map[string]bool, len(f.Providers))
 	enabled := 0
 	for i := range f.Providers {
@@ -202,6 +220,21 @@ func (f File) Normalize() (File, error) {
 	return f, nil
 }
 
+// cleanStrings 去空白、去空项、去重，保持原有顺序。
+func cleanStrings(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 func (p *Provider) normalize(idx int) {
 	p.ID = strings.TrimSpace(p.ID)
 	if p.ID == "" {
@@ -221,19 +254,9 @@ func (p *Provider) normalize(idx int) {
 		enabled := true
 		p.Enabled = &enabled
 	}
-	// 模型名去空格、去重，保持顺序
-	models := make([]string, 0, len(p.Models))
-	seen := make(map[string]bool, len(p.Models))
-	for _, m := range p.Models {
-		m = strings.TrimSpace(m)
-		if m == "" || seen[m] {
-			continue
-		}
-		seen[m] = true
-		models = append(models, m)
-	}
-	p.Models = models
-	// 端点 base URL 去掉尾部斜杠
+	// 模型名与排除列表去空格、去重，保持顺序
+	p.Models = cleanStrings(p.Models)
+	p.ModelsExcluded = cleanStrings(p.ModelsExcluded)
 	p.OpenAIBaseURL = strings.TrimRight(strings.TrimSpace(p.OpenAIBaseURL), "/")
 	p.AnthropicBaseURL = strings.TrimRight(strings.TrimSpace(p.AnthropicBaseURL), "/")
 	p.OpenAIEndpointOverride = strings.TrimSpace(p.OpenAIEndpointOverride)
