@@ -121,6 +121,17 @@ jobs:
           fi
           echo "凭证加密 OK"
 
+          # Phase 3：模型聚合与 /v1/models（mock 上游提供 3 个模型）
+          mout=""
+          for i in $(seq 1 15); do
+            mout=$(curl -s http://127.0.0.1:19090/v1/models -H "authorization: Bearer $gw_key" || true)
+            echo "$mout" | grep -q 'mock/mock-gpt-4o' && break || sleep 1
+          done
+          echo "$mout" | grep -q '"object":"list"' || { echo "/v1/models 返回异常: $mout"; exit 1; }
+          echo "$mout" | grep -q 'mock/mock-gpt-4o' || { echo "模型聚合未生效（缺少命名空间条目）: $mout"; exit 1; }
+          echo "$mout" | grep -q '"owned_by":"mock"' || { echo "owned_by 字段异常: $mout"; exit 1; }
+          echo "模型聚合 OK"
+
   # race detector 需要 cgo，因此单独一个 job（发布产物一律 CGO_ENABLED=0）
   race:
     name: race detector (linux/amd64)

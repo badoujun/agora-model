@@ -668,6 +668,11 @@ func streamSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, 
 - **失败隔离**：单供应商失败仅记录，不影响其他供应商；Web UI 展示 `last_fetch_error`。
 - **去重与 `owned_by`**：同一 `model_id` 出现在多个供应商时，裸名归 `priority` 最小者；命名空间形式全部列出。
 - **一致性**：`model_cache` 的读在内存快照中进行（启动加载 + 变更后重建），请求路径不查库。
+- **实现细节（Phase 3 落地）**：
+  - 拉取响应兼容三种形态：`{"data":[{"id":…}]}`、`{"data":["…"]}`、顶层数组；
+  - `model_cache` 的写入由聚合器内部串行化（规避 modernc 在并发写下报 `database is locked`）；
+  - 失败时写 `providers.last_fetch_error` 并**保留旧缓存**，成功时清空该字段并刷新 `last_fetch_at`；
+  - 刷新间隔取 `settings.model_refresh_seconds`（缺省 10 分钟），单次拉取超时 20s。
 
 ### 7.6 连接测试流程
 

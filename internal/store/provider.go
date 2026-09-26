@@ -37,12 +37,17 @@ type ProviderRecord struct {
 	Enabled                   bool
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time
+	// LastFetchAt 是最后一次模型拉取的时间（失败时也会刷新，用于展示"陈旧"）。
+	LastFetchAt time.Time
+	// LastFetchError 是最近一次拉取失败的原因（成功时清空）。
+	LastFetchError string
 }
 
 const providerColumns = `id, name, openai_base_url, anthropic_base_url,
 	openai_endpoint_override, anthropic_endpoint_override, api_key_cipher, api_key_hint,
 	models_manual_json, models_excluded_json, auto_fetch_models, priority, timeout_seconds,
-	extra_headers_json, extra_body_json, allow_internal, enabled, created_at, updated_at`
+	extra_headers_json, extra_body_json, allow_internal, enabled, created_at, updated_at,
+	last_fetch_at, last_fetch_error`
 
 // UpsertProvider 写入或更新一条供应商记录（不做加密，调用方负责传入密文）。
 func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
@@ -70,7 +75,7 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 	}
 
 	const q = `INSERT INTO providers (` + providerColumns + `)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			openai_base_url=excluded.openai_base_url,
@@ -96,6 +101,7 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 		string(manual), string(excluded), boolToInt(rec.AutoFetchModels), rec.Priority, rec.TimeoutSeconds,
 		string(headers), string(body), boolToInt(rec.AllowInternal), boolToInt(rec.Enabled),
 		rec.CreatedAt.UTC().Format(time.RFC3339), rec.UpdatedAt.UTC().Format(time.RFC3339),
+		formatTime(rec.LastFetchAt), rec.LastFetchError,
 	)
 	if err != nil {
 		return fmt.Errorf("写入供应商 %s 失败: %w", rec.ID, err)
@@ -200,6 +206,7 @@ func (s *Store) SaveProvider(ctx context.Context, master []byte, p config.Provid
 		APIKeyCipher:              cipherText,
 		APIKeyHint:                crypto.Mask(p.APIKey),
 		ModelsManual:              p.Models,
+		ModelsExcluded:            p.ModelsExcluded,
 		AutoFetchModels:           autoFetch,
 		Priority:                  p.Priority,
 		TimeoutSeconds:            p.TimeoutSeconds,
@@ -208,6 +215,8 @@ func (s *Store) SaveProvider(ctx context.Context, master []byte, p config.Provid
 		AllowInternal:             p.AllowInternal,
 		Enabled:                   p.IsEnabled(),
 		CreatedAt:                 created,
+		LastFetchAt:               existing.LastFetchAt,
+		LastFetchError:            existing.LastFetchError,
 	}
 	if err := s.UpsertProvider(ctx, rec); err != nil {
 		return ProviderRecord{}, err
@@ -228,6 +237,7 @@ func (s *Store) LoadProviders(ctx context.Context, master []byte) ([]config.Prov
 			return nil, fmt.Errorf("供应商 %s 的凭证解密失败: %w", rec.ID, err)
 		}
 		enabled := rec.Enabled
+		autoFetch := rec.AutoFetchModels
 		out = append(out, config.Provider{
 			ID:                        rec.ID,
 			Name:                      rec.Name,
@@ -237,6 +247,8 @@ func (s *Store) LoadProviders(ctx context.Context, master []byte) ([]config.Prov
 			AnthropicEndpointOverride: rec.AnthropicEndpointOverride,
 			APIKey:                    string(plain),
 			Models:                    rec.ModelsManual,
+			ModelsExcluded:            rec.ModelsExcluded,
+			AutoFetchModels:           &autoFetch,
 			Priority:                  rec.Priority,
 			TimeoutSeconds:            rec.TimeoutSeconds,
 			ExtraHeaders:              rec.ExtraHeaders,
@@ -258,12 +270,14 @@ func scanProvider(row rowScanner) (ProviderRecord, error) {
 		manual, excluded, headers, body   string
 		autoFetch, allowInternal, enabled int
 		createdAt, updatedAt              string
+		lastFetchAt                       string
 	)
 	err := row.Scan(
 		&rec.ID, &rec.Name, &rec.OpenAIBaseURL, &rec.AnthropicBaseURL,
 		&rec.OpenAIEndpointOverride, &rec.AnthropicEndpointOverride, &rec.APIKeyCipher, &rec.APIKeyHint,
 		&manual, &excluded, &autoFetch, &rec.Priority, &rec.TimeoutSeconds,
 		&headers, &body, &allowInternal, &enabled, &createdAt, &updatedAt,
+		&lastFetchAt, &rec.LastFetchError,
 	)
 	if err != nil {
 		return ProviderRecord{}, err
@@ -277,9 +291,17 @@ func scanProvider(row rowScanner) (ProviderRecord, error) {
 	rec.Enabled = enabled != 0
 	rec.CreatedAt = parseTime(createdAt)
 	rec.UpdatedAt = parseTime(updatedAt)
+	rec.LastFetchAt = parseTime(lastFetchAt)
 	return rec, nil
 }
 
+// formatTime 把时间格式化为 RFC3339；零值写空串（便于判断"从未拉取"）。
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
 func decodeStrings(raw string) []string {
 	var out []string
 	if raw == "" {

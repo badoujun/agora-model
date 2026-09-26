@@ -22,6 +22,7 @@ type Store struct {
 // 迁移定义。新增迁移时追加到切片末尾，切勿修改已发布的条目。
 var migrations = []migration{
 	{version: 1, name: "init", statements: schemaV1},
+	{version: 2, name: "provider_fetch_status", statements: schemaV2},
 }
 
 type migration struct {
@@ -201,4 +202,10 @@ var schemaV1 = []string{
 	`CREATE INDEX IF NOT EXISTS idx_logs_status ON logs(status_code)`,
 	`CREATE INDEX IF NOT EXISTS idx_logs_model  ON logs(model)`,
 	`CREATE INDEX IF NOT EXISTS idx_cache_model ON model_cache(model_id)`,
+}
+
+// schemaV2 为 providers 增加模型拉取状态列（Phase 3 · 模型聚合）。
+var schemaV2 = []string{
+	`ALTER TABLE providers ADD COLUMN last_fetch_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE providers ADD COLUMN last_fetch_error TEXT NOT NULL DEFAULT ''`,
 }

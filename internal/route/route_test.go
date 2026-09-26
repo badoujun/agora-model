@@ -90,3 +90,74 @@ func TestResolveNilSnapshot(t *testing.T) {
 		t.Fatalf("空快照应返回 ErrModelNotFound，得到 %v", err)
 	}
 }
+
+func TestResolveNamespaceForcesProvider(t *testing.T) {
+	snap := snapshot(t,
+		config.Provider{ID: "a", OpenAIBaseURL: "http://a/v1", Priority: 1, Models: []string{"shared", "only-a"}},
+		config.Provider{ID: "b", OpenAIBaseURL: "http://b/v1", Priority: 2, Models: []string{"shared", "only-b"}},
+	)
+	// 裸名按 priority 命中 a
+	bare, err := Resolve(snap, config.ProtocolOpenAI, "shared")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if bare.Provider.ID != "a" {
+		t.Fatalf("裸名应命中 priority 最小者，得到 %s", bare.Provider.ID)
+	}
+
+	// 命名空间强制走 b，并且转发用的 model 要去掉前缀
+	forced, err := Resolve(snap, config.ProtocolOpenAI, "b/shared")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if forced.Provider.ID != "b" {
+		t.Fatalf("命名空间应强制走 b，得到 %s", forced.Provider.ID)
+	}
+	if forced.Model != "shared" {
+		t.Fatalf("转发用的 model 应为 shared，得到 %q", forced.Model)
+	}
+	if forced.Upstream != "http://b/v1/chat/completions" {
+		t.Fatalf("Upstream = %q", forced.Upstream)
+	}
+}
+
+func TestResolveNamespaceDoesNotBreakSlashModelNames(t *testing.T) {
+	// meta-llama 不是已存在的 provider id，应整体当作模型名
+	snap := snapshot(t, config.Provider{
+		ID:            "p",
+		OpenAIBaseURL: "http://p/v1",
+		Models:        []string{"meta-llama/Llama-3-70B"},
+	})
+	got, err := Resolve(snap, config.ProtocolOpenAI, "meta-llama/Llama-3-70B")
+	if err != nil {
+		t.Fatalf("含斜杠的真实模型名不应被误判为命名空间: %v", err)
+	}
+	if got.Provider.ID != "p" || got.Model != "meta-llama/Llama-3-70B" {
+		t.Fatalf("解析结果异常: provider=%s model=%q", got.Provider.ID, got.Model)
+	}
+}
+
+func TestResolveNamespaceErrors(t *testing.T) {
+	disabled := false
+	snap := snapshot(t,
+		config.Provider{ID: "on", OpenAIBaseURL: "http://on/v1", Models: []string{"m"}},
+		config.Provider{ID: "off", OpenAIBaseURL: "http://off/v1", Models: []string{"m"}, Enabled: &disabled},
+	)
+
+	if _, err := Resolve(snap, config.ProtocolOpenAI, "off/m"); !errors.Is(err, ErrProviderDisabled) {
+		t.Fatalf("停用供应商应返回 ErrProviderDisabled，得到 %v", err)
+	}
+	if _, err := Resolve(snap, config.ProtocolOpenAI, "on/nope"); !errors.Is(err, ErrModelNotFound) {
+		t.Fatalf("供应商未声明该模型应返回 ErrModelNotFound，得到 %v", err)
+	}
+	if _, err := Resolve(snap, config.ProtocolOpenAI, "on/"); !errors.Is(err, ErrModelNotFound) {
+		t.Fatalf("尾部斜杠应退回普通模型名查找，得到 %v", err)
+	}
+}
+
+func TestResolveNamespaceProtocolNotConfigured(t *testing.T) {
+	snap := snapshot(t, config.Provider{ID: "on", OpenAIBaseURL: "http://on/v1", Models: []string{"m"}})
+	if _, err := Resolve(snap, config.ProtocolAnthropic, "on/m"); !errors.Is(err, ErrProtocolNotConfigured) {
+		t.Fatalf("期望 ErrProtocolNotConfigured，得到 %v", err)
+	}
+}

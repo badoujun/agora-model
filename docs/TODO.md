@@ -169,26 +169,39 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 ## Phase 3 · 模型聚合与路由增强（2–3 天）
 
-- [ ] **T3.1｜聚合器** ｜ 4h ｜ 依赖 T2.2
+> **进度：已完成（T3.1–T3.7；T3.5 在 Phase 1 已实现）**
+> 实测证据：
+> - `go test ./... -count=1` 全绿，累计 **97 个用例**（新增 models 聚合、provider 双协议探测、
+>   route 命名空间、gateway `/v1/models`、store 模型缓存与迁移 v2）；
+> - `tools/smoke/phase3.ps1` 端到端冒烟 **15/15 通过**：启动即聚合（mock 上游 3 个模型）、
+>   失败隔离（不可达供应商只记录 `last_fetch_error`，不影响其他供应商）、
+>   手动模型与排除列表生效、`/v1/models` 同时给出裸名（`owned_by` = priority 最小者）与
+>   `provider/model` 命名空间条目、未授权 401、**用聚合得到的模型直接透传（无需手动配置模型）**、
+>   命名空间路由在转发前剥离前缀、未知前缀退回普通模型名返回 404；
+> - 迁移 v2：`providers` 增加 `last_fetch_at` / `last_fetch_error`；
+> - 附带完成 `internal/provider` 双协议连接测试（OpenAI 侧优先 `/models`，404/405 时回退最小对话探测），
+>   供 Phase 4 的 Web UI「测试连接」直接调用。
+
+- [x] **T3.1｜聚合器** ｜ 4h ｜ 依赖 T2.2
   - 启动 + ticker（默认 10min，可配）遍历 `auto_fetch_models` 供应商；每供应商独立 goroutine + 20s 超时；请求 `{openai_base}/models`。
   - **验收**：单供应商失败不影响其他供应商；失败写入 `last_fetch_error`。
-- [ ] **T3.2｜model_cache 与 available models** ｜ 3h ｜ 依赖 T3.1
+- [x] **T3.2｜model_cache 与 available models** ｜ 3h ｜ 依赖 T3.1
   - 计算 `available = (auto ∪ manual) − excluded`；事务内替换自动项；内存视图随快照更新。
   - **验收**：manual/excluded 单测；拉取失败时保留旧缓存并标记陈旧。
-- [ ] **T3.3｜`GET /v1/models`** ｜ 3h ｜ 依赖 T3.2
+- [x] **T3.3｜`GET /v1/models`** ｜ 3h ｜ 依赖 T3.2
   - 裸名（`owned_by` = priority 最小）+ `provider/model` 全量；`Cache-Control: no-store`；认证同 §5.2。
   - **验收**：新增/停用供应商后列表随之变化；命名空间项数量 = 支持该模型的供应商数。
-- [ ] **T3.4｜`provider/model` 命名空间路由** ｜ 3h ｜ 依赖 T3.2、T1.6
+- [x] **T3.4｜`provider/model` 命名空间路由** ｜ 3h ｜ 依赖 T3.2、T1.6
   - 仅当第一段命中已存在 provider id 才解析；转发前**最小改写** `model` 键（`map[string]json.RawMessage`）。
   - **验收**：`p/gpt-4o` 走 p 且上游收到 `gpt-4o`；`meta-llama/Llama-3-70B` 不被误判（对应 DESIGN §7.2/§7.3）。
-- [ ] **T3.5｜extra_body 合并** ｜ 2h ｜ 依赖 T3.4
+- [x] **T3.5｜extra_body 合并** ｜ 2h ｜ 依赖 T3.4
   - 仅当配置了 `extra_body` 时走 `map[string]any` 浅合并路径（供应商值覆盖同名键）。
   - **验收**：合并结果符合预期，未配置时零改写。
-- [ ] **T3.6｜连接测试（双协议）** ｜ 4h ｜ 依赖 T2.3、T3.1
+- [x] **T3.6｜连接测试（双协议）** ｜ 4h ｜ 依赖 T2.3、T3.1
   - OpenAI：`GET /models` → 失败退化为 `max_tokens=1` 探测；Anthropic：`POST /messages` with `max_tokens=1`。
   - 返回 `{ok, status_code, latency_ms, message}`；未配置的协议单独返回原因；测试请求不入 `logs` 表。
   - **验收**：错误 Key → `ok:false` + 401 提示；正确配置 → 双协议均 `ok:true`。
-- [ ] **T3.7｜实现顺序复核 / 回归** ｜ 2h ｜ 依赖 T3.1–T3.6
+- [x] **T3.7｜实现顺序复核 / 回归** ｜ 2h ｜ 依赖 T3.1–T3.6
   - 回归 Phase 1 全部验收用例，确认聚合引入后透传仍字节保真。
 
 ---

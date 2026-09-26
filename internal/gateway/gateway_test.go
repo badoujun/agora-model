@@ -515,3 +515,137 @@ func TestClientDisconnectCancelsUpstream(t *testing.T) {
 		t.Fatal("客户端断开后，上游请求未被取消（存在泄漏风险）")
 	}
 }
+
+func TestModelsEndpointAggregatesAndNamespaces(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	first := providerFor("a", upstream.URL, "shared", "only-a")
+	first.Priority = 1
+	second := providerFor("b", upstream.URL, "shared", "only-b")
+	second.Priority = 2
+	srv := buildGateway(t, config.Gateway{}, first, second)
+
+	resp, _ := doRequest(t, http.MethodGet, srv.URL+"/v1/models", "", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("未授权状态码 = %d, 期望 401", resp.StatusCode)
+	}
+
+	resp, body := doRequest(t, http.MethodGet, srv.URL+"/v1/models", gatewayKey, "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d", resp.StatusCode)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, 期望 no-store", cc)
+	}
+
+	items, ok := decodeJSON(t, body)["data"].([]any)
+	if !ok {
+		t.Fatalf("响应缺少 data 数组: %s", body)
+	}
+	ownedBy := make(map[string]string, len(items))
+	for _, raw := range items {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("data 元素不是对象: %v", raw)
+		}
+		id, _ := entry["id"].(string)
+		owner, _ := entry["owned_by"].(string)
+		if entry["object"] != "model" {
+			t.Errorf("object 字段 = %v, 期望 model", entry["object"])
+		}
+		ownedBy[id] = owner
+	}
+
+	if ownedBy["shared"] != "a" {
+		t.Errorf("裸模型名 shared 的 owned_by = %q, 期望 priority 最小的 a", ownedBy["shared"])
+	}
+	if ownedBy["only-b"] != "b" {
+		t.Errorf("only-b 的 owned_by = %q, 期望 b", ownedBy["only-b"])
+	}
+	if ownedBy["a/shared"] != "a" || ownedBy["b/shared"] != "b" {
+		t.Errorf("命名空间条目缺失或归属错误: %v", ownedBy)
+	}
+
+	resp, _ = doRequest(t, http.MethodPost, srv.URL+"/v1/models", gatewayKey, `{}`, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /v1/models 状态码 = %d, 期望 404", resp.StatusCode)
+	}
+}
+
+func TestNamespaceRoutingRewritesModelBeforeForwarding(t *testing.T) {
+	var cap captured
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		cap.set(r, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	first := providerFor("a", upstream.URL, "shared")
+	first.Priority = 1
+	second := providerFor("b", upstream.URL, "shared")
+	second.Priority = 2
+	srv := buildGateway(t, config.Gateway{}, first, second)
+
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"b/shared","messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d", resp.StatusCode)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(cap.snapshot().body, &payload); err != nil {
+		t.Fatalf("上游请求体不是 JSON: %v", err)
+	}
+	if payload["model"] != "shared" {
+		t.Fatalf("上游收到的 model 应为 shared（已剥离命名空间前缀），得到 %v", payload["model"])
+	}
+}
+
+func TestNamespaceRoutingDisabledProviderReturns503(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	disabled := providerFor("off", upstream.URL, "m")
+	disabled.Enabled = boolPtr(false)
+	enabled := providerFor("on", upstream.URL, "m")
+	srv := buildGateway(t, config.Gateway{}, enabled, disabled)
+
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"off/m","messages":[]}`, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 = %d, 期望 503", resp.StatusCode)
+	}
+	if code := decodeJSON(t, body)["error"].(map[string]any)["code"]; code != "no_available_provider" {
+		t.Errorf("code = %v, 期望 no_available_provider", code)
+	}
+}
+
+func TestSlashModelNameIsNotTreatedAsNamespace(t *testing.T) {
+	var cap captured
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		cap.set(r, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	p := providerFor("p", upstream.URL, "meta-llama/Llama-3-70B")
+	srv := buildGateway(t, config.Gateway{}, p)
+
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"meta-llama/Llama-3-70B","messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("含斜杠的真实模型名应正常转发，状态码 = %d", resp.StatusCode)
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(cap.snapshot().body, &payload)
+	if payload["model"] != "meta-llama/Llama-3-70B" {
+		t.Fatalf("模型名不应被改写，得到 %v", payload["model"])
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

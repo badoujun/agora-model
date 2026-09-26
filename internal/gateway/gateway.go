@@ -86,6 +86,62 @@ func (g *Gateway) WithRecorder(r *logging.Recorder) *Gateway {
 func (g *Gateway) Register(mux *http.ServeMux) {
 	mux.HandleFunc(config.ProtocolOpenAI.Path(), g.handler(config.ProtocolOpenAI))
 	mux.HandleFunc(config.ProtocolAnthropic.Path(), g.handler(config.ProtocolAnthropic))
+	mux.HandleFunc(modelsPath, g.modelsHandler())
+}
+
+// modelsPath 是对外暴露聚合模型列表的路径。
+const modelsPath = "/v1/models"
+
+// modelEntry 是 /v1/models 返回的单条模型。
+type modelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// modelsHandler 返回聚合后的模型列表（DESIGN §5.5）。
+//
+//   - 裸模型名：owned_by 为 priority 最小的供应商（即默认路由目标）；
+//   - 命名空间形式 provider/model：每个支持该模型的供应商各列一条，便于显式指定。
+func (g *Gateway) modelsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, config.ProtocolOpenAI, http.StatusNotFound, codeNotFound,
+				fmt.Sprintf("%s 仅支持 GET，收到 %s", modelsPath, r.Method), "")
+			return
+		}
+		if !g.authorize(r) {
+			writeError(w, config.ProtocolOpenAI, http.StatusUnauthorized, codeInvalidAPIKey,
+				"网关 API Key 无效或缺失", "")
+			return
+		}
+
+		snap := g.holder.Get()
+		providers := snap.ProvidersByPriority()
+
+		// 裸名：ProvidersByPriority 已按 priority 升序，首个出现者即默认供应商
+		seen := make(map[string]bool)
+		data := make([]modelEntry, 0, 16)
+		for _, p := range providers {
+			for _, m := range p.Models {
+				if seen[m] {
+					continue
+				}
+				seen[m] = true
+				data = append(data, modelEntry{ID: m, Object: "model", OwnedBy: p.ID})
+			}
+		}
+		// 命名空间形式
+		for _, p := range providers {
+			for _, m := range p.Models {
+				data = append(data, modelEntry{ID: p.ID + "/" + m, Object: "model", OwnedBy: p.ID})
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+	}
 }
 
 // handler 返回指定入站协议的处理器（DESIGN §7.1 主流程）。
@@ -167,6 +223,8 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 				writeError(w, proto, http.StatusNotFound, codeModelNotFound, err.Error(), "model")
 			case errors.Is(err, route.ErrProtocolNotConfigured):
 				writeError(w, proto, http.StatusBadRequest, codeProtocolNotConfigured, err.Error(), "")
+			case errors.Is(err, route.ErrProviderDisabled):
+				writeError(w, proto, http.StatusServiceUnavailable, codeNoAvailableProvider, err.Error(), "")
 			default:
 				writeError(w, proto, http.StatusInternalServerError, codeInvalidRequest, err.Error(), "")
 			}

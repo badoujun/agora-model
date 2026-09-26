@@ -22,6 +22,7 @@ import (
 	"agora-model/internal/crypto"
 	"agora-model/internal/gateway"
 	"agora-model/internal/logging"
+	"agora-model/internal/models"
 	"agora-model/internal/platform"
 	"agora-model/internal/store"
 )
@@ -137,11 +138,7 @@ func run(logger *slog.Logger, opts options) error {
 		return err
 	}
 
-	// 5) 从数据库加载供应商并构建快照
-	providers, err := st.LoadProviders(rootCtx, master)
-	if err != nil {
-		return err
-	}
+	// 5) 构建快照：供应商 + 模型缓存（(手动 ∪ 自动) − 排除）
 	gwSettings := config.Gateway{
 		Listen:         config.DefaultListen,
 		Port:           config.DefaultPort,
@@ -170,17 +167,46 @@ func run(logger *slog.Logger, opts options) error {
 		gwSettings.Port = opts.Port
 	}
 
-	snapshot, err := config.NewSnapshot(config.File{Gateway: gwSettings, Providers: providers})
+	loadSnapshot := func(ctx context.Context) (*config.Snapshot, error) {
+		providers, err := st.LoadProviders(ctx, master)
+		if err != nil {
+			return nil, err
+		}
+		cache, err := st.LoadAllModelCache(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for i := range providers {
+			providers[i].Models = models.Available(providers[i].Models, cache[providers[i].ID], providers[i].ModelsExcluded)
+		}
+		return config.NewSnapshot(config.File{Gateway: gwSettings, Providers: providers})
+	}
+
+	snapshot, err := loadSnapshot(rootCtx)
 	if err != nil {
 		return fmt.Errorf("%w（可用 --config 提供引导配置，或等待 Web UI 添加供应商）", err)
 	}
 	holder := config.NewHolder(snapshot)
 
-	// 6) 请求日志记录器（异步批量写入）
+	// 6) 模型聚合：启动即拉取一次，随后按间隔刷新，完成后原子替换快照
+	aggregator := models.NewAggregator(st, logger, models.Options{
+		Master: master,
+		OnRefresh: func(ctx context.Context) {
+			next, err := loadSnapshot(ctx)
+			if err != nil {
+				logger.Warn("模型聚合后重建快照失败", "err", err)
+				return
+			}
+			holder.Store(next)
+		},
+	})
+	aggregator.Start(rootCtx)
+
+	// 7) 请求日志记录器（异步批量写入）
 	recorder := logging.NewRecorder(st, logger, logging.RecorderOptions{})
 	recorder.Start(rootCtx)
 
-	// 7) HTTP 服务
+	// 8) HTTP 服务
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	gateway.New(holder, logger).

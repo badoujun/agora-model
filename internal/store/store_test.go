@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,9 +14,31 @@ import (
 	"agora-model/internal/logging"
 )
 
+// tempDBPath 返回一个独立的临时数据库路径。
+//
+// 刻意不用 t.TempDir()：Windows 上 SQLite 关闭后句柄释放可能有延迟，
+// TempDir 的严格清理会因此把测试判为失败；这里改为带重试的静默清理。
+func tempDBPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "agora-store-")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 10; i++ {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Logf("临时目录未能清理（Windows 句柄释放延迟）: %s", dir)
+	})
+	return filepath.Join(dir, "agora.db")
+}
+
 func newTestStore(t *testing.T) (*Store, []byte) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "nested", "agora.db")
+	path := tempDBPath(t)
 	st, err := Open(context.Background(), path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -48,7 +71,7 @@ func sampleProvider(id string) config.Provider {
 }
 
 func TestOpenIsIdempotentAndMigrates(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "agora.db")
+	path := tempDBPath(t)
 	ctx := context.Background()
 
 	first, err := Open(ctx, path)
@@ -59,8 +82,8 @@ func TestOpenIsIdempotentAndMigrates(t *testing.T) {
 	if err := first.DB().QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("读取迁移版本: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("迁移版本 = %d, 期望 1", version)
+	if version != len(migrations) {
+		t.Fatalf("迁移版本 = %d, 期望 %d", version, len(migrations))
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
@@ -70,13 +93,14 @@ func TestOpenIsIdempotentAndMigrates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("二次 Open 应幂等: %v", err)
 	}
-	defer second.Close()
+	t.Cleanup(func() { _ = second.Close() })
+
 	var count int
 	if err := second.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("迁移记录数 = %d, 期望 1（不应重复执行）", count)
+	if count != len(migrations) {
+		t.Fatalf("迁移记录数 = %d, 期望 %d（不应重复执行）", count, len(migrations))
 	}
 }
 
@@ -330,5 +354,127 @@ func TestLogsSchemaDropAndRecreateUnsuitableColumns(t *testing.T) {
 		if !cols[want] {
 			t.Errorf("logs 表缺少字段 %s", want)
 		}
+	}
+}
+
+func TestProviderFetchStatusColumnsAfterMigration(t *testing.T) {
+	st, _ := newTestStore(t)
+	rows, err := st.DB().QueryContext(context.Background(), `SELECT name FROM pragma_table_info('providers')`)
+	if err != nil {
+		t.Fatalf("读取表结构失败: %v", err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		cols[name] = true
+	}
+	for _, want := range []string{"last_fetch_at", "last_fetch_error"} {
+		if !cols[want] {
+			t.Errorf("providers 表缺少迁移 v2 引入的字段 %s", want)
+		}
+	}
+}
+
+func TestModelCacheReplaceLoadAndFetchError(t *testing.T) {
+	st, master := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := st.SaveProvider(ctx, master, sampleProvider("p1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveProvider(ctx, master, sampleProvider("p2")); err != nil {
+		t.Fatal(err)
+	}
+
+	fetchedAt := time.Now().UTC().Truncate(time.Second)
+	if err := st.ReplaceModelCache(ctx, "p1", []string{"m1", "m2"}, fetchedAt); err != nil {
+		t.Fatalf("ReplaceModelCache: %v", err)
+	}
+
+	models, at, err := st.LoadModelCache(ctx, "p1")
+	if err != nil {
+		t.Fatalf("LoadModelCache: %v", err)
+	}
+	if len(models) != 2 || models[0] != "m1" || models[1] != "m2" {
+		t.Fatalf("模型缓存 = %v", models)
+	}
+	if !at.Equal(fetchedAt) {
+		t.Errorf("fetched_at = %v, 期望 %v", at, fetchedAt)
+	}
+
+	all, err := st.LoadAllModelCache(ctx)
+	if err != nil {
+		t.Fatalf("LoadAllModelCache: %v", err)
+	}
+	if len(all["p1"]) != 2 {
+		t.Errorf("批量读取结果 = %v", all)
+	}
+	if _, ok := all["p2"]; ok {
+		t.Error("未拉取的供应商不应出现在缓存中")
+	}
+
+	// 覆盖式替换：旧模型应被清掉
+	if err := st.ReplaceModelCache(ctx, "p1", []string{"m3"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	models, _, _ = st.LoadModelCache(ctx, "p1")
+	if len(models) != 1 || models[0] != "m3" {
+		t.Fatalf("替换后缓存 = %v", models)
+	}
+
+	// 记录失败原因、成功后清空
+	if err := st.SetProviderFetchError(ctx, "p1", "上游返回 401: invalid key"); err != nil {
+		t.Fatalf("SetProviderFetchError: %v", err)
+	}
+	rec, err := st.GetProvider(ctx, "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.LastFetchError, "401") {
+		t.Errorf("last_fetch_error = %q", rec.LastFetchError)
+	}
+
+	if err := st.ReplaceModelCache(ctx, "p1", []string{"m4"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = st.GetProvider(ctx, "p1")
+	if rec.LastFetchError != "" {
+		t.Errorf("成功拉取后应清空 last_fetch_error，得到 %q", rec.LastFetchError)
+	}
+	if rec.LastFetchAt.IsZero() {
+		t.Error("成功拉取后应记录 last_fetch_at")
+	}
+}
+
+func TestSaveProviderPreservesFetchStatus(t *testing.T) {
+	st, master := newTestStore(t)
+	ctx := context.Background()
+
+	p := sampleProvider("p1")
+	if _, err := st.SaveProvider(ctx, master, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReplaceModelCache(ctx, "p1", []string{"cached-model"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 再次保存（例如 Web UI 改了名称）不应清空拉取状态
+	p.Name = "改名后的供应商"
+	if _, err := st.SaveProvider(ctx, master, p); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := st.GetProvider(ctx, "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.LastFetchAt.IsZero() {
+		t.Error("更新供应商不应清空 last_fetch_at")
+	}
+	if rec.Name != "改名后的供应商" {
+		t.Errorf("Name = %q", rec.Name)
 	}
 }
