@@ -1,0 +1,24 @@
+{
+  "gateway": {
+    "api_key": "gw-dev-change-me",
+    "listen": "127.0.0.1",
+    "port": 9090,
+    "sse_idle_seconds": 15,
+    "max_body_bytes": 16777216
+  },
+  "providers": [
+    {
+      "id": "mock",
+      "name": "本地 Mock 上游",
+      "openai_base_url": "http://127.0.0.1:9999/v1",
+      "anthropic_base_url": "http://127.0.0.1:9999/v1",
+      "api_key": "sk-mock-provider-key",
+      "models": ["mock-gpt-4o", "mock-claude-sonnet-4-5", "mock-deepseek-v3"],
+      "priority": 10,
+      "timeout_seconds": 120,
+      "extra_headers": {},
+      "extra_body": {},
+      "enabled": true
+    }
+  ]
+}

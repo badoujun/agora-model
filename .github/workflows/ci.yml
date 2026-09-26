@@ -34,7 +34,7 @@ jobs:
           CGO_ENABLED: '0'
 
       - name: go test
-        run: go test ./...
+        run: go test ./... -count=1
         env:
           CGO_ENABLED: '0'
 
@@ -58,8 +58,8 @@ jobs:
           set -euo pipefail
           go version -m "$OUT" | grep -q 'CGO_ENABLED=0' && echo "CGO_ENABLED=0 OK"
 
-      # 冒烟：仅在本机架构上执行（交叉架构产物无法直接运行）。
-      # Phase 1 完成后，此步骤追加"经网关完成一次 mock 上游透传"的断言。
+      # 冒烟只在本机架构上执行（交叉架构产物无法直接运行）。
+      # 覆盖：healthz、无凭证 401、经网关向 mock 上游完成一次透传。
       - name: 冒烟（本机架构）
         shell: bash
         run: |
@@ -71,12 +71,50 @@ jobs:
             exit 0
           fi
           chmod +x "$OUT" 2>/dev/null || true
-          "$OUT" --listen 127.0.0.1 --port 19090 &
-          pid=$!
-          trap 'kill $pid 2>/dev/null || true' EXIT
+
+          PORT=9999 node tools/mock-upstream/server.mjs > /tmp/mock.log 2>&1 &
+          mock_pid=$!
+          "$OUT" --listen 127.0.0.1 --port 19090 --config config.example.json > /tmp/gw.log 2>&1 &
+          gw_pid=$!
+          trap 'kill $gw_pid $mock_pid 2>/dev/null || true' EXIT
+
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:19090/healthz; then echo; break; fi
+            if curl -fsS http://127.0.0.1:19090/healthz > /dev/null 2>&1; then break; fi
             sleep 1
           done
           curl -fsS http://127.0.0.1:19090/healthz | grep -q '"status":"ok"'
-          echo "冒烟通过"
+          echo "healthz OK"
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:19090/v1/chat/completions \
+            -H 'content-type: application/json' -d '{"model":"mock-gpt-4o"}')
+          [ "$code" = "401" ] || { echo "期望 401，实际 $code"; exit 1; }
+          echo "鉴权 OK"
+
+          out=$(curl -s -X POST http://127.0.0.1:19090/v1/chat/completions \
+            -H 'content-type: application/json' -H 'authorization: Bearer gw-dev-change-me' \
+            -d '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}')
+          echo "$out" | grep -q 'mock' || { echo "透传失败: $out"; exit 1; }
+          echo "双协议透传 OK"
+
+          aout=$(curl -s -X POST http://127.0.0.1:19090/v1/messages \
+            -H 'content-type: application/json' -H 'x-api-key: gw-dev-change-me' -H 'anthropic-version: 2023-06-01' \
+            -d '{"model":"mock-claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}')
+          echo "$aout" | grep -q 'message' || { echo "Anthropic 透传失败: $aout"; exit 1; }
+          echo "Anthropic 透传 OK"
+
+  # race detector 需要 cgo，因此单独一个 job（发布产物一律 CGO_ENABLED=0）
+  race:
+    name: race detector (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test -race
+        env:
+          CGO_ENABLED: '1'
+        run: go test ./... -count=1 -race

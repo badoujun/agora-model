@@ -12,6 +12,7 @@ master.key
 
 # ---- 本地环境与临时文件 ----
 .env
+config.json
 *.local.*
 mock-upstream.log
 

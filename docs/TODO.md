@@ -66,53 +66,61 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 - [ ] **T0.6｜CI 矩阵** ｜ 2h ｜ 依赖 T0.3
   - 流水线矩阵：`os ∈ {windows-latest, ubuntu-latest, macos-latest}` × `goarch ∈ {amd64, arm64}`；步骤：构建 → 单元测试 → 产物冒烟（`/healthz`；Phase 1 后追加经网关的透传断言）。
   - **验收**：六个组合全绿；任一平台失败能明确定位；macOS runner 上确认未签名二进制可启动（必要时先 `xattr -dr com.apple.quarantine`）。
-  - 进度：workflow 已就绪（`.github/workflows/ci.yml`：三平台 × 两架构、`go vet`/`go test`、CGO 校验、仅本机架构冒烟）；**仓库尚无远端，待 push 后才能实际验证**。
+  - 进度：workflow 已就绪（`.github/workflows/ci.yml`：三平台 × 两架构的 `go vet`/`go test`/构建/CGO 校验，本机架构冒烟已含 healthz + 401 + 双协议透传断言，另有独立 `race` job 跑 `go test -race`）；**仓库尚无远端，待 push 后才能实际验证**。
 
 ---
 
 ## Phase 1 · 核心透传网关（3–5 天）
 
-- [ ] **T1.1｜启动配置** ｜ 2h ｜ 依赖 T0.2
+> **进度：已完成（T1.1–T1.14）**
+> 实测证据：
+> - `go test ./... -count=1` **全部通过**（config 11 / route 6 / gateway 21 个用例，含子用例共 38 项）；
+> - `tools/smoke/phase1.ps1` 端到端冒烟 **21/21 通过**：healthz、双风格 401、缺 model 400、未知模型 404、
+>   非流式与流式透传（OpenAI `[DONE]` / Anthropic `message_stop`）、上游凭证替换（`Bearer sk-…` / `x-api-key`）、
+>   `anthropic-version` 透传、SSE 心跳保活、上游超时 504、上游不可达 502、请求体超限 413、
+>   `extra_body` / `extra_headers` 合并、断连后上游请求被取消、mock 上游存活；
+> - 说明：本机 `CGO_ENABLED=0` 且无 gcc，`-race` 不可用，已放到 CI 的独立 Linux job（`CGO_ENABLED=1`）。
+- [x] **T1.1｜启动配置** ｜ 2h ｜ 依赖 T0.2
   - flag/env：`LISTEN_ADDR`(127.0.0.1)、`PORT`(9090)、`DB_PATH`、`GW_MASTER_KEY`、`SSE_IDLE_SECONDS`(15)、`MAX_BODY_BYTES`(16MB)、`LOG_LEVEL`、`ADMIN_PASSWORD`。
   - **验收**：非法组合给出明确报错（如监听 `0.0.0.0` 但未设 `ADMIN_PASSWORD` 时拒绝启动）。
-- [ ] **T1.2｜路由骨架** ｜ 2h ｜ 依赖 T1.1
+- [x] **T1.2｜路由骨架** ｜ 2h ｜ 依赖 T1.1
   - 注册 `POST /v1/chat/completions`、`POST /v1/messages`、`GET /v1/models`、`GET /healthz`；未知路径 404。
   - **验收**：路径识别到协议映射正确（openai/anthropic）。
-- [ ] **T1.3｜配置快照 + 引导配置** ｜ 3h ｜ 依赖 T1.1
+- [x] **T1.3｜配置快照 + 引导配置** ｜ 3h ｜ 依赖 T1.1
   - `atomic.Pointer[ConfigSnapshot]`，Phase 1 先用 JSON 文件加载（Phase 2 切换 SQLite，接口不变）。
   - **验收**：改配置后重启生效；快照替换是原子的（无半更新状态）。
-- [ ] **T1.4｜入站认证** ｜ 2h ｜ 依赖 T1.2
+- [x] **T1.4｜入站认证** ｜ 2h ｜ 依赖 T1.2
   - OpenAI：`Authorization: Bearer <gw-key>`；Anthropic：`x-api-key`（兼容 Bearer）。
   - `sha256` 存储 + `subtle.ConstantTimeCompare`；失败 → 401。
   - **验收**：错误 Key 返回 401，且错误体风格符合入站协议。
-- [ ] **T1.5｜请求体读取 / 限制 / model 探测** ｜ 3h ｜ 依赖 T1.2
+- [x] **T1.5｜请求体读取 / 限制 / model 探测** ｜ 3h ｜ 依赖 T1.2
   - `io.LimitReader(body, maxBody+1)`；超限 413；`json.Unmarshal` 只探测 `model`；缺失 → 400。
   - **验收**：17MB 请求返回 413；无 `model` 返回 400（DESIGN §7.2）。
-- [ ] **T1.6｜路由决策 v1** ｜ 3h ｜ 依赖 T1.3、T1.5
+- [x] **T1.6｜路由决策 v1** ｜ 3h ｜ 依赖 T1.3、T1.5
   - 按 `priority` 升序取第一个 enabled 且包含该模型的供应商；未命中 → 404 `model_not_found`。
   - **验收**：表驱动单测覆盖「命中/未命中/多供应商优先级/停用供应商」。
-- [ ] **T1.7｜头改写** ｜ 3h ｜ 依赖 T1.6
+- [x] **T1.7｜头改写** ｜ 3h ｜ 依赖 T1.6
   - 剥离逐跳头与 `Accept-Encoding`；替换认证头；注入 `extra_headers`；`Host` 重写；`Transport.DisableCompression = true`。
   - **验收**：mock 上游收到的头部符合 DESIGN §5.3 表格（含 `anthropic-version` 原样透传）。
-- [ ] **T1.8｜非流式透传** ｜ 3h ｜ 依赖 T1.7
+- [x] **T1.8｜非流式透传** ｜ 3h ｜ 依赖 T1.7
   - 透传状态码、响应头（剥离逐跳）、响应体；不缓冲整包。
   - **验收**：mock 返回的字节与客户端收到的一致（`model` 未改写时字节级相同）。
-- [ ] **T1.9｜上游超时与连接池** ｜ 2h ｜ 依赖 T1.7
+- [x] **T1.9｜上游超时与连接池** ｜ 2h ｜ 依赖 T1.7
   - `context.WithTimeout` 按 `provider.timeout_seconds`；共享 `http.Transport`（`MaxIdleConnsPerHost` 合理值）；**不使用** `Client.Timeout`（会误杀长流）。
   - **验收**：mock 延迟 > 超时值 → 504；长流不被全局超时掐断。
-- [ ] **T1.10｜SSE 透传** ｜ 4h ｜ 依赖 T1.8
+- [x] **T1.10｜SSE 透传** ｜ 4h ｜ 依赖 T1.8
   - 按 DESIGN §7.4 实现 `pumpSSE`（读协程投递 chunk）+ `streamSSE`（主循环写客户端）。
   - **验收**：mock 分 10 块吐 SSE，客户端逐块实时收到（非一次性）；无内容改写。
-- [ ] **T1.11｜SSE 心跳保活** ｜ 3h ｜ 依赖 T1.10
+- [x] **T1.11｜SSE 心跳保活** ｜ 3h ｜ 依赖 T1.10
   - 空闲达 `SSE_IDLE_SECONDS` 注入 `: keep-alive\n\n` 并 Flush；有数据重置计时器。
   - **验收**：mock 静默 20s，客户端在此期间收到 ≥1 行注释；恢复数据后内容与上游一致。
-- [ ] **T1.12｜客户端断开取消** ｜ 2h ｜ 依赖 T1.10
+- [x] **T1.12｜客户端断开取消** ｜ 2h ｜ 依赖 T1.10
   - 上游请求使用入站 `ctx`；断言断开后上游被取消、读协程退出。
   - **验收**：集成测试中 `runtime.NumGoroutine` 回落到基线；mock 观察到 ctx 取消（对应 DESIGN §11「取消测试」）。
-- [ ] **T1.13｜统一错误响应** ｜ 2h ｜ 依赖 T1.4、T1.6
+- [x] **T1.13｜统一错误响应** ｜ 2h ｜ 依赖 T1.4、T1.6
   - 实现 DESIGN §5.4 的状态码与 `code`/`error.type` 映射；上游错误原样回传。
   - **验收**：同一错误在 OpenAI 路径与 Anthropic 路径返回各自风格的错误体。
-- [ ] **T1.14｜Phase 1 测试与冒烟** ｜ 4h ｜ 依赖 T1.1–T1.13
+- [x] **T1.14｜Phase 1 测试与冒烟** ｜ 4h ｜ 依赖 T1.1–T1.13
   - 单测：路由、头改写、body 限制、错误映射；集成：mock 上游端到端。
   - **验收（Phase 1 DoD）**：Claude Code 配 `ANTHROPIC_BASE_URL` 可流式对话；OpenAI SDK 配 `OPENAI_BASE_URL` 可流式对话；静默 20s 不断流；断开无泄漏。
 

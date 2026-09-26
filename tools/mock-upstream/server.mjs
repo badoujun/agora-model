@@ -33,9 +33,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function qp(req, key) {
   return new URL(req.url, 'http://localhost').searchParams.get(key);
 }
+// param 优先读 x-mock-<key> 请求头（便于经网关透传注入故障），其次读 query 参数
+function param(req, key) {
+  const header = req.headers['x-mock-' + key];
+  if (header !== undefined) return Array.isArray(header) ? header[0] : header;
+  return qp(req, key);
+}
+
 function num(req, key, def) {
-  const v = qp(req, key);
-  return v === null ? def : Number(v);
+  const v = param(req, key);
+  return v === null || v === undefined ? def : Number(v);
 }
 
 function readBody(req) {
@@ -71,6 +78,8 @@ function record(req, body) {
     },
     bodyBytes: body.length,
     model: modelOf(body),
+    bodyPreview: body.toString('utf8').slice(0, 512),
+    xHeaders: Object.fromEntries(Object.entries(req.headers).filter(([k]) => k.startsWith('x-'))),
   };
   requests.push(entry);
   if (requests.length > 100) requests.shift();
@@ -103,6 +112,10 @@ async function openaiStream(req, res, model) {
   const silence = num(req, 'silence', 0);
   sseHeaders(res);
   for (let i = 0; i < chunks; i++) {
+    if (res.destroyed || res.writableEnded) {
+      console.log('[mock] 客户端已断开，停止推送流式分块');
+      return;
+    }
     const chunk = {
       id: 'chatcmpl-mock',
       object: 'chat.completion.chunk',
@@ -176,6 +189,10 @@ async function anthropicStream(req, res, model) {
   });
   send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
   for (let i = 0; i < chunks; i++) {
+    if (res.destroyed || res.writableEnded) {
+      console.log('[mock] 客户端已断开，停止推送流式分块');
+      return;
+    }
     send('content_block_delta', {
       type: 'content_block_delta',
       index: 0,
@@ -217,6 +234,10 @@ const server = http.createServer(async (req, res) => {
     }
     return sendJSON(res, 200, { count: requests.length, requests });
   }
+
+  // 客户端断开时不要让未捕获的 'error' 事件杀掉进程
+  req.on('error', (err) => console.log(`[mock] 请求流错误: {err.code || err.message}`));
+  res.on('error', (err) => console.log(`[mock] 响应流错误（可能客户端断开）: {err.code || err.message}`));
 
   const body = await readBody(req);
   record(req, body);
