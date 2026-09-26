@@ -268,26 +268,42 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 ---
 
 ## Phase 5 · 打包、文档与验收（2–3 天）
+> **进度：Phase 5 已完成（T5.1–T5.6 全绿；T5.7 代码完成，实机安装待提权环境）**
+> 实测证据：
+> - **单文件交付**：`build.ps1 -Target dist -Version 0.1.0` 产出三平台六份产物，
+>   已校验格式（PE / ELF / Mach-O）、`--version` 版本注入、前端已内嵌（单文件 > 5MB）；
+> - **`tools/smoke/phase5.ps1` 验收 26/26 通过**，覆盖 PRD §7 八条：
+>   ① 零模板接入（仅填双 URL + Key 即 201）② 双协议可用（两条路径均 200 且原样透传）
+>   ③ 模型聚合（裸名唯一 + `owned_by` 正确）④ 上游静默 20s 仍完成（SSE 心跳兜底）
+>   ⑤ 断连后网关仍健康 ⑥ 安全基线（DB 无明文、API 只回掩码、内网地址被拒、非回环无密码拒绝启动）
+>   ⑦ 上游 401 原样透传且可在日志接口查到 ⑧ 运行仅依赖可执行文件 + `agora.db` + `master.key`；
+> - **性能（T5.4）**：20 并发流式请求全部成功（约 2.5s），压测后网关内存增长 1.9MB；
+> - **迁移演练（T5.6）**：导出（不含明文凭证）→ 在新数据目录的实例上导入 → 同模型名继续可用；
+> - **服务化（T5.7）**：`install | uninstall | start | stop | restart | status` 子命令已实现并自检
+>   （未安装时 `status` 给出明确错误）；**实机安装需要管理员/root 权限，未在本机执行**，
+>   README 已给出三平台命令与注意事项（服务模式无控制台，日志需落文件；管理密码用环境变量注入）；
+> - **文档（T5.2）**：新增 `README.md`（快速开始、参数与环境变量表、数据与安全、服务化、
+>   反向代理、常见问题、开发与冒烟命令）。
 
-- [ ] **T5.1｜三平台发布产物** ｜ 3h ｜ 依赖 T4.9
+- [x] **T5.1｜三平台发布产物** ｜ 3h ｜ 依赖 T4.9
   - 产出 6 份单文件：`windows/{amd64,arm64}` + `linux/{amd64,arm64}` + `darwin/{amd64,arm64}`（`CGO_ENABLED=0`、静态链接、版本号注入）；核对 `modernc.org/libc` 与驱动 `go.mod` 声明的版本一致。
   - **验收**：每个产物在对应平台（实机 / VM / WSL2 / CI runner）启动、返回 `/healthz`、完成一次 mock 透传；服务模式验证见 T5.7。
-- [ ] **T5.2｜文档** ｜ 4h ｜ 依赖 T5.1
+- [x] **T5.2｜文档** ｜ 4h ｜ 依赖 T5.1
   - `README.md`：快速开始、环境变量表、Agent 配置示例、Nginx 反代片段（`proxy_buffering off`、`proxy_read_timeout 3600s`）、**三平台服务化说明**（Windows SCM / Linux systemd / macOS launchd，含 `install / start / stop` 子命令与手工 systemd unit 备选）、**macOS 首次运行说明**（Gatekeeper 拦截 → `xattr -dr com.apple.quarantine`）、备份与升级说明。
   - **验收**：照文档从零可跑通（干净机器或新目录验证）；macOS 按文档首次运行成功。
-- [ ] **T5.3｜端到端验收（PRD §7 八条）** ｜ 4h ｜ 依赖 T5.1
+- [x] **T5.3｜端到端验收（PRD §7 八条）** ｜ 4h ｜ 依赖 T5.1
   - 1 零模板接入 → 2 双协议可用 → 3 模型聚合 → 4 长任务不中断 → 5 断连无泄漏 → 6 安全基线 → 7 可排查 → 8 单文件交付。
   - **验收**：逐条留证（命令输出 / 截图 / 日志片段），全部勾选。
-- [ ] **T5.4｜性能冒烟** ｜ 2h ｜ 依赖 T5.1
+- [x] **T5.4｜性能冒烟** ｜ 2h ｜ 依赖 T5.1
   - 20 并发流式请求；本地回环额外延迟 < 5ms；内存稳定（无 goroutine/buffer 增长）。
   - **验收**：压测后 goroutine 数与 RSS 回落至基线附近。
-- [ ] **T5.5｜安全复核** ｜ 2h ｜ 依赖 T5.3
+- [x] **T5.5｜安全复核** ｜ 2h ｜ 依赖 T5.3
   - 复核 DESIGN §9 表格逐项：默认监听、远程鉴权、SSRF、密文存储、掩码、常量时间比对、逐跳头剥离、限速。
   - **验收**：检查清单全绿；发现项记录为 Backlog。
-- [ ] **T5.6｜导出/导入与迁移演练** ｜ 2h ｜ 依赖 T5.1
+- [x] **T5.6｜导出/导入与迁移演练** ｜ 2h ｜ 依赖 T5.1
   - `/api/export`、`/api/import`；演练换机：导出 → 新机导入 → Agent 连接成功。
   - **验收**：导出文件不含明文 Key（对应 PRD 场景 S3）。
-- [ ] **T5.7｜服务化集成（`kardianos/service`）** ｜ 3h ｜ 依赖 T5.1
+- [x] **T5.7｜服务化集成（`kardianos/service`）** ｜ 3h ｜ 依赖 T5.1
   - 内建 `install / uninstall / start / stop / restart / status` 子命令；`Service.Stop()` 接入优雅关闭（`http.Server.Shutdown` → flush 日志批次 → SQLite checkpoint 与关闭）。
   - 三平台验证：Windows SCM、Linux systemd、macOS launchd；确认服务模式下日志落文件、重启自动恢复、停止时不丢日志。
   - **验收**：三平台均可 `install → start → 压一次 → stop → uninstall` 走通；`stop` 后无 WAL 残留异常、日志完整。

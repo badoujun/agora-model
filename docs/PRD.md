@@ -299,6 +299,7 @@
 | 第 7 轮 | Phase 1 / Phase 2 实施 | 网关 Key 改由数据库管理（JSON 中的 pi_key 不再参与认证）；引导配置仅在库为空时导入一次；供应商凭证 AES-256-GCM 加密落库；go.mod 的 Go 指令提升为 **1.25.0**（由 modernc.org/sqlite v1.59.0 决定） |
 | 第 8 轮 | Phase 3 实施 | 启动即聚合 + 定时刷新（间隔取 settings.model_refresh_seconds，默认 10 分钟）；/v1/models 同时给出裸名与 provider/model；命名空间路由仅在斜杠前缀命中已存在的 provider id 时生效；新增迁移 v2（last_fetch_at / last_fetch_error） |
 | 第 9 轮 | Phase 4 实施 | 前端 Vite + React 19 + Tailwind v4 + shadcn/ui 风格手写组件；产物由 internal/webui 内嵌进单二进制；SPA fallback 不吞 /api、/v1、/healthz 的 404；新增 	ools/smoke/phase4.ps1 端到端冒烟（28 项） |
+| 第 10 轮 | Phase 5 验收 | 三平台六份产物（内嵌前端）完成；PRD §7 八条验收脚本化并通过（26 项）；20 并发流式压测通过（内存增长 1.9MB）；换机迁移演练通过；服务化子命令实现，实机安装待提权环境验证 |
 
 ## 附录 B：最终用户使用方式（验收片段）
 

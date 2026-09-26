@@ -113,3 +113,4 @@ switch ($Target) {
 }
 
 Write-Host "完成（version=$Version，target=$Target）"
+exit 0

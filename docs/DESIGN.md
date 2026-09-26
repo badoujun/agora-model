@@ -899,6 +899,7 @@ location / {
 ```
 
 - **服务化（已定案：`kardianos/service`）**：同一二进制内建 `install / uninstall / start / stop / restart / status` 子命令，自动对接各平台服务管理器——**Windows：SCM；Linux：systemd；macOS：launchd**。
+  - **实现状态**：子命令已实现并自检；install 时会把 --config/--data-dir/--db/--port 转为绝对路径写入服务配置；管理密码**不写入**服务参数（避免明文落盘），需通过环境变量注入；实机安装需管理员/root 权限。
   - 该库为**纯 Go（无 CGO）**，不影响 ADR-001 的跨平台基线。
   - **停止事件必须接入优雅关闭**：`service.Interface.Stop()` → `cancel()` → `http.Server.Shutdown(ctx)` → 停止日志批量写入并 flush → 关闭 SQLite 连接（WAL checkpoint），确保不丢日志、不损坏数据库。
   - **服务模式没有控制台**：日志必须落文件（或平台日志），不得依赖 stdout；建议 `--log-format=json` 便于采集。

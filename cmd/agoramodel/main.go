@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +29,8 @@ import (
 	"agora-model/internal/platform"
 	"agora-model/internal/store"
 	"agora-model/internal/webui"
+
+	"github.com/kardianos/service"
 )
 
 // version 由构建脚本以 -ldflags "-X main.version=<ver>" 注入。
@@ -56,7 +59,7 @@ func main() {
 	}
 
 	logger := newLogger(*logFormat, *logLevel)
-	if err := run(logger, options{
+	opts := options{
 		ConfigPath:      *configPath,
 		DataDir:         *dataDir,
 		DBPath:          *dbPath,
@@ -64,7 +67,35 @@ func main() {
 		Port:            *port,
 		ResetGatewayKey: *resetKey,
 		AdminPassword:   *adminPass,
-	}); err != nil {
+	}
+
+	// 服务管理子命令（T5.7）：agoramodel install|uninstall|start|stop|restart|status
+	if cmd := serviceCommand(); cmd != "" {
+		if err := runServiceCommand(cmd, logger, opts); err != nil {
+			logger.Error("服务操作失败", "command", cmd, "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// 由 SCM / systemd / launchd 拉起时，生命周期交给各平台服务管理器；
+	// 前台运行时自行响应信号。
+	if !service.Interactive() {
+		s, err := newService(logger, opts)
+		if err != nil {
+			logger.Error("初始化服务失败", "err", err)
+			os.Exit(1)
+		}
+		if err := s.Run(); err != nil {
+			logger.Error("服务运行失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runServer(ctx, logger, opts); err != nil {
 		logger.Error("启动失败", "err", err)
 		os.Exit(1)
 	}
@@ -80,7 +111,12 @@ type options struct {
 	AdminPassword   string
 }
 
-func run(logger *slog.Logger, opts options) error {
+// runServer 启动并运行网关主体逻辑，直到 ctx 被取消。
+func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
+	// 派生可取消的 ctx：HTTP 服务异常退出时需要主动结束整个进程
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// 1) 数据目录与数据库
 	dir := opts.DataDir
 	if dir == "" {
@@ -98,10 +134,7 @@ func run(logger *slog.Logger, opts options) error {
 		dbFile = filepath.Join(dir, "agora.db")
 	}
 
-	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	st, err := store.Open(rootCtx, dbFile)
+	st, err := store.Open(ctx, dbFile)
 	if err != nil {
 		return err
 	}
@@ -121,25 +154,25 @@ func run(logger *slog.Logger, opts options) error {
 	}
 
 	// 3) 首次启动：用 JSON 引导配置导入供应商（之后以数据库为准）
-	imported, err := bootstrap(rootCtx, st, master, opts.ConfigPath, logger)
+	imported, err := bootstrap(ctx, st, master, opts.ConfigPath, logger)
 	if err != nil {
 		return err
 	}
 
 	// 4) 网关 Key：确保存在，必要时打印新生成的明文（只打印一次）
 	if opts.ResetGatewayKey {
-		plain, err := st.ResetGatewayKey(rootCtx)
+		plain, err := st.ResetGatewayKey(ctx)
 		if err != nil {
 			return err
 		}
 		logger.Warn("网关 Key 已重置：旧的 Key 立即失效，请更新所有 Agent 的配置", "gateway_key", plain)
 	}
-	if plain, created, err := st.EnsureGatewayKey(rootCtx); err != nil {
+	if plain, created, err := st.EnsureGatewayKey(ctx); err != nil {
 		return err
 	} else if created {
 		logger.Warn("已生成网关 Key（明文只显示这一次，请立即保存）", "gateway_key", plain)
 	}
-	keyInfo, err := st.ActiveGatewayKey(rootCtx)
+	keyInfo, err := st.ActiveGatewayKey(ctx)
 	if err != nil {
 		return err
 	}
@@ -198,7 +231,7 @@ func run(logger *slog.Logger, opts options) error {
 		return config.NewSnapshot(config.File{Gateway: gwSettings, Providers: providers})
 	}
 
-	snapshot, err := loadSnapshot(rootCtx)
+	snapshot, err := loadSnapshot(ctx)
 	if err != nil {
 		return fmt.Errorf("%w（可用 --config 提供引导配置，或等待 Web UI 添加供应商）", err)
 	}
@@ -216,11 +249,11 @@ func run(logger *slog.Logger, opts options) error {
 			holder.Store(next)
 		},
 	})
-	aggregator.Start(rootCtx)
+	aggregator.Start(ctx)
 
 	// 7) 请求日志记录器（异步批量写入）
 	recorder := logging.NewRecorder(st, logger, logging.RecorderOptions{})
-	recorder.Start(rootCtx)
+	recorder.Start(ctx)
 
 	// 8) HTTP 服务
 	mux := http.NewServeMux()
@@ -269,11 +302,11 @@ func run(logger *slog.Logger, opts options) error {
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP 服务异常退出", "err", err)
-			stop()
+			cancel()
 		}
 	}()
 
-	<-rootCtx.Done()
+	<-ctx.Done()
 	logger.Info("收到退出信号，开始优雅关闭")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -368,4 +401,134 @@ func newLogger(format, level string) *slog.Logger {
 		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
 	}
 	return slog.New(slog.NewTextHandler(os.Stdout, opts))
+}
+
+// ---------------- 服务化（T5.7） ----------------
+
+// serviceCommand 解析服务管理子命令。
+func serviceCommand() string {
+	if len(os.Args) < 2 {
+		return ""
+	}
+	switch strings.ToLower(os.Args[1]) {
+	case "install", "uninstall", "start", "stop", "restart", "status":
+		return strings.ToLower(os.Args[1])
+	}
+	return ""
+}
+
+// serviceArguments 生成服务启动参数（路径转绝对，避免服务工作目录不同导致找不到配置）。
+//
+// 刻意不写入管理密码：请通过服务配置注入 ADMIN_PASSWORD 环境变量，避免明文落在 unit 文件里。
+func serviceArguments(opts options) []string {
+	args := make([]string, 0, 10)
+	appendPath := func(flagName, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		if abs, err := filepath.Abs(value); err == nil {
+			args = append(args, flagName, abs)
+			return
+		}
+		args = append(args, flagName, value)
+	}
+	appendPath("--config", opts.ConfigPath)
+	appendPath("--data-dir", opts.DataDir)
+	appendPath("--db", opts.DBPath)
+	if opts.Listen != "" {
+		args = append(args, "--listen", opts.Listen)
+	}
+	if opts.Port != 0 {
+		args = append(args, "--port", strconv.Itoa(opts.Port))
+	}
+	return args
+}
+
+func newService(logger *slog.Logger, opts options) (service.Service, error) {
+	prg := &serviceProgram{logger: logger, opts: opts}
+	return service.New(prg, &service.Config{
+		Name:        "agoramodel",
+		DisplayName: "AgoraModel Gateway",
+		Description: "AI Agent 统一接入网关（双协议透传 + 模型聚合 + Web 控制台）",
+		Arguments:   serviceArguments(opts),
+	})
+}
+
+func runServiceCommand(cmd string, logger *slog.Logger, opts options) error {
+	s, err := newService(logger, opts)
+	if err != nil {
+		return err
+	}
+	switch cmd {
+	case "install":
+		if err := s.Install(); err != nil {
+			return err
+		}
+		logger.Info("服务已安装（Windows: SCM / Linux: systemd / macOS: launchd）", "name", "agoramodel")
+		logger.Info("提示：如需登录保护，请在服务配置中注入环境变量 ADMIN_PASSWORD 后再启动")
+		return nil
+	case "uninstall":
+		return s.Uninstall()
+	case "start":
+		return s.Start()
+	case "stop":
+		return s.Stop()
+	case "restart":
+		return s.Restart()
+	case "status":
+		status, err := s.Status()
+		if err != nil {
+			return err
+		}
+		logger.Info("服务状态", "status", serviceStatusText(status))
+		return nil
+	}
+	return fmt.Errorf("未知的服务子命令：%s", cmd)
+}
+
+func serviceStatusText(status service.Status) string {
+	switch status {
+	case service.StatusRunning:
+		return "running"
+	case service.StatusStopped:
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
+// serviceProgram 把网关主体接入各平台服务管理器的生命周期。
+type serviceProgram struct {
+	logger *slog.Logger
+	opts   options
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (p *serviceProgram) Start(service.Service) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+	p.done = make(chan struct{})
+	go func() {
+		defer close(p.done)
+		if err := runServer(ctx, p.logger, p.opts); err != nil {
+			p.logger.Error("服务已退出", "err", err)
+		}
+	}()
+	return nil
+}
+
+// Stop 由服务管理器在停止时调用：取消 ctx，触发记录日志刷盘与数据库关闭。
+func (p *serviceProgram) Stop(service.Service) error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	if p.done != nil {
+		select {
+		case <-p.done:
+		case <-time.After(15 * time.Second):
+			p.logger.Warn("服务停止超时：可能仍有连接在传输")
+		}
+	}
+	return nil
 }
