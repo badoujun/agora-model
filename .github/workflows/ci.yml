@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  # 三平台 × 两架构的构建与冒烟矩阵（T0.6）
+  build-test:
+    name: ${{ matrix.runner }} / ${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, goos: windows, goarch: amd64 }
+          - { runner: windows-latest, goos: windows, goarch: arm64 }
+          - { runner: ubuntu-latest,  goos: linux,   goarch: amd64 }
+          - { runner: ubuntu-latest,  goos: linux,   goarch: arm64 }
+          - { runner: macos-latest,   goos: darwin,  goarch: amd64 }
+          - { runner: macos-latest,   goos: darwin,  goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: '0'
+
+      - name: go test
+        run: go test ./...
+        env:
+          CGO_ENABLED: '0'
+
+      - name: 构建目标产物（CGO 关闭）
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/agoramodel-$GOOS-$GOARCH"
+          if [ "$GOOS" = "windows" ]; then out="$out.exe"; fi
+          go build -trimpath -ldflags "-s -w -X main.version=ci-${GITHUB_SHA::7}" -o "$out" ./cmd/agoramodel
+          echo "OUT=$out" >> "$GITHUB_ENV"
+
+      - name: 校验 CGO 已关闭
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version -m "$OUT" | grep -q 'CGO_ENABLED=0' && echo "CGO_ENABLED=0 OK"
+
+      # 冒烟：仅在本机架构上执行（交叉架构产物无法直接运行）。
+      # Phase 1 完成后，此步骤追加"经网关完成一次 mock 上游透传"的断言。
+      - name: 冒烟（本机架构）
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_arch="$(go env GOHOSTARCH)"
+          host_os="$(go env GOHOSTOS)"
+          if [ "$host_os" != "$GOOS" ] || [ "$host_arch" != "$GOARCH" ]; then
+            echo "跳过冒烟：目标 $GOOS/$GOARCH != 本机 $host_os/$host_arch"
+            exit 0
+          fi
+          chmod +x "$OUT" 2>/dev/null || true
+          "$OUT" --listen 127.0.0.1 --port 19090 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:19090/healthz; then echo; break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:19090/healthz | grep -q '"status":"ok"'
+          echo "冒烟通过"

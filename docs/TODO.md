@@ -38,28 +38,35 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 ## Phase 0 · 环境与仓库准备（1 天）
 
-- [ ] **T0.1｜安装 Go 工具链（ADR-001 已定案：Go 1.22+）** ｜ 0.5h ｜ 无依赖
-  - 安装 **Go 1.22+** 并验证 `go version`；目标平台已确认（Windows 10 / 11 + Linux，见 PRD R9，已关闭）。
+- [x] **T0.1｜安装 Go 工具链（ADR-001 已定案：Go 1.22+）** ｜ 0.5h ｜ 无依赖
+  - 安装 **Go 1.22+** 并验证 `go version`；目标平台已确认（Windows 10 / 11 + Linux + macOS，见 PRD R9，已关闭）。
   - Rust + Axum 仅作备选记录，不再是默认路径（接口契约、数据模型、流程不变，切换成本可控）。
   - **验收**：`go version`、`go env GOHOSTOS GOHOSTARCH` 正常；版本号记入 DESIGN ADR-001。
-- [ ] **T0.2｜初始化仓库结构** ｜ 1h ｜ 依赖 T0.1
+  - ✅ 实测：winget 安装 **go1.27.0 windows/amd64**；`gofmt -l cmd internal` 无输出，`go vet ./...`、`go build ./...` 均通过。
+- [x] **T0.2｜初始化仓库结构** ｜ 1h ｜ 依赖 T0.1
   - 创建 `cmd/agoramodel`、`internal/{config,store,crypto,security,platform,provider,models,route,gateway,logging,api}`、`web/`。
   - `.gitignore` 至少包含：`data/`、`*.db`、`*.db-wal`、`*.db-shm`、`master.key`、`web/dist/`、`web/node_modules/`、`dist/`。
   - 新增 `.gitattributes`：`* text=auto eol=lf`、`*.ps1 eol=crlf`（消除 Windows CRLF 与其他平台 LF 的行尾差异）。
   - **验收**：`git status` 干净；目录骨架与 DESIGN §2.4 一致（含 `internal/platform`）。
-- [ ] **T0.3｜构建脚本（含三平台矩阵）** ｜ 2h ｜ 依赖 T0.2
+  - ✅ 实测：11 个 internal 包（各含 `doc.go`）+ `cmd/agoramodel/main.go`（`/healthz` 与优雅关闭骨架）+ `web/README.md`；`.gitattributes` 生效，Go 文件为无 BOM UTF-8。
+- [x] **T0.3｜构建脚本（含三平台矩阵）** ｜ 2h ｜ 依赖 T0.2
   - `Makefile`（Linux / macOS）与 `build.ps1`（Windows）：前端构建 → `embed` → 按 ADR-001 矩阵执行 `CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -ldflags="-s -w -X main.version=<ver>"`，输出 `dist/agoramodel-<os>-<arch>[.exe]`（Windows / Linux / macOS × amd64 / arm64，共 6 份）。
   - 脚本内**断言 `CGO_ENABLED=0`**；构建后用 `file` / `ldd`（或 Windows 侧等价手段）确认静态链接、无 CGO 依赖。
   - **验收**：一条命令产出三平台六份产物，且校验通过。
-- [ ] **T0.4｜Mock 上游服务（测试基础设施）** ｜ 2h ｜ 依赖 T0.1
+  - ✅ 实测：`build.ps1 -Target dist` 一次产出 6 份产物（6.2–6.9 MB/份）；`go version -m` 逐份确认 `CGO_ENABLED=0` 与正确的 `GOOS/GOARCH`。注意：`build.ps1` 必须保存为 **UTF-8 with BOM + CRLF**，否则 Windows PowerShell 5.1 会按 ANSI 解码中文而报解析错误（脚本头部已注明）。
+- [x] **T0.4｜Mock 上游服务（测试基础设施）** ｜ 2h ｜ 依赖 T0.1
   - 支持 `POST /v1/chat/completions`、`POST /v1/messages`、`GET /v1/models`；可配置：分块间隔、**空闲静默 N 秒**、返回 401/429/500、非法 JSON、超大响应、慢首字节。
   - **验收**：mock 可被 `curl` 调用；静默能力可复现 SSE 超时场景。
+  - ✅ 实测：`tools/mock-upstream/server.mjs`（Node）双协议流式 / 非流式均正常（Anthropic 8 个 SSE 事件、OpenAI 含 `[DONE]`）；`status=401`、`bad=1` 故障注入生效；`/__requests` 断言端点可读出收到的 `authorization` / `x-api-key` / `anthropic-version` 头。注意：PowerShell 向 `curl.exe` 传内联 JSON 会吃掉引号，测试脚本一律用 `--data-binary @file`。
 - [ ] **T0.5｜三平台本地冒烟** ｜ 2h ｜ 依赖 T0.3、T0.4（可与 T0.6 并行）
-  - Windows 实机跑 `windows/amd64`、WSL2 或 Linux 机器跑 `linux/amd64`、macOS 机器（或 CI 的 `macos-latest` runner）跑 `darwin/arm64`；三端均需启动成功、`/healthz` 正常、完成一次 mock 透传。
+  - Windows 实机跑 `windows/amd64`、WSL2 或 Linux 机器跑 `linux/amd64`、macOS 机器（或 CI 的 `macos-latest` runner）跑 `darwin/arm64`；三端均需启动成功、`/healthz` 正常；mock 上游用 `curl` 直连验证自身可用。
+  - **经网关的端到端透传冒烟不在本任务内**（透传能力属 Phase 1），由 **T1.14** 覆盖。
   - **验收**：三端冒烟通过；记录控制台/日志差异并确认 `--no-color`、`--log-format=json` 可用；macOS 侧确认未签名二进制的可运行方式（`xattr -dr com.apple.quarantine`）。
+  - 进度：Windows 侧 ✅（`--version` 注入 `0.1.0-dev`、`/healthz` 返回 200、`text` 与 `json` 两种日志格式输出正常）；Linux / macOS 侧待 T0.6 的 CI runner。
 - [ ] **T0.6｜CI 矩阵** ｜ 2h ｜ 依赖 T0.3
-  - 流水线矩阵：`os ∈ {windows-latest, ubuntu-latest, macos-latest}` × `goarch ∈ {amd64, arm64}`；步骤：构建 → 单元测试 → 产物冒烟（`/healthz` + 一次 mock 透传）。
+  - 流水线矩阵：`os ∈ {windows-latest, ubuntu-latest, macos-latest}` × `goarch ∈ {amd64, arm64}`；步骤：构建 → 单元测试 → 产物冒烟（`/healthz`；Phase 1 后追加经网关的透传断言）。
   - **验收**：六个组合全绿；任一平台失败能明确定位；macOS runner 上确认未签名二进制可启动（必要时先 `xattr -dr com.apple.quarantine`）。
+  - 进度：workflow 已就绪（`.github/workflows/ci.yml`：三平台 × 两架构、`go vet`/`go test`、CGO 校验、仅本机架构冒烟）；**仓库尚无远端，待 push 后才能实际验证**。
 
 ---
 

@@ -1,0 +1,16 @@
+# 统一以 LF 存储：避免 Windows 检出成 CRLF，破坏脚本 / SQL / Go 源码 / 文档的行尾一致性
+* text=auto eol=lf
+
+# Windows 专用脚本仍用 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不做行尾转换
+*.exe binary
+*.db binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.webp binary

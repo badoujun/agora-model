@@ -1,0 +1,29 @@
+# ---- 构建产物 ----
+/dist/
+/web/dist/
+/web/node_modules/
+
+# ---- 运行数据（含 SQLite 数据库与加密凭证，切勿提交）----
+/data/
+*.db
+*.db-wal
+*.db-shm
+master.key
+
+# ---- 本地环境与临时文件 ----
+.env
+*.local.*
+mock-upstream.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 工具运行时目录（Reasonix 等 agent 宿主）----
+.reasonix/
+
+# ---- Go ----
+*.test
+*.out
