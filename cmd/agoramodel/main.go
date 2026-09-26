@@ -15,9 +15,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"agora-model/internal/api"
 	"agora-model/internal/config"
 	"agora-model/internal/crypto"
 	"agora-model/internal/gateway"
@@ -41,6 +43,7 @@ func main() {
 		logLevel   = flag.String("log-level", "info", "日志级别：debug|info|warn|error")
 		noColor    = flag.Bool("no-color", false, "禁用彩色输出")
 		resetKey   = flag.Bool("reset-gateway-key", false, "吊销现有网关 Key 并生成新的（明文只打印一次）")
+		adminPass  = flag.String("admin-password", "", "Web UI 管理密码（也可用环境变量 ADMIN_PASSWORD；非回环监听时必填）")
 		showVer    = flag.Bool("version", false, "打印版本并退出")
 	)
 	flag.Parse()
@@ -59,6 +62,7 @@ func main() {
 		Listen:          *listen,
 		Port:            *port,
 		ResetGatewayKey: *resetKey,
+		AdminPassword:   *adminPass,
 	}); err != nil {
 		logger.Error("启动失败", "err", err)
 		os.Exit(1)
@@ -72,6 +76,7 @@ type options struct {
 	Listen          string
 	Port            int
 	ResetGatewayKey bool
+	AdminPassword   string
 }
 
 func run(logger *slog.Logger, opts options) error {
@@ -167,6 +172,16 @@ func run(logger *slog.Logger, opts options) error {
 		gwSettings.Port = opts.Port
 	}
 
+	// 访问控制：默认仅回环；非回环监听必须设置管理密码（DESIGN §9）
+	adminPassword := strings.TrimSpace(opts.AdminPassword)
+	if adminPassword == "" {
+		adminPassword = strings.TrimSpace(os.Getenv("ADMIN_PASSWORD"))
+	}
+	localOnly := isLoopbackHost(gwSettings.Listen)
+	if !localOnly && adminPassword == "" {
+		return fmt.Errorf("监听 %s 但未设置管理密码：请设置 ADMIN_PASSWORD（或 --admin-password）后再暴露到非回环地址", gwSettings.Listen)
+	}
+
 	loadSnapshot := func(ctx context.Context) (*config.Snapshot, error) {
 		providers, err := st.LoadProviders(ctx, master)
 		if err != nil {
@@ -209,6 +224,12 @@ func run(logger *slog.Logger, opts options) error {
 	// 8) HTTP 服务
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
+	api.SetLogStatsFunc(recorder.Stats)
+	api.New(api.Options{
+		Store: st, Master: master, Holder: holder, Aggregator: aggregator,
+		Reload: loadSnapshot, Logger: logger, Version: version,
+		AdminPassword: adminPassword, LocalOnly: localOnly,
+	}).Register(mux)
 	gateway.New(holder, logger).
 		WithKeyStore(st).
 		WithRecorder(recorder).
@@ -221,7 +242,15 @@ func run(logger *slog.Logger, opts options) error {
 	}
 
 	logStartup(logger, srv.Addr, dir, dbFile, keyInfo, snapshot, imported)
-
+	if localOnly {
+		if adminPassword == "" {
+			logger.Info("Web UI 免登录（仅本机回环监听）")
+		} else {
+			logger.Info("Web UI 已启用登录（本机回环监听 + 管理密码）")
+		}
+	} else {
+		logger.Info("Web UI 已启用登录（非回环监听）", "listen", gwSettings.Listen)
+	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP 服务异常退出", "err", err)
@@ -303,6 +332,15 @@ func logStartup(logger *slog.Logger, addr, dataDir, dbFile string, keyInfo store
 		logger.Warn("监听地址不是本机回环：请确认访问来源已受限、网关 Key 足够强（DESIGN §9）",
 			"listen", cfg.Listen)
 	}
+}
+
+// isLoopbackHost 判断监听地址是否仅本机回环。
+func isLoopbackHost(host string) bool {
+	switch strings.TrimSpace(host) {
+	case "", "127.0.0.1", "localhost", "::1", "[::1]":
+		return true
+	}
+	return false
 }
 
 func newLogger(format, level string) *slog.Logger {

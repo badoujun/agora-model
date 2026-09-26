@@ -14,18 +14,18 @@ import (
 //
 // 字段与 store 的 logs 表一一对应；本包不依赖 store，避免循环依赖。
 type Entry struct {
-	TS              time.Time
-	RequestID       string
-	InboundProtocol string
-	Model           string
-	ProviderID      string
-	UpstreamURL     string
-	StatusCode      int
-	LatencyMS       int64
-	FirstByteMS     int64
-	Stream          bool
-	ErrorMsg        string
-	ClientIP        string
+	TS              time.Time `json:"ts"`
+	RequestID       string    `json:"request_id"`
+	InboundProtocol string    `json:"inbound_protocol"`
+	Model           string    `json:"model"`
+	ProviderID      string    `json:"provider_id"`
+	UpstreamURL     string    `json:"upstream_url"`
+	StatusCode      int       `json:"status_code"`
+	LatencyMS       int64     `json:"latency_ms"`
+	FirstByteMS     int64     `json:"first_byte_ms"`
+	Stream          bool      `json:"stream"`
+	ErrorMsg        string    `json:"error_msg,omitempty"`
+	ClientIP        string    `json:"client_ip"`
 }
 
 // Writer 是日志落库接口（由 store 实现）。

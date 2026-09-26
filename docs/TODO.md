@@ -208,6 +208,19 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 ## Phase 4 · Web UI（5–7 天）
 
+> **补充任务组（本轮补齐的文档遗漏）：T4.0 后端管理 API（DESIGN §6）**
+> Phase 1–3 只实现了数据面（`/v1/*`）。控制面的 REST 接口必须与前端同步落地：
+> `/api/auth/*`（登录/登出/会话）、`/api/health`、`/api/providers*`（CRUD / 连接测试 / 拉取模型）、
+> `/api/models*`（列表 / 刷新 / 手动增删）、`/api/settings`、`/api/gateway-key*`（读取 / 重置）、
+> `/api/logs`（筛选分页）、`/api/export|import`；并复用保存路径上的 SSRF 校验与凭证加密、
+> 采用「默认仅回环免登录，远程必须登录」的访问控制。
+>
+> **进度（T4.0 已完成）**：`internal/api` 已实现全部控制面端点并通过单测（12 个用例）——
+> 会话认证（默认回环免登录；设置 `ADMIN_PASSWORD` 后强制登录，**非回环监听且无密码时启动直接失败**）、
+> providers CRUD（响应只回掩码、`PUT` 留空 `api_key` 表示保持原值、复用 SSRF 校验与加密）、
+> 连接测试、拉取模型、模型列表与手动增删、settings、网关 Key 重置（明文仅出现一次）、
+> 日志查询（错误信息已脱敏）、导出/导入（导出不含明文凭证）。
+
 - [ ] **T4.1｜前端脚手架** ｜ 3h ｜ 依赖 T0.3
   - Vite + React 19 + Tailwind + shadcn/ui + `@tanstack/react-query` + 路由。
   - **验收**：`npm run dev` 可跑，构建产物可被 `embed`。
