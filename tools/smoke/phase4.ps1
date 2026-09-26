@@ -23,8 +23,8 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $repoRoot
 
-$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-            [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\toolchain.ps1')
+Add-ToolchainToPath -Quiet
 $env:CGO_ENABLED = '0'
 $env:GOPROXY = 'https://goproxy.cn,direct'
 

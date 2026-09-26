@@ -190,6 +190,17 @@ location / {
 **Q：macOS 上提示「无法验证开发者」？**
 二进制未签名：`xattr -dr com.apple.quarantine agoramodel-darwin-arm64` 后再运行。
 
+**Q：`build.ps1` 报「无法将 go 项识别为 cmdlet / 函数 / 脚本文件」？**
+已修复：脚本会自行合并系统与用户 PATH，并探测常见安装目录（`C:\Program Files\Go\bin`、
+`%LOCALAPPDATA%\Programs\Go\bin`、winget 包目录等）。原因是通过 winget 等方式安装工具时，
+只修改了系统 PATH，而**已经打开的终端仍持有旧 PATH**。
+若仍报错则说明 Go 确实未安装：`winget install GoLang.Go` 后重试（无需重开终端）。
+同样的探测也已接入 `tools/smoke/*.ps1`。
+
+**Q：构建时 npm 提示 `allow-scripts ... esbuild`？**
+这是 npm 11+ 的安全策略（默认不执行依赖的安装脚本）。esbuild 的平台二进制由可选依赖提供，
+**不影响构建**；如需消除提示可执行 `npm approve-scripts esbuild`。
+
 ## 开发
 
 ```bash

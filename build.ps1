@@ -24,6 +24,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
+# 统一工具链探测：处理「刚装好 Go / Node 但当前进程 PATH 未刷新」导致的 go 找不到
+. (Join-Path $PSScriptRoot 'tools\lib\toolchain.ps1')
+Add-ToolchainToPath
+
 if (-not $Version) {
     $Version = (git describe --tags --always --dirty 2>$null)
     if (-not $Version) { $Version = 'dev' }
