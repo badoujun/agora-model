@@ -2,6 +2,9 @@
 /dist/
 /web/dist/
 /web/node_modules/
+# 前端构建产物内嵌到 Go 包，仅保留占位文件以支持未构建时的编译
+/internal/webui/dist/*
+!/internal/webui/dist/robots.txt
 
 # ---- 运行数据（含 SQLite 数据库与加密凭证，切勿提交）----
 /data/

@@ -1,0 +1,130 @@
+import type {
+  HealthInfo,
+  LogItem,
+  ModelItem,
+  ProviderDTO,
+  ProviderInput,
+  SessionInfo,
+  SettingsPayload,
+  TestResult,
+} from './types'
+
+const JSON_HEADERS = { 'Content-Type': 'application/json' }
+
+/** ApiError 携带 HTTP 状态码，便于调用方区分 401/400。 */
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const resp = await fetch(path, { credentials: 'same-origin', ...init })
+  const text = await resp.text()
+
+  let payload: unknown
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      payload = text
+    }
+  }
+
+  if (!resp.ok) {
+    let message = `HTTP ${resp.status}`
+    if (payload && typeof payload === 'object' && 'error' in payload) {
+      message = String((payload as { error: unknown }).error)
+    } else if (typeof payload === 'string' && payload) {
+      message = payload
+    }
+    throw new ApiError(resp.status, message)
+  }
+  return payload as T
+}
+
+function query(params: Record<string, string | number | boolean | undefined>): string {
+  const search = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === '' || value === false) continue
+    search.set(key, String(value))
+  }
+  const raw = search.toString()
+  return raw ? `?${raw}` : ''
+}
+
+export const api = {
+  // 会话
+  session: () => request<SessionInfo>('/api/auth/session'),
+  login: (password: string) =>
+    request<{ ok: boolean }>('/api/auth/login', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ password }),
+    }),
+  logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  health: () => request<HealthInfo>('/api/health'),
+
+  // 供应商
+  listProviders: () => request<{ items: ProviderDTO[] }>('/api/providers'),
+  createProvider: (body: ProviderInput) =>
+    request<ProviderDTO>('/api/providers', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  updateProvider: (id: string, body: ProviderInput) =>
+    request<ProviderDTO>(`/api/providers/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  deleteProvider: (id: string) =>
+    request<{ ok: boolean }>(`/api/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  testProvider: (id: string) =>
+    request<TestResult>(`/api/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  fetchModels: (id: string) =>
+    request<ProviderDTO>(`/api/providers/${encodeURIComponent(id)}/fetch-models`, { method: 'POST' }),
+
+  // 模型
+  listModels: () => request<{ items: ModelItem[] }>('/api/models'),
+  refreshModels: () => request<{ ok: boolean }>('/api/models/refresh', { method: 'POST' }),
+  addManualModel: (providerId: string, model: string) =>
+    request<{ ok: boolean }>('/api/models/manual', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ provider_id: providerId, model }),
+    }),
+  removeManualModel: (providerId: string, model: string) =>
+    request<{ ok: boolean }>(
+      `/api/models/manual${query({ provider_id: providerId, model })}`,
+      { method: 'DELETE' },
+    ),
+
+  // 设置与网关 Key
+  getSettings: () => request<SettingsPayload>('/api/settings'),
+  updateSettings: (body: { model_refresh_seconds?: number; log_success?: boolean }) =>
+    request<SettingsPayload>('/api/settings', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  resetGatewayKey: () =>
+    request<{ gateway_key: string; key_hint: string; warning: string }>('/api/gateway-key/reset', {
+      method: 'POST',
+    }),
+
+  // 日志
+  listLogs: (params: {
+    failed?: string
+    model?: string
+    provider_id?: string
+    status_min?: number
+    limit?: number
+    offset?: number
+  }) => request<{ items: LogItem[]; total: number; limit: number; offset: number }>(`/api/logs${query(params)}`),
+}

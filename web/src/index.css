@@ -1,0 +1,23 @@
+@import 'tailwindcss';
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+/* 表格与表单的紧凑排版 */
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+}

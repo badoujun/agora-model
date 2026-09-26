@@ -27,6 +27,7 @@ import (
 	"agora-model/internal/models"
 	"agora-model/internal/platform"
 	"agora-model/internal/store"
+	"agora-model/internal/webui"
 )
 
 // version 由构建脚本以 -ldflags "-X main.version=<ver>" 注入。
@@ -230,6 +231,20 @@ func run(logger *slog.Logger, opts options) error {
 		Reload: loadSnapshot, Logger: logger, Version: version,
 		AdminPassword: adminPassword, LocalOnly: localOnly,
 	}).Register(mux)
+
+	// 9) 内嵌前端（构建后自动可用；未构建时只提供 API）
+	if fsys, ferr := webui.FS(); ferr != nil {
+		logger.Warn("加载内嵌前端失败", "err", ferr)
+	} else if webui.Available(fsys) {
+		if rerr := webui.Register(mux, fsys); rerr != nil {
+			logger.Warn("挂载 Web UI 失败", "err", rerr)
+		} else {
+			logger.Info("Web UI 已挂载", "path", "/")
+		}
+	} else {
+		logger.Info("未检测到前端构建产物，仅提供 API（需要 Web UI 请先执行 npm --prefix web run build）")
+	}
+
 	gateway.New(holder, logger).
 		WithKeyStore(st).
 		WithRecorder(recorder).

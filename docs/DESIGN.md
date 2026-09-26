@@ -802,6 +802,18 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 - 请求封装统一处理 401（跳转登录）、错误 toast、加载态。
 - 不引入重型状态库：`@tanstack/react-query`（或 SWR）足够。
 
+### 8.7 实现说明（Phase 4 落地）
+
+- **技术栈**：Vite + React 19 + TypeScript + Tailwind CSS v4（`@tailwindcss/vite`）+ `@tanstack/react-query` + `react-router-dom`；
+- **组件**：按 shadcn/ui 的组织方式与工具链（`class-variance-authority` + `clsx` + `tailwind-merge`）手写所需组件，
+  未运行交互式 `npx shadcn init`，因此不引入 Radix 依赖；后续可用 CLI 追加组件；
+- **构建产物**：Vite 的 `build.outDir` 直接指向 `internal/webui/dist`，由该包 `//go:embed all:dist` 内嵌进单二进制；
+  仓库保留 `internal/webui/dist/robots.txt` 作为占位，保证未构建前端时仍可编译（运行时提示"仅提供 API"）；
+- **SPA 行为**：`/` 返回 `index.html`（`Cache-Control: no-store`），`assets/*` 带 `immutable` 长期缓存；
+  `/api`、`/v1`、`/healthz` 下的未知路径仍返回 404，避免前端路由掩盖接口拼写错误；
+- **开发期**：`npm --prefix web run dev`（5173）通过 Vite 代理 `/api` 到本地网关；
+- **登录页**：仅在设置了 `ADMIN_PASSWORD` 时出现（`/api/auth/session` 的 `login_required` 决定）。
+
 ---
 
 ## 9. 安全设计汇总

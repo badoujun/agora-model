@@ -298,6 +298,7 @@
 | 第 6 轮 | 目标 Windows 下限收窄为 Win10 / Win11；服务化选定 `kardianos/service`；要求顺带产出 macOS 产物 | 目标矩阵扩为 Windows / Linux / macOS × amd64 / arm64（6 份产物）；服务化统一为 `kardianos/service`（Windows SCM / Linux systemd / macOS launchd）；跨平台清单补齐 macOS 特有项（Gatekeeper、launchd、数据目录、大小写敏感性） |
 | 第 7 轮 | Phase 1 / Phase 2 实施 | 网关 Key 改由数据库管理（JSON 中的 pi_key 不再参与认证）；引导配置仅在库为空时导入一次；供应商凭证 AES-256-GCM 加密落库；go.mod 的 Go 指令提升为 **1.25.0**（由 modernc.org/sqlite v1.59.0 决定） |
 | 第 8 轮 | Phase 3 实施 | 启动即聚合 + 定时刷新（间隔取 settings.model_refresh_seconds，默认 10 分钟）；/v1/models 同时给出裸名与 provider/model；命名空间路由仅在斜杠前缀命中已存在的 provider id 时生效；新增迁移 v2（last_fetch_at / last_fetch_error） |
+| 第 9 轮 | Phase 4 实施 | 前端 Vite + React 19 + Tailwind v4 + shadcn/ui 风格手写组件；产物由 internal/webui 内嵌进单二进制；SPA fallback 不吞 /api、/v1、/healthz 的 404；新增 	ools/smoke/phase4.ps1 端到端冒烟（28 项） |
 
 ## 附录 B：最终用户使用方式（验收片段）
 

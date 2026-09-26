@@ -388,15 +388,33 @@ func (s *Server) loadProvider(ctx context.Context, id string) (config.Provider, 
 // ---------------- 模型 ----------------
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	snap := s.holder.Get()
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	records, err := s.store.ListProviders(ctx)
+	if err != nil {
+		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
+		return
+	}
+	// 快照里的 Models 是「手动 ∪ 自动」的合并结果；手动列表需回到数据库读取才能区分来源
+	manual := make(map[string]map[string]bool, len(records))
+	for _, rec := range records {
+		set := make(map[string]bool, len(rec.ModelsManual))
+		for _, m := range rec.ModelsManual {
+			set[m] = true
+		}
+		manual[rec.ID] = set
+	}
+
 	type entry struct {
 		Model    string `json:"model"`
 		Provider string `json:"provider_id"`
 		Default  bool   `json:"default"`
 		Source   string `json:"source"`
 	}
-	original := map[string]string{} // 裸名 -> 默认供应商
-	items := make([]entry, 0, 32)
+
+	snap := s.holder.Get()
+	original := map[string]string{} // 裸名 -> 默认供应商（priority 最小者）
 	for _, p := range snap.ProvidersByPriority() {
 		for _, m := range p.Models {
 			if _, ok := original[m]; !ok {
@@ -404,20 +422,21 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	items := make([]entry, 0, 32)
 	for _, p := range snap.ProvidersByPriority() {
-		manual := map[string]bool{}
 		for _, m := range p.Models {
-			manual[m] = true
-		}
-		for _, m := range p.Models {
+			source := "auto"
+			if manual[p.ID][m] {
+				source = "manual"
+			}
 			items = append(items, entry{
 				Model:    m,
 				Provider: p.ID,
 				Default:  original[m] == p.ID,
-				Source:   "manual_or_auto",
+				Source:   source,
 			})
 		}
-		_ = manual
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
