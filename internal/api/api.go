@@ -15,6 +15,7 @@ import (
 
 	"agora-model/internal/config"
 	"agora-model/internal/crypto"
+	"agora-model/internal/models"
 	"agora-model/internal/store"
 )
 
@@ -23,7 +24,6 @@ type Options struct {
 	Store         *store.Store
 	Master        []byte
 	Holder        *config.Holder
-	Aggregator    Refresher
 	Reload        func(ctx context.Context) (*config.Snapshot, error)
 	Logger        *slog.Logger
 	Version       string
@@ -32,24 +32,18 @@ type Options struct {
 	LocalOnly bool
 }
 
-// Refresher 触发模型聚合刷新（由 models.Aggregator 实现）。
-type Refresher interface {
-	RefreshAll(ctx context.Context)
-	RefreshProvider(ctx context.Context, p config.Provider) error
-}
-
 // Server 提供 Web UI 使用的管理接口（DESIGN §6）。
 type Server struct {
-	store      *store.Store
-	master     []byte
-	holder     *config.Holder
-	aggregator Refresher
-	reload     func(ctx context.Context) (*config.Snapshot, error)
-	logger     *slog.Logger
-	version    string
-	localOnly  bool
-	auth       *Authenticator
-	client     *http.Client
+	store     *store.Store
+	master    []byte
+	holder    *config.Holder
+	reload    func(ctx context.Context) (*config.Snapshot, error)
+	logger    *slog.Logger
+	version   string
+	localOnly bool
+	auth      *Authenticator
+	client    *http.Client
+	fetcher   *models.Fetcher
 }
 
 // New 创建控制面服务。
@@ -59,15 +53,15 @@ func New(opts Options) *Server {
 		logger = slog.Default()
 	}
 	return &Server{
-		store:      opts.Store,
-		master:     opts.Master,
-		holder:     opts.Holder,
-		aggregator: opts.Aggregator,
-		reload:     opts.Reload,
-		logger:     logger,
-		version:    opts.Version,
-		localOnly:  opts.LocalOnly,
-		auth:       NewAuthenticator(opts.AdminPassword),
+		store:     opts.Store,
+		master:    opts.Master,
+		holder:    opts.Holder,
+		reload:    opts.Reload,
+		logger:    logger,
+		version:   opts.Version,
+		localOnly: opts.LocalOnly,
+		auth:      NewAuthenticator(opts.AdminPassword),
+		fetcher:   models.NewFetcher(),
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
@@ -97,9 +91,6 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 	// 模型
 	mux.HandleFunc("GET /api/models", s.guard(s.handleListModels))
-	mux.HandleFunc("POST /api/models/refresh", s.guard(s.handleRefreshModels))
-	mux.HandleFunc("POST /api/models/manual", s.guard(s.handleAddManualModel))
-	mux.HandleFunc("DELETE /api/models/manual", s.guard(s.handleRemoveManualModel))
 
 	// 设置与网关 Key
 	mux.HandleFunc("GET /api/settings", s.guard(s.handleGetSettings))
@@ -186,10 +177,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	providers := len(s.holder.Get().ProvidersByPriority())
+	providers := len(s.holder.Get().Providers())
 	modelSet := map[string]bool{}
-	for _, p := range s.holder.Get().ProvidersByPriority() {
-		for _, m := range p.Models {
+	for _, p := range s.holder.Get().Providers() {
+		for _, m := range p.ExposedModels() {
 			modelSet[m] = true
 		}
 	}
@@ -232,7 +223,6 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
 		return
 	}
-	available := s.availableModels()
 
 	out := exportPayload{
 		Gateway:   s.holder.Get().Gateway(),
@@ -242,7 +232,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	for _, rec := range records {
-		out.Providers = append(out.Providers, toDTO(rec, available[rec.ID]))
+		out.Providers = append(out.Providers, toDTO(rec, nil))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -300,15 +290,6 @@ func (s *Server) applyReload(ctx context.Context) error {
 	}
 	s.holder.Store(snap)
 	return nil
-}
-
-// availableModels 返回快照中每个供应商的可用模型。
-func (s *Server) availableModels() map[string][]string {
-	out := map[string][]string{}
-	for _, p := range s.holder.Get().ProvidersByPriority() {
-		out[p.ID] = p.Models
-	}
-	return out
 }
 
 // logRecorderStats 允许外部注入日志统计（main 侧设置）。

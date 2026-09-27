@@ -6,7 +6,6 @@ import { formatTime } from '@/lib/utils'
 import { useToast } from '@/components/ui/toast'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 
@@ -17,7 +16,6 @@ export function SettingsPage() {
 
   const [newKey, setNewKey] = useState<string | null>(null)
   const [acknowledged, setAcknowledged] = useState(false)
-  const [refreshSeconds, setRefreshSeconds] = useState('')
   const [copied, setCopied] = useState<string | null>(null)
 
   const resetKey = useMutation({
@@ -32,8 +30,7 @@ export function SettingsPage() {
   })
 
   const saveSettings = useMutation({
-    mutationFn: (payload: { model_refresh_seconds?: number; log_success?: boolean }) =>
-      api.updateSettings(payload),
+    mutationFn: (payload: { log_success?: boolean }) => api.updateSettings(payload),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['settings'] })
       toast.show('设置已保存', 'success')
@@ -53,10 +50,8 @@ export function SettingsPage() {
 
   const origin = window.location.origin
   const openaiSnippet = `OPENAI_BASE_URL=${origin}/v1\nOPENAI_API_KEY=<你的网关 Key>`
-  const anthropicSnippet = `ANTHROPIC_BASE_URL=${origin}\nANTHROPIC_API_KEY=<你的网关 Key>`
 
   const data = settings.data
-  const currentRefresh = refreshSeconds !== '' ? refreshSeconds : (data?.model_refresh_seconds ?? '600')
   const logSuccess = data?.log_success === 'true'
 
   return (
@@ -94,7 +89,7 @@ export function SettingsPage() {
               }}
               disabled={resetKey.isPending}
             >
-              {resetKey.isPending ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              <RefreshCw className="h-4 w-4" />
               重置网关 Key
             </Button>
           </div>
@@ -126,24 +121,12 @@ export function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle>接入地址</CardTitle>
-          <CardDescription>把下面的环境变量填进任意 Agent（只要它支持自定义 Base URL）。</CardDescription>
+          <CardDescription>把下面的环境变量填进任意支持自定义 Base URL 的 Agent。</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-2">
+        <CardContent>
           <div className="rounded-md border border-slate-200 p-3">
             <div className="flex items-center justify-between">
-              <p className="text-sm font-medium">Anthropic 协议（Claude Code 等）</p>
-              <Button variant="ghost" size="sm" onClick={() => copy('anthropic', anthropicSnippet)}>
-                {copied === 'anthropic' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                复制
-              </Button>
-            </div>
-            <pre className="mt-2 overflow-x-auto rounded bg-slate-900 p-3 font-mono text-xs text-slate-100">
-              {anthropicSnippet}
-            </pre>
-          </div>
-          <div className="rounded-md border border-slate-200 p-3">
-            <div className="flex items-center justify-between">
-              <p className="text-sm font-medium">OpenAI 协议（Codex / Cursor 等）</p>
+              <p className="text-sm font-medium">OpenAI 协议（Codex / Cursor / 任意 OpenAI 兼容工具）</p>
               <Button variant="ghost" size="sm" onClick={() => copy('openai', openaiSnippet)}>
                 {copied === 'openai' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
                 复制
@@ -159,46 +142,18 @@ export function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle>运行参数</CardTitle>
-          <CardDescription>监听地址与请求上限需要修改启动参数后重启；刷新间隔与日志开关即时生效。</CardDescription>
+          <CardDescription>监听地址与请求上限需要修改启动参数后重启；日志开关即时生效。</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="grid gap-1.5">
-              <Label htmlFor="refresh-interval">模型刷新间隔（秒）</Label>
-              <div className="flex items-center gap-2">
-                <Input
-                  id="refresh-interval"
-                  type="number"
-                  min={30}
-                  value={currentRefresh}
-                  onChange={(event) => setRefreshSeconds(event.target.value)}
-                />
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    const value = Number(currentRefresh)
-                    if (!Number.isFinite(value) || value < 30) {
-                      toast.show('刷新间隔不能小于 30 秒', 'error')
-                      return
-                    }
-                    saveSettings.mutate({ model_refresh_seconds: value })
-                  }}
-                  disabled={saveSettings.isPending}
-                >
-                  保存
-                </Button>
-              </div>
-            </div>
-            <div className="flex items-center gap-3 pt-6">
-              <Switch
-                id="log-success"
-                checked={logSuccess}
-                onCheckedChange={(checked) => saveSettings.mutate({ log_success: checked })}
-              />
-              <div>
-                <Label htmlFor="log-success">记录成功请求日志</Label>
-                <p className="text-xs text-slate-500">默认关闭以避免写放大；失败请求始终记录。</p>
-              </div>
+          <div className="flex items-center gap-3">
+            <Switch
+              id="log-success"
+              checked={logSuccess}
+              onCheckedChange={(checked) => saveSettings.mutate({ log_success: checked })}
+            />
+            <div>
+              <Label htmlFor="log-success">记录成功请求日志</Label>
+              <p className="text-xs text-slate-500">默认关闭以避免写放大；失败请求始终记录。</p>
             </div>
           </div>
 

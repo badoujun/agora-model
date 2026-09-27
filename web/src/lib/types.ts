@@ -4,21 +4,22 @@ export interface ProviderDTO {
   id: string
   name: string
   openai_base_url: string
-  anthropic_base_url: string
   openai_endpoint_override: string
-  anthropic_endpoint_override: string
   api_key_hint: string
-  models_manual: string[]
-  models_excluded: string[]
-  auto_fetch_models: boolean
-  priority: number
+  /** 已勾选启用的上游模型名（顺序即展示顺序） */
+  models_selected: string[]
+  /** 上游模型名 -> 对外别名 */
+  model_aliases: Record<string, string>
+  /** 对外暴露的模型名（配置了别名时用别名） */
+  exposed_models: string[]
   timeout_seconds: number
   extra_headers?: Record<string, string>
   extra_body?: Record<string, unknown>
   allow_internal: boolean
   enabled: boolean
   model_count: number
-  available_models: string[]
+  /** 最近一次「拉取模型」的候选结果 */
+  candidate_models?: string[]
   last_fetch_at?: string
   last_fetch_error?: string
 }
@@ -27,15 +28,11 @@ export interface ProviderInput {
   id?: string
   name: string
   openai_base_url: string
-  anthropic_base_url: string
   openai_endpoint_override?: string
-  anthropic_endpoint_override?: string
   /** 编辑时留空表示不修改凭证 */
   api_key?: string
-  models_manual?: string[]
-  models_excluded?: string[]
-  auto_fetch_models?: boolean
-  priority?: number
+  models_selected?: string[]
+  model_aliases?: Record<string, string>
   timeout_seconds?: number
   extra_headers?: Record<string, string>
   extra_body?: Record<string, unknown>
@@ -43,26 +40,24 @@ export interface ProviderInput {
   enabled?: boolean
 }
 
-export interface ProbeResult {
+export interface TestResult {
   ok: boolean
   status_code: number
   latency_ms: number
   message: string
   model_count?: number
-}
-
-export interface TestResult {
-  ok: boolean
-  openai: ProbeResult
-  anthropic: ProbeResult
   checked_at: string
 }
 
 export interface ModelItem {
+  /** 对外模型名（配置了别名时是别名） */
   model: string
+  /** 转发给上游时使用的真实模型名 */
+  upstream_model: string
+  alias?: string
   provider_id: string
+  provider_name: string
   default: boolean
-  source: string
 }
 
 export interface LogItem {
@@ -88,7 +83,6 @@ export interface SettingsPayload {
   gateway_key_hint: string
   gateway_key_created_at?: string
   gateway_key_last_used?: string
-  model_refresh_seconds?: string
   log_success?: string
 }
 

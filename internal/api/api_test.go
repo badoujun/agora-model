@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,17 +23,55 @@ import (
 
 const testAdminPassword = "s3cret-password"
 
-type fakeAggregator struct {
-	refreshProvider int
-	refreshAll      int
-	err             error
+// upstreamStub 模拟供应商上游：/v1/models 与 /v1/chat/completions。
+type upstreamStub struct {
+	mu     sync.Mutex
+	fail   bool
+	models []string
+	chat   bool
 }
 
-func (f *fakeAggregator) RefreshAll(ctx context.Context) { f.refreshAll++ }
+func (u *upstreamStub) setFail(v bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.fail = v
+}
 
-func (f *fakeAggregator) RefreshProvider(ctx context.Context, p config.Provider) error {
-	f.refreshProvider++
-	return f.err
+func (u *upstreamStub) chatCalled() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.chat
+}
+
+func (u *upstreamStub) handler(w http.ResponseWriter, r *http.Request) {
+	u.mu.Lock()
+	fail := u.fail
+	models := append([]string(nil), u.models...)
+	u.mu.Unlock()
+
+	if fail {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid key"}}`))
+		return
+	}
+
+	switch r.URL.Path {
+	case "/v1/models":
+		items := make([]map[string]any, 0, len(models))
+		for _, m := range models {
+			items = append(items, map[string]any{"id": m})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": items})
+	case "/v1/chat/completions":
+		u.mu.Lock()
+		u.chat = true
+		u.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
 }
 
 type harness struct {
@@ -41,12 +80,13 @@ type harness struct {
 	store       *store.Store
 	master      []byte
 	holder      *config.Holder
-	aggregator  *fakeAggregator
+	upstream    *upstreamStub
+	upstreamURL string
 	reloadCount int
 }
 
-// newHarness 构造一个带真实 SQLite 的控制面测试服务。
-func newHarness(t *testing.T, adminPassword, upstreamURL string) *harness {
+// newHarness 构造一个带真实 SQLite 的控制面测试服务（含 mock 上游）。
+func newHarness(t *testing.T, adminPassword string) *harness {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "agora-api-")
@@ -73,15 +113,18 @@ func newHarness(t *testing.T, adminPassword, upstreamURL string) *harness {
 		master[i] = byte(i + 1)
 	}
 
+	upstream := &upstreamStub{models: []string{"extra-model", "seed-model"}}
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(upstream.handler))
+	t.Cleanup(upstreamSrv.Close)
+
 	// 至少需要一个启用的供应商，否则 NewSnapshot 会拒绝（与运行期约束一致）
 	if _, err := st.SaveProvider(context.Background(), master, config.Provider{
-		ID:               "seed",
-		Name:             "seed",
-		OpenAIBaseURL:    upstreamURL + "/v1",
-		AnthropicBaseURL: upstreamURL + "/v1",
-		APIKey:           "sk-seed",
-		Models:           []string{"seed-model"},
-		AllowInternal:    true,
+		ID:            "seed",
+		Name:          "seed",
+		OpenAIBaseURL: upstreamSrv.URL + "/v1",
+		APIKey:        "sk-seed",
+		Models:        []string{"seed-model"},
+		AllowInternal: true,
 	}); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
@@ -92,13 +135,12 @@ func newHarness(t *testing.T, adminPassword, upstreamURL string) *harness {
 	}
 	holder := config.NewHolder(snap)
 
-	h := &harness{t: t, store: st, master: master, holder: holder, aggregator: &fakeAggregator{}}
+	h := &harness{t: t, store: st, master: master, holder: holder, upstream: upstream, upstreamURL: upstreamSrv.URL}
 	mux := http.NewServeMux()
 	New(Options{
-		Store:      st,
-		Master:     master,
-		Holder:     holder,
-		Aggregator: h.aggregator,
+		Store:  st,
+		Master: master,
+		Holder: holder,
 		Reload: func(ctx context.Context) (*config.Snapshot, error) {
 			h.reloadCount++
 			return buildSnapshot(ctx, st, master)
@@ -163,9 +205,7 @@ func (h *harness) do(client *http.Client, method, path string, body any) (int, m
 }
 
 func TestHealthAndSession(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+	h := newHarness(t, "")
 	client := newClient(t)
 
 	code, body, _ := h.do(client, http.MethodGet, "/api/health", nil)
@@ -178,6 +218,9 @@ func TestHealthAndSession(t *testing.T) {
 	if body["providers"].(float64) < 1 {
 		t.Fatalf("providers = %v", body["providers"])
 	}
+	if body["models"].(float64) != 1 {
+		t.Fatalf("models = %v, 期望 1（seed 勾选了一个模型）", body["models"])
+	}
 
 	code, body, _ = h.do(client, http.MethodGet, "/api/auth/session", nil)
 	if code != http.StatusOK {
@@ -189,9 +232,7 @@ func TestHealthAndSession(t *testing.T) {
 }
 
 func TestAuthRequiredWhenPasswordConfigured(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, testAdminPassword, upstream.URL)
+	h := newHarness(t, testAdminPassword)
 	client := newClient(t)
 
 	code, _, _ := h.do(client, http.MethodGet, "/api/providers", nil)
@@ -223,19 +264,17 @@ func TestAuthRequiredWhenPasswordConfigured(t *testing.T) {
 }
 
 func TestProviderCRUDAndMasking(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+	h := newHarness(t, "")
 	client := newClient(t)
 
 	code, body, raw := h.do(client, http.MethodPost, "/api/providers", map[string]any{
-		"name":               "供应商A",
-		"openai_base_url":    upstream.URL + "/v1",
-		"anthropic_base_url": upstream.URL + "/v1",
-		"api_key":            "sk-live-abcdefghijkl",
-		"models_manual":      []string{"m1", "m1", " m2 "},
-		"allow_internal":     true,
-		"priority":           5,
+		"name":            "供应商A",
+		"openai_base_url": h.upstreamURL + "/v1",
+		"api_key":         "sk-live-abcdefghijkl",
+		"models_selected": []string{"m1", "m1", " m2 "},
+		"model_aliases":   map[string]string{"m1": " 别名一 "},
+		"allow_internal":  true,
+		"timeout_seconds": 30,
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("创建状态码 = %d, 期望 201（%s）", code, raw)
@@ -250,9 +289,16 @@ func TestProviderCRUDAndMasking(t *testing.T) {
 	if id == "" {
 		t.Fatal("响应缺少 id")
 	}
-	models, _ := body["models_manual"].([]any)
+	models, _ := body["models_selected"].([]any)
 	if len(models) != 2 {
-		t.Errorf("models_manual 应去重去空白，得到 %v", models)
+		t.Errorf("models_selected 应去重去空白，得到 %v", models)
+	}
+	exposed, _ := body["exposed_models"].([]any)
+	if len(exposed) != 2 || exposed[0] != "别名一" {
+		t.Errorf("exposed_models 应使用别名，得到 %v", exposed)
+	}
+	if body["model_count"].(float64) != 2 {
+		t.Errorf("model_count = %v", body["model_count"])
 	}
 
 	code, body, _ = h.do(client, http.MethodGet, "/api/providers/"+id, nil)
@@ -273,6 +319,9 @@ func TestProviderCRUDAndMasking(t *testing.T) {
 	if body["api_key_hint"] != "sk-****ijkl" {
 		t.Errorf("凭证掩码不应变化: %v", body["api_key_hint"])
 	}
+	if body["model_count"].(float64) != 2 {
+		t.Errorf("未提供 models_selected 时应沿用原值: %v", body["model_count"])
+	}
 	providers, err := h.store.LoadProviders(context.Background(), h.master)
 	if err != nil {
 		t.Fatal(err)
@@ -283,6 +332,9 @@ func TestProviderCRUDAndMasking(t *testing.T) {
 			found = true
 			if p.APIKey != "sk-live-abcdefghijkl" {
 				t.Errorf("未提供凭证时应沿用原值，得到 %q", p.APIKey)
+			}
+			if p.ModelAliases["m1"] != "别名一" {
+				t.Errorf("别名应被保存: %#v", p.ModelAliases)
 			}
 		}
 	}
@@ -300,19 +352,23 @@ func TestProviderCRUDAndMasking(t *testing.T) {
 }
 
 func TestCreateProviderValidations(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+	h := newHarness(t, "")
 	client := newClient(t)
 
 	cases := []struct {
 		name string
 		body map[string]any
 	}{
-		{"缺少 api_key", map[string]any{"name": "x", "openai_base_url": upstream.URL + "/v1"}},
-		{"缺少协议地址", map[string]any{"name": "x", "api_key": "sk-aaaaaaaaaaaa"}},
+		{"缺少 api_key", map[string]any{"name": "x", "openai_base_url": h.upstreamURL + "/v1"}},
+		{"缺少名称", map[string]any{"openai_base_url": h.upstreamURL + "/v1", "api_key": "sk-aaaaaaaaaaaa"}},
+		{"缺少上游地址", map[string]any{"name": "x", "api_key": "sk-aaaaaaaaaaaa"}},
+		{"名称重复", map[string]any{"name": "seed", "openai_base_url": h.upstreamURL + "/v1", "api_key": "sk-aaaaaaaaaaaa"}},
+		{"别名冲突", map[string]any{
+			"name": "y", "openai_base_url": h.upstreamURL + "/v1", "api_key": "sk-aaaaaaaaaaaa",
+			"models_selected": []string{"m1", "m2"}, "model_aliases": map[string]string{"m1": "同名", "m2": "同名"},
+		}},
 		{"内网地址未放行", map[string]any{
-			"name": "x", "openai_base_url": "http://127.0.0.1:11434/v1", "api_key": "sk-aaaaaaaaaaaa",
+			"name": "z", "openai_base_url": "http://127.0.0.1:11434/v1", "api_key": "sk-aaaaaaaaaaaa",
 		}},
 	}
 	for _, tc := range cases {
@@ -325,20 +381,27 @@ func TestCreateProviderValidations(t *testing.T) {
 	}
 }
 
+func TestRenameToExistingNameIsRejected(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	code, body, raw := h.do(client, http.MethodPost, "/api/providers", map[string]any{
+		"name": "另一个", "openai_base_url": h.upstreamURL + "/v1", "api_key": "sk-aaaaaaaaaaaa",
+		"allow_internal": true,
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("创建状态码 = %d（%s）", code, raw)
+	}
+	id, _ := body["id"].(string)
+
+	code, _, _ = h.do(client, http.MethodPut, "/api/providers/"+id, map[string]any{"name": "SEED"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("重名应被拒绝（忽略大小写），状态码 = %d", code)
+	}
+}
+
 func TestTestProviderEndpoint(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/v1/models":
-			_, _ = w.Write([]byte(`{"data":[{"id":"m1"}]}`))
-		case "/v1/messages":
-			_, _ = w.Write([]byte(`{"type":"message"}`))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+	h := newHarness(t, "")
 	client := newClient(t)
 
 	code, body, raw := h.do(client, http.MethodPost, "/api/providers/seed/test", nil)
@@ -348,13 +411,8 @@ func TestTestProviderEndpoint(t *testing.T) {
 	if body["ok"] != true {
 		t.Fatalf("连接测试应通过: %v", body)
 	}
-	openai, _ := body["openai"].(map[string]any)
-	if openai["ok"] != true || openai["model_count"].(float64) != 1 {
-		t.Errorf("OpenAI 探测结果异常: %v", openai)
-	}
-	anthropic, _ := body["anthropic"].(map[string]any)
-	if anthropic["ok"] != true {
-		t.Errorf("Anthropic 探测结果异常: %v", anthropic)
+	if body["model_count"].(float64) != 2 {
+		t.Errorf("model_count = %v", body["model_count"])
 	}
 	if _, ok := body["checked_at"].(string); !ok {
 		t.Error("缺少 checked_at")
@@ -362,21 +420,27 @@ func TestTestProviderEndpoint(t *testing.T) {
 }
 
 func TestFetchModelsEndpoint(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+	h := newHarness(t, "")
 	client := newClient(t)
 
-	code, _, _ := h.do(client, http.MethodPost, "/api/providers/seed/fetch-models", nil)
+	code, body, raw := h.do(client, http.MethodPost, "/api/providers/seed/fetch-models", nil)
 	if code != http.StatusOK {
-		t.Fatalf("拉取模型状态码 = %d", code)
+		t.Fatalf("拉取模型状态码 = %d（%s）", code, raw)
 	}
-	if h.aggregator.refreshProvider != 1 {
-		t.Errorf("应调用一次 RefreshProvider，实际 %d", h.aggregator.refreshProvider)
+	candidates, _ := body["candidate_models"].([]any)
+	if len(candidates) != 2 {
+		t.Errorf("候选模型 = %v", candidates)
+	}
+	if body["last_fetch_at"] == "" {
+		t.Errorf("last_fetch_at 应被设置: %v", body)
+	}
+	// 拉取候选不应改变已勾选的模型
+	if body["model_count"].(float64) != 1 {
+		t.Errorf("model_count = %v, 期望仍为 1", body["model_count"])
 	}
 
-	h.aggregator.err = context.DeadlineExceeded
-	code, body, _ := h.do(client, http.MethodPost, "/api/providers/seed/fetch-models", nil)
+	h.upstream.setFail(true)
+	code, body, _ = h.do(client, http.MethodPost, "/api/providers/seed/fetch-models", nil)
 	if code != http.StatusBadGateway {
 		t.Fatalf("失败时状态码 = %d, 期望 502", code)
 	}
@@ -385,17 +449,21 @@ func TestFetchModelsEndpoint(t *testing.T) {
 	}
 }
 
-func TestManualModelsAndList(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+func TestModelsList(t *testing.T) {
+	h := newHarness(t, "")
 	client := newClient(t)
 
-	code, _, raw := h.do(client, http.MethodPost, "/api/models/manual", map[string]any{
-		"provider_id": "seed", "model": "manual-1",
+	// 再建一个供应商：与 seed 共享模型，但对 seed-model 配置了别名
+	code, _, raw := h.do(client, http.MethodPost, "/api/providers", map[string]any{
+		"name":            "别名供应商",
+		"openai_base_url": h.upstreamURL + "/v1",
+		"api_key":         "sk-aaaaaaaaaaaa",
+		"models_selected": []string{"seed-model", "extra-model"},
+		"model_aliases":   map[string]string{"seed-model": "共享别名"},
+		"allow_internal":  true,
 	})
-	if code != http.StatusOK {
-		t.Fatalf("新增手动模型状态码 = %d（%s）", code, raw)
+	if code != http.StatusCreated {
+		t.Fatalf("创建状态码 = %d（%s）", code, raw)
 	}
 
 	code, body, _ := h.do(client, http.MethodGet, "/api/models", nil)
@@ -403,42 +471,112 @@ func TestManualModelsAndList(t *testing.T) {
 		t.Fatalf("列表状态码 = %d", code)
 	}
 	items, _ := body["items"].([]any)
-	found := false
+	type row = map[string]any
+	byModel := map[string]row{}
 	for _, raw := range items {
-		entry := raw.(map[string]any)
-		if entry["model"] == "manual-1" && entry["provider_id"] == "seed" {
-			found = true
-			if entry["default"] != true {
-				t.Errorf("唯一供应商的模型应标记 default: %v", entry)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("列表中缺少 manual-1: %v", items)
+		entry := raw.(row)
+		byModel[entry["model"].(string)] = entry
 	}
 
-	code, _, _ = h.do(client, http.MethodDelete, "/api/models/manual?provider_id=seed&model=manual-1", nil)
-	if code != http.StatusOK {
-		t.Fatalf("删除手动模型状态码 = %d", code)
+	seedRow, ok := byModel["seed-model"]
+	if !ok {
+		t.Fatalf("缺少 seed-model: %v", items)
 	}
-	_, body, _ = h.do(client, http.MethodGet, "/api/models", nil)
-	items, _ = body["items"].([]any)
-	for _, raw := range items {
-		if raw.(map[string]any)["model"] == "manual-1" {
-			t.Fatal("删除后仍出现在列表中")
+	if seedRow["provider_name"] != "seed" {
+		t.Errorf("provider_name = %v", seedRow["provider_name"])
+	}
+	if seedRow["default"] != true {
+		t.Errorf("名称最小者应为默认路由: %v", seedRow)
+	}
+	aliasRow, ok := byModel["共享别名"]
+	if !ok {
+		t.Fatalf("缺少别名条目: %v", items)
+	}
+	if aliasRow["upstream_model"] != "seed-model" {
+		t.Errorf("别名条目应同时给出上游模型名: %v", aliasRow)
+	}
+	if aliasRow["alias"] != "共享别名" {
+		t.Errorf("别名条目应标注别名: %v", aliasRow)
+	}
+	// 别名是独立的对外模型名，只有这一个供应商提供它 → 它就是该名的默认路由
+	if aliasRow["default"] != true {
+		t.Errorf("唯一提供者的对外模型名应标记默认: %v", aliasRow)
+	}
+	extraRow, ok := byModel["extra-model"]
+	if !ok {
+		t.Fatalf("缺少 extra-model: %v", items)
+	}
+	if extraRow["default"] != true {
+		t.Errorf("唯一提供者的模型应标记默认: %v", extraRow)
+	}
+}
+
+func TestModelsListDefaultUsesProviderNameOrder(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	for _, name := range []string{"zeta 供应商", "alpha 供应商"} {
+		code, _, raw := h.do(client, http.MethodPost, "/api/providers", map[string]any{
+			"name":            name,
+			"openai_base_url": h.upstreamURL + "/v1",
+			"api_key":         "sk-aaaaaaaaaaaa",
+			"models_selected": []string{"shared-model"},
+			"allow_internal":  true,
+		})
+		if code != http.StatusCreated {
+			t.Fatalf("创建 %s 状态码 = %d（%s）", name, code, raw)
 		}
+	}
+
+	code, body, _ := h.do(client, http.MethodGet, "/api/models", nil)
+	if code != http.StatusOK {
+		t.Fatalf("列表状态码 = %d", code)
+	}
+	items, _ := body["items"].([]any)
+	defaults := map[string]bool{}
+	seen := map[string]bool{}
+	for _, raw := range items {
+		entry := raw.(map[string]any)
+		if entry["model"] != "shared-model" {
+			continue
+		}
+		name := entry["provider_name"].(string)
+		seen[name] = true
+		if entry["default"] == true {
+			defaults[name] = true
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("两个供应商都应出现在列表中: %v", seen)
+	}
+	if !defaults["alpha 供应商"] || defaults["zeta 供应商"] {
+		t.Fatalf("默认路由应按供应商名称升序选择，得到 %v", defaults)
+	}
+}
+
+func TestManualModelEndpointsRemoved(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	code, _, _ := h.do(client, http.MethodPost, "/api/models/manual", map[string]any{"provider_id": "seed", "model": "m"})
+	if code != http.StatusNotFound {
+		t.Fatalf("手动模型接口应已下线，状态码 = %d, 期望 404", code)
+	}
+	code, _, _ = h.do(client, http.MethodPost, "/api/models/refresh", nil)
+	if code != http.StatusNotFound {
+		t.Fatalf("全量刷新接口应已下线，状态码 = %d, 期望 404", code)
 	}
 }
 
 func TestSettingsAndGatewayKeyReset(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+	h := newHarness(t, "")
 	client := newClient(t)
 
-	if _, _, _ = h.do(client, http.MethodPost, "/api/gateway-key/reset", nil); true {
-		// 先确保存在一个 Key
+	// 首次需要生成一个网关 Key（运行期由 main 调用 EnsureGatewayKey）
+	if _, _, raw := h.do(client, http.MethodPost, "/api/gateway-key/reset", nil); raw == "" {
+		t.Fatal("生成网关 Key 失败")
 	}
+
 	code, body, raw := h.do(client, http.MethodGet, "/api/gateway-key", nil)
 	if code != http.StatusOK {
 		t.Fatalf("读取网关 Key 状态码 = %d（%s）", code, raw)
@@ -468,36 +606,25 @@ func TestSettingsAndGatewayKeyReset(t *testing.T) {
 		t.Errorf("掩码应为新 Key 的掩码: %v", body["key_hint"])
 	}
 
-	code, body, raw = h.do(client, http.MethodPut, "/api/settings", map[string]any{
-		"model_refresh_seconds": 300,
-		"log_success":           true,
-	})
+	code, body, raw = h.do(client, http.MethodPut, "/api/settings", map[string]any{"log_success": true})
 	if code != http.StatusOK {
 		t.Fatalf("写入设置状态码 = %d（%s）", code, raw)
-	}
-	if body["model_refresh_seconds"] != "300" {
-		t.Errorf("model_refresh_seconds = %v", body["model_refresh_seconds"])
 	}
 	if body["log_success"] != "true" {
 		t.Errorf("log_success = %v", body["log_success"])
 	}
-
-	// 非法值应被拒绝
-	code, _, _ = h.do(client, http.MethodPut, "/api/settings", map[string]any{"model_refresh_seconds": 5})
-	if code != http.StatusBadRequest {
-		t.Fatalf("间隔过小应返回 400，实际 %d", code)
+	if _, exists := body["model_refresh_seconds"]; exists {
+		t.Errorf("模型刷新间隔设置应已移除: %v", body)
 	}
 }
 
-func TestLogsEndpoint(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+func TestLogsEndpointAndFuzzyModelFilter(t *testing.T) {
+	h := newHarness(t, "")
 	client := newClient(t)
 
 	entries := []logging.Entry{
-		{TS: time.Now().UTC(), RequestID: "r1", InboundProtocol: "openai", Model: "m1", ProviderID: "seed", StatusCode: 200},
-		{TS: time.Now().UTC(), RequestID: "r2", InboundProtocol: "openai", Model: "m2", ProviderID: "seed", StatusCode: 502,
+		{TS: time.Now().UTC(), RequestID: "r1", InboundProtocol: "openai", Model: "GPT-4O", ProviderID: "seed", StatusCode: 200},
+		{TS: time.Now().UTC(), RequestID: "r2", InboundProtocol: "openai", Model: "claude-3-5", ProviderID: "seed", StatusCode: 502,
 			ErrorMsg: "上游失败 sk-should-be-redacted"},
 	}
 	if err := h.store.InsertLogs(context.Background(), entries); err != nil {
@@ -522,12 +649,31 @@ func TestLogsEndpoint(t *testing.T) {
 	if body["total"].(float64) != 2 {
 		t.Errorf("total = %v", body["total"])
 	}
+
+	// 模型筛选：忽略大小写 + 模糊匹配
+	for _, keyword := range []string{"gpt-4o", "GPT", "4o", "claude-3"} {
+		code, body, _ = h.do(client, http.MethodGet, "/api/logs?model="+keyword, nil)
+		if code != http.StatusOK {
+			t.Fatalf("查询 %q 状态码 = %d", keyword, code)
+		}
+		got, _ := body["items"].([]any)
+		if len(got) != 1 {
+			t.Fatalf("关键词 %q 应命中 1 条，实际 %d", keyword, len(got))
+		}
+	}
+
+	// LIKE 通配符按字面匹配（% 不应变成「匹配全部」）
+	code, body, _ = h.do(client, http.MethodGet, "/api/logs?model=%25", nil)
+	if code != http.StatusOK {
+		t.Fatalf("通配符查询状态码 = %d", code)
+	}
+	if got, _ := body["items"].([]any); len(got) != 0 {
+		t.Fatalf("%% 应按字面匹配，实际命中 %d 条", len(got))
+	}
 }
 
 func TestExportImportRoundTrip(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+	h := newHarness(t, "")
 	client := newClient(t)
 
 	code, body, raw := h.do(client, http.MethodGet, "/api/export", nil)
@@ -544,6 +690,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 	exported := providers[0].(map[string]any)
 	exported["api_key"] = "sk-rotated-key-123456"
 	exported["id"] = "imported"
+	exported["name"] = "导入的供应商"
 
 	code, body, raw = h.do(client, http.MethodPost, "/api/import", map[string]any{
 		"providers": []any{exported},
@@ -566,6 +713,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 			if p.APIKey != "sk-rotated-key-123456" {
 				t.Errorf("导入的凭证 = %q", p.APIKey)
 			}
+			if len(p.Models) != 1 || p.Models[0] != "seed-model" {
+				t.Errorf("导入的模型选择 = %v", p.Models)
+			}
 		}
 	}
 	if !found {
@@ -581,13 +731,11 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 }
 
-func TestProviderListIncludesFetchStatus(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	h := newHarness(t, "", upstream.URL)
+func TestProviderListIncludesFetchStatusAndCandidates(t *testing.T) {
+	h := newHarness(t, "")
 	client := newClient(t)
 
-	if err := h.store.ReplaceModelCache(context.Background(), "seed", []string{"auto-1", "auto-2"}, time.Now().UTC()); err != nil {
+	if err := h.store.ReplaceCandidateModels(context.Background(), "seed", []string{"auto-1", "auto-2"}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.store.SetProviderFetchError(context.Background(), "seed", "上游返回 401"); err != nil {
@@ -605,5 +753,9 @@ func TestProviderListIncludesFetchStatus(t *testing.T) {
 	}
 	if seed["last_fetch_at"] == "" {
 		t.Errorf("last_fetch_at 应被设置: %v", seed)
+	}
+	candidates, _ := seed["candidate_models"].([]any)
+	if len(candidates) != 2 {
+		t.Errorf("candidate_models = %v", candidates)
 	}
 }

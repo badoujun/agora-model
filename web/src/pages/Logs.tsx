@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { RefreshCw } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -38,6 +38,14 @@ export function LogsPage() {
   const [expanded, setExpanded] = useState<string | null>(null)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.listProviders })
+
+  const providerNames = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const item of providers.data?.items ?? []) {
+      map.set(item.id, item.name || item.id)
+    }
+    return map
+  }, [providers.data])
 
   const logs = useQuery({
     queryKey: ['logs', { failedOnly, model, providerId, limit, offset }],
@@ -81,13 +89,13 @@ export function LogsPage() {
               <Label htmlFor="log-model">模型</Label>
               <Input
                 id="log-model"
-                className="w-44"
+                className="w-52"
                 value={model}
                 onChange={(event) => {
                   setModel(event.target.value)
                   setOffset(0)
                 }}
-                placeholder="精确匹配"
+                placeholder="模糊匹配，忽略大小写"
               />
             </div>
             <div className="grid gap-1.5">
@@ -165,7 +173,9 @@ export function LogsPage() {
                     <TableCell className="whitespace-nowrap text-xs">{formatTime(item.ts)}</TableCell>
                     <TableCell className="text-xs">{item.inbound_protocol}</TableCell>
                     <TableCell className="font-mono text-xs">{item.model || '—'}</TableCell>
-                    <TableCell className="text-xs">{item.provider_id || '—'}</TableCell>
+                    <TableCell className="text-xs">
+                      {providerNames.get(item.provider_id) || item.provider_id || '—'}
+                    </TableCell>
                     <TableCell>{statusBadge(item.status_code)}</TableCell>
                     <TableCell className="text-xs">{item.latency_ms} ms</TableCell>
                     <TableCell className="text-xs">

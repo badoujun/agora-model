@@ -23,6 +23,7 @@ type Store struct {
 var migrations = []migration{
 	{version: 1, name: "init", statements: schemaV1},
 	{version: 2, name: "provider_fetch_status", statements: schemaV2},
+	{version: 3, name: "single_protocol_model_selection", statements: schemaV3},
 }
 
 type migration struct {
@@ -208,4 +209,21 @@ var schemaV1 = []string{
 var schemaV2 = []string{
 	`ALTER TABLE providers ADD COLUMN last_fetch_at TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE providers ADD COLUMN last_fetch_error TEXT NOT NULL DEFAULT ''`,
+}
+
+// schemaV3 把供应商收敛为单一 OpenAI 兼容协议，并以「勾选模型 + 别名」取代
+// 手动模型 / 排除模型 / 优先级 / 自动拉取开关。
+//
+// 旧版的手动模型列表继续有效（迁移为已勾选模型）；自动拉取到的模型需要重新勾选。
+var schemaV3 = []string{
+	`ALTER TABLE providers ADD COLUMN models_selected_json TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE providers ADD COLUMN models_alias_json TEXT NOT NULL DEFAULT '{}'`,
+	`UPDATE providers SET models_selected_json = models_manual_json
+		WHERE models_manual_json <> '' AND models_manual_json <> '[]'`,
+	`ALTER TABLE providers DROP COLUMN anthropic_base_url`,
+	`ALTER TABLE providers DROP COLUMN anthropic_endpoint_override`,
+	`ALTER TABLE providers DROP COLUMN models_manual_json`,
+	`ALTER TABLE providers DROP COLUMN models_excluded_json`,
+	`ALTER TABLE providers DROP COLUMN auto_fetch_models`,
+	`ALTER TABLE providers DROP COLUMN priority`,
 }

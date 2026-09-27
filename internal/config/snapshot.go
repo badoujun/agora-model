@@ -12,7 +12,9 @@ import (
 type Snapshot struct {
 	gateway Gateway
 	byID    map[string]*Provider
-	ordered []*Provider // 仅启用项，按 priority 升序
+	// byName 以归一化名称（去空白 + 忽略大小写）为键，供命名空间路由使用。
+	byName  map[string]*Provider
+	ordered []*Provider // 仅启用项，按名称升序
 }
 
 // NewSnapshot 由配置构建快照（会执行规范化与校验）。
@@ -24,6 +26,7 @@ func NewSnapshot(f File) (*Snapshot, error) {
 	s := &Snapshot{
 		gateway: normalized.Gateway,
 		byID:    make(map[string]*Provider, len(normalized.Providers)),
+		byName:  make(map[string]*Provider, len(normalized.Providers)),
 	}
 	for i := range normalized.Providers {
 		p := normalized.Providers[i]
@@ -31,12 +34,14 @@ func NewSnapshot(f File) (*Snapshot, error) {
 			continue // Normalize 已保证不重复，这里仅防御
 		}
 		s.byID[p.ID] = &p
+		s.byName[normalizeName(p.Name)] = &p
 		if p.IsEnabled() {
 			s.ordered = append(s.ordered, &p)
 		}
 	}
+	// 默认路由顺序：按供应商名称升序（同名已被 Normalize 拒绝）
 	sort.SliceStable(s.ordered, func(i, j int) bool {
-		return s.ordered[i].Priority < s.ordered[j].Priority
+		return s.ordered[i].Name < s.ordered[j].Name
 	})
 	return s, nil
 }
@@ -50,14 +55,20 @@ func (s *Snapshot) Provider(id string) (*Provider, bool) {
 	return p, ok
 }
 
-// HasProvider 报告 id 是否存在（含已停用项），用于 Phase 3 的命名空间判定。
+// ProviderByName 按供应商名称查找（去空白 + 忽略大小写），含已停用项。
+func (s *Snapshot) ProviderByName(name string) (*Provider, bool) {
+	p, ok := s.byName[normalizeName(name)]
+	return p, ok
+}
+
+// HasProvider 报告 id 是否存在（含已停用项）。
 func (s *Snapshot) HasProvider(id string) bool {
 	_, ok := s.byID[id]
 	return ok
 }
 
-// ProvidersByPriority 返回启用的供应商，按 priority 升序。
-func (s *Snapshot) ProvidersByPriority() []*Provider { return s.ordered }
+// Providers 返回启用的供应商，按名称升序（即默认路由优先级）。
+func (s *Snapshot) Providers() []*Provider { return s.ordered }
 
 // Holder 以原子方式持有当前配置快照，读取无锁。
 type Holder struct {

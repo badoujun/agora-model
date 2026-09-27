@@ -15,6 +15,7 @@ func TestNormalizeDefaults(t *testing.T) {
 			ID:            " a ",
 			OpenAIBaseURL: "http://upstream.example/v1/",
 			Models:        []string{"m1", " m1 ", "", "m2"},
+			ModelAliases:  map[string]string{"m1": " 我的模型 ", "m2": "   ", "ghost": "x"},
 		}},
 	}
 	out, err := f.Normalize()
@@ -51,20 +52,74 @@ func TestNormalizeDefaults(t *testing.T) {
 	if len(p.Models) != 2 || p.Models[0] != "m1" || p.Models[1] != "m2" {
 		t.Errorf("模型列表应去空白去重: %#v", p.Models)
 	}
+	if len(p.ModelAliases) != 1 || p.ModelAliases["m1"] != "我的模型" {
+		t.Errorf("别名应去空白并丢弃空值: %#v", p.ModelAliases)
+	}
 	if !p.IsEnabled() {
 		t.Error("缺省应视为启用")
-	}
-	if p.Priority != DefaultPriority {
-		t.Errorf("Priority = %d, 期望 %d", p.Priority, DefaultPriority)
 	}
 	if p.TimeoutSeconds != DefaultTimeoutSeconds {
 		t.Errorf("TimeoutSeconds = %d, 期望 %d", p.TimeoutSeconds, DefaultTimeoutSeconds)
 	}
-	if got := p.Endpoint(ProtocolOpenAI); got != "http://upstream.example/v1/chat/completions" {
-		t.Errorf("OpenAI endpoint = %q", got)
+	if got := p.Endpoint(); got != "http://upstream.example/v1/chat/completions" {
+		t.Errorf("endpoint = %q", got)
 	}
-	if got := p.Endpoint(ProtocolAnthropic); got != "" {
-		t.Errorf("未配置的 Anthropic endpoint 应为空, 得到 %q", got)
+	if got := p.ModelsEndpoint(); got != "http://upstream.example/v1/models" {
+		t.Errorf("models endpoint = %q", got)
+	}
+}
+
+func TestExposedAndRealModel(t *testing.T) {
+	p := Provider{
+		ID:            "p",
+		OpenAIBaseURL: "http://x/v1",
+		Models:        []string{"gpt-4o", "gpt-4o-mini"},
+		ModelAliases:  map[string]string{"gpt-4o": "我的模型"},
+	}
+	if got := p.ExposedModel("gpt-4o"); got != "我的模型" {
+		t.Errorf("ExposedModel = %q", got)
+	}
+	if got := p.ExposedModels(); len(got) != 2 || got[0] != "我的模型" || got[1] != "gpt-4o-mini" {
+		t.Errorf("ExposedModels = %#v", got)
+	}
+	real, ok := p.RealModel("我的模型")
+	if !ok || real != "gpt-4o" {
+		t.Errorf("RealModel(我的模型) = %q ok=%v", real, ok)
+	}
+	if _, ok := p.RealModel("gpt-4o"); ok {
+		t.Error("配置了别名后，上游原名不应再对外可用")
+	}
+	if !p.KnowsModel("gpt-4o-mini") {
+		t.Error("未配置别名的模型应仍可用原名访问")
+	}
+	if p.KnowsModel("nope") {
+		t.Error("未勾选的模型不应被声明")
+	}
+}
+
+func TestValidateModelSelectionRejectsAliasCollision(t *testing.T) {
+	p := Provider{
+		ID:            "p",
+		Name:          "供应商A",
+		OpenAIBaseURL: "http://x/v1",
+		Models:        []string{"m1", "m2"},
+		ModelAliases:  map[string]string{"m1": "alias", "m2": "ALIAS"},
+	}
+	err := p.ValidateModelSelection()
+	if err == nil || !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("别名冲突应被拒绝（忽略大小写），得到 %v", err)
+	}
+}
+
+func TestValidateModelSelectionAllowsDistinctAliases(t *testing.T) {
+	p := Provider{
+		ID:            "p",
+		OpenAIBaseURL: "http://x/v1",
+		Models:        []string{"m1", "m2"},
+		ModelAliases:  map[string]string{"m1": "别名1", "m2": "别名2"},
+	}
+	if err := p.ValidateModelSelection(); err != nil {
+		t.Fatalf("合法别名不应报错: %v", err)
 	}
 }
 
@@ -91,22 +146,38 @@ func TestNormalizeErrors(t *testing.T) {
 		{
 			name: "供应商 id 重复",
 			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
-				{ID: "dup", OpenAIBaseURL: "http://x/v1"},
-				{ID: "dup", OpenAIBaseURL: "http://y/v1"},
+				{ID: "dup", Name: "a", OpenAIBaseURL: "http://x/v1"},
+				{ID: "dup", Name: "b", OpenAIBaseURL: "http://y/v1"},
 			}},
 			want: "id 重复",
 		},
 		{
-			name: "供应商未配置任何协议地址",
-			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{{ID: "a"}}},
-			want: "至少需要配置一个协议地址",
+			name: "供应商名称重复",
+			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
+				{ID: "a", Name: "同名", OpenAIBaseURL: "http://x/v1"},
+				{ID: "b", Name: " 同名 ", OpenAIBaseURL: "http://y/v1"},
+			}},
+			want: "供应商名称重复",
+		},
+		{
+			name: "供应商未配置上游地址",
+			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{{ID: "a", Name: "a"}}},
+			want: "必须配置 openai_base_url",
 		},
 		{
 			name: "URL scheme 非法",
 			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
-				{ID: "a", OpenAIBaseURL: "ftp://x/v1"},
+				{ID: "a", Name: "a", OpenAIBaseURL: "ftp://x/v1"},
 			}},
 			want: "仅支持 http/https",
+		},
+		{
+			name: "别名冲突",
+			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
+				{ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1",
+					Models: []string{"m1", "m2"}, ModelAliases: map[string]string{"m2": "m1"}},
+			}},
+			want: "重复",
 		},
 	}
 	for _, tc := range cases {
@@ -124,27 +195,25 @@ func TestNormalizeErrors(t *testing.T) {
 
 func TestEndpointOverrideTakesPrecedence(t *testing.T) {
 	p := Provider{
-		ID:                        "p",
-		OpenAIBaseURL:             "http://x/v1",
-		OpenAIEndpointOverride:    "http://x/custom/completions",
-		AnthropicBaseURL:          "http://x",
-		AnthropicEndpointOverride: "http://x/custom/messages",
+		ID:                     "p",
+		OpenAIBaseURL:          "http://x/v1",
+		OpenAIEndpointOverride: "http://x/custom/completions",
 	}
-	if got := p.Endpoint(ProtocolOpenAI); got != "http://x/custom/completions" {
+	if got := p.Endpoint(); got != "http://x/custom/completions" {
 		t.Errorf("override 应优先: %q", got)
 	}
-	if got := p.Endpoint(ProtocolAnthropic); got != "http://x/custom/messages" {
-		t.Errorf("override 应优先: %q", got)
+	if got := p.ModelsEndpoint(); got != "" {
+		t.Errorf("端点覆盖时无法推导 /models: %q", got)
 	}
 }
 
-func TestSnapshotOrderingAndDisabled(t *testing.T) {
+func TestSnapshotOrderingByNameAndDisabled(t *testing.T) {
 	f := File{
 		Gateway: Gateway{APIKey: "k"},
 		Providers: []Provider{
-			{ID: "late", OpenAIBaseURL: "http://x/v1", Priority: 50, Models: []string{"m"}},
-			{ID: "off", OpenAIBaseURL: "http://x/v1", Priority: 1, Models: []string{"m"}, Enabled: boolPtr(false)},
-			{ID: "early", OpenAIBaseURL: "http://x/v1", Priority: 5, Models: []string{"m"}},
+			{ID: "late", Name: "Beta", OpenAIBaseURL: "http://x/v1", Models: []string{"m"}},
+			{ID: "off", Name: "Alpha", OpenAIBaseURL: "http://x/v1", Models: []string{"m"}, Enabled: boolPtr(false)},
+			{ID: "early", Name: "Delta", OpenAIBaseURL: "http://x/v1", Models: []string{"m"}},
 		},
 	}
 	snap, err := NewSnapshot(f)
@@ -152,18 +221,22 @@ func TestSnapshotOrderingAndDisabled(t *testing.T) {
 		t.Fatalf("NewSnapshot: %v", err)
 	}
 
-	ordered := snap.ProvidersByPriority()
+	ordered := snap.Providers()
 	if len(ordered) != 2 {
 		t.Fatalf("停用的供应商不应进入路由列表，得到 %d 项", len(ordered))
 	}
-	if ordered[0].ID != "early" || ordered[1].ID != "late" {
-		t.Fatalf("应按 priority 升序: %s, %s", ordered[0].ID, ordered[1].ID)
+	if ordered[0].ID != "late" || ordered[1].ID != "early" {
+		t.Fatalf("应按名称升序（Beta < Delta）: %s, %s", ordered[0].ID, ordered[1].ID)
 	}
 	if !snap.HasProvider("off") {
-		t.Error("HasProvider 应包含已停用的供应商（供 Phase 3 命名空间判定）")
+		t.Error("HasProvider 应包含已停用的供应商")
 	}
 	if _, ok := snap.Provider("early"); !ok {
 		t.Error("Provider 查询失败")
+	}
+	byName, ok := snap.ProviderByName(" ALPHA ")
+	if !ok || byName.ID != "off" {
+		t.Errorf("ProviderByName 应忽略空白与大小写、并包含停用项，得到 %v ok=%v", byName, ok)
 	}
 }
 
@@ -172,7 +245,8 @@ func TestLoadFileAndHolder(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 	body := `{
 	  "gateway": {"api_key": "gw-1", "port": 1234},
-	  "providers": [{"id": "p1", "openai_base_url": "http://x/v1", "models": ["m"]}]
+	  "providers": [{"id": "p1", "name": "供应商 1", "openai_base_url": "http://x/v1",
+	                 "models": ["m"], "model_aliases": {"m": "别名M"}}]
 	}`
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -184,6 +258,9 @@ func TestLoadFileAndHolder(t *testing.T) {
 	}
 	if f.Gateway.Port != 1234 {
 		t.Errorf("Port = %d", f.Gateway.Port)
+	}
+	if f.Providers[0].ModelAliases["m"] != "别名M" {
+		t.Errorf("模型别名未解析: %#v", f.Providers[0].ModelAliases)
 	}
 
 	snap, err := NewSnapshot(f)

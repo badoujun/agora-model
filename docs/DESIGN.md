@@ -1,22 +1,35 @@
 # AgoraModel 功能明细设计说明书
 
-> 对应 PRD：`docs/PRD.md` v1.0
+> 对应 PRD：`docs/PRD.md` v1.1
 > 本文档面向实现，描述架构、数据模型、接口契约、核心流程、前端页面与测试/部署方案。
-> 版本：v1.0（初稿）
+> 版本：v1.0（初稿）+ v1.1 变更说明
+>
+> **v1.1 变更（与本说明书中 v1.0 段落冲突处以此为准）**：
+>
+> - **只保留 OpenAI 兼容协议**：`/v1/messages`、`ProtocolAnthropic`、双协议错误体风格与 Anthropic 连接测试均已删除；
+>   落库结构由迁移 v3 收敛（删除 `anthropic_*` 列）。
+> - **供应商字段精简**：`name`、`openai_base_url`、`openai_endpoint_override`、`api_key`、`models`（已勾选）、
+>   `model_aliases`、`timeout_seconds`、`extra_headers`、`extra_body`、`allow_internal`、`enabled`；
+>   `priority`、`models_excluded`、`auto_fetch_models` 已移除（供应商名称唯一，且名称即路由命名空间）。
+> - **模型由勾选决定**：`internal/models` 只提供按需拉取（`Fetcher`），候选列表存 `model_cache` 供编辑页勾选；
+>   没有定时聚合，`settings.model_refresh_seconds` 不再使用。
+> - **接口契约调整**：`/v1/models` 的 `owned_by` 与命名空间前缀使用供应商名称，别称为对外模型名；
+>   `/api/models/refresh`、`/api/models/manual` 已下线；`/api/providers/{id}` 的 DTO 见 `internal/api/resources.go`。
+> - **日志筛选**：`GET /api/logs?model=` 为忽略大小写的模糊匹配（LIKE 通配符按字面处理）。
 
 ---
 
 ## 1. 设计目标与边界
 
-**设计目标**：以最小实现代价交付「一个对外入口 + 双协议原样透传 + 零模板动态供应商 + 模型聚合 + 轻量 Web UI」，并把对抗性审查中确认的工程风险（SSRF、明文凭证、SSE 空闲超时、断连泄漏、配置损坏、黑盒排查）在低成本范围内一次性修掉。
+**设计目标**：以最小实现代价交付「一个对外入口 + OpenAI 兼容协议原样透传 + 零模板动态供应商 + 模型拉取勾选 + 轻量 Web UI」，并把对抗性审查中确认的工程风险（SSRF、明文凭证、SSE 空闲超时、断连泄漏、配置损坏、黑盒排查）在低成本范围内一次性修掉。
 
 **设计边界（明确的"不做"）**：
 
-- 不做请求/响应/SSE 的协议转换——上游供应商自带双协议 URL，网关只做「按入站协议选上游 URL」。
+- 不做请求/响应/SSE 的协议转换——网关只按模型名选择上游，原样透传。
 - 不做凭证池、轮询、故障转移——每个供应商一个凭证。
 - 不做用量统计、计费、WebDAV。
 - 不做多实例/分布式；不做多租户。
-- 不为 `/v1/models` 做 Anthropic 格式内容协商。
+- 不为 `/v1/models` 做 Anthropic 格式内容协商（v1.1 起 Anthropic 协议整体下线）。
 
 ---
 

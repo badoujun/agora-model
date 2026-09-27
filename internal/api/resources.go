@@ -11,61 +11,51 @@ import (
 
 	"agora-model/internal/config"
 	"agora-model/internal/crypto"
-	"agora-model/internal/models"
 	"agora-model/internal/provider"
 	"agora-model/internal/store"
 )
 
-// 默认值（与 DESIGN §4.4 / config 包保持一致）。
-const (
-	defaultPriority       = 100
-	defaultTimeoutSeconds = 120
-)
+// defaultTimeoutSeconds 与 config 包保持一致。
+const defaultTimeoutSeconds = 120
 
 // providerDTO 是对外的供应商表示：凭证只输出掩码。
 type providerDTO struct {
-	ID                        string            `json:"id"`
-	Name                      string            `json:"name"`
-	OpenAIBaseURL             string            `json:"openai_base_url"`
-	AnthropicBaseURL          string            `json:"anthropic_base_url"`
-	OpenAIEndpointOverride    string            `json:"openai_endpoint_override"`
-	AnthropicEndpointOverride string            `json:"anthropic_endpoint_override"`
-	APIKeyHint                string            `json:"api_key_hint"`
-	ModelsManual              []string          `json:"models_manual"`
-	ModelsExcluded            []string          `json:"models_excluded"`
-	AutoFetchModels           bool              `json:"auto_fetch_models"`
-	Priority                  int               `json:"priority"`
-	TimeoutSeconds            int               `json:"timeout_seconds"`
-	ExtraHeaders              map[string]string `json:"extra_headers,omitempty"`
-	ExtraBody                 map[string]any    `json:"extra_body,omitempty"`
-	AllowInternal             bool              `json:"allow_internal"`
-	Enabled                   bool              `json:"enabled"`
-	ModelCount                int               `json:"model_count"`
-	AvailableModels           []string          `json:"available_models"`
-	LastFetchAt               string            `json:"last_fetch_at,omitempty"`
-	LastFetchError            string            `json:"last_fetch_error,omitempty"`
+	ID                     string            `json:"id"`
+	Name                   string            `json:"name"`
+	OpenAIBaseURL          string            `json:"openai_base_url"`
+	OpenAIEndpointOverride string            `json:"openai_endpoint_override"`
+	APIKeyHint             string            `json:"api_key_hint"`
+	ModelsSelected         []string          `json:"models_selected"`
+	ModelAliases           map[string]string `json:"model_aliases"`
+	ExposedModels          []string          `json:"exposed_models"`
+	TimeoutSeconds         int               `json:"timeout_seconds"`
+	ExtraHeaders           map[string]string `json:"extra_headers,omitempty"`
+	ExtraBody              map[string]any    `json:"extra_body,omitempty"`
+	AllowInternal          bool              `json:"allow_internal"`
+	Enabled                bool              `json:"enabled"`
+	ModelCount             int               `json:"model_count"`
+	// CandidateModels 是最近一次「拉取模型」得到的结果，供编辑页勾选。
+	CandidateModels []string `json:"candidate_models,omitempty"`
+	LastFetchAt     string   `json:"last_fetch_at,omitempty"`
+	LastFetchError  string   `json:"last_fetch_error,omitempty"`
 }
 
 // providerInput 是创建/更新供应商的请求体。
 //
 // 指针字段用于区分「未提供」与「显式置零/置 false」。
 type providerInput struct {
-	ID                        string            `json:"id"`
-	Name                      string            `json:"name"`
-	OpenAIBaseURL             string            `json:"openai_base_url"`
-	AnthropicBaseURL          string            `json:"anthropic_base_url"`
-	OpenAIEndpointOverride    string            `json:"openai_endpoint_override"`
-	AnthropicEndpointOverride string            `json:"anthropic_endpoint_override"`
-	APIKey                    *string           `json:"api_key"`
-	ModelsManual              []string          `json:"models_manual"`
-	ModelsExcluded            []string          `json:"models_excluded"`
-	AutoFetchModels           *bool             `json:"auto_fetch_models"`
-	Priority                  *int              `json:"priority"`
-	TimeoutSeconds            *int              `json:"timeout_seconds"`
-	ExtraHeaders              map[string]string `json:"extra_headers"`
-	ExtraBody                 map[string]any    `json:"extra_body"`
-	AllowInternal             *bool             `json:"allow_internal"`
-	Enabled                   *bool             `json:"enabled"`
+	ID                     string            `json:"id"`
+	Name                   string            `json:"name"`
+	OpenAIBaseURL          string            `json:"openai_base_url"`
+	OpenAIEndpointOverride string            `json:"openai_endpoint_override"`
+	APIKey                 *string           `json:"api_key"`
+	ModelsSelected         []string          `json:"models_selected"`
+	ModelAliases           map[string]string `json:"model_aliases"`
+	TimeoutSeconds         *int              `json:"timeout_seconds"`
+	ExtraHeaders           map[string]string `json:"extra_headers"`
+	ExtraBody              map[string]any    `json:"extra_body"`
+	AllowInternal          *bool             `json:"allow_internal"`
+	Enabled                *bool             `json:"enabled"`
 }
 
 func (in providerInput) displayName() string {
@@ -78,28 +68,38 @@ func (in providerInput) displayName() string {
 	return "(未命名)"
 }
 
-func toDTO(rec store.ProviderRecord, available []string) providerDTO {
+// exposedModels 返回记录对外暴露的模型名（别名优先）。
+func exposedModels(rec store.ProviderRecord) []string {
+	out := make([]string, 0, len(rec.ModelsSelected))
+	for _, m := range rec.ModelsSelected {
+		if alias := strings.TrimSpace(rec.ModelAliases[m]); alias != "" {
+			out = append(out, alias)
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func toDTO(rec store.ProviderRecord, candidates []string) providerDTO {
 	return providerDTO{
-		ID:                        rec.ID,
-		Name:                      rec.Name,
-		OpenAIBaseURL:             rec.OpenAIBaseURL,
-		AnthropicBaseURL:          rec.AnthropicBaseURL,
-		OpenAIEndpointOverride:    rec.OpenAIEndpointOverride,
-		AnthropicEndpointOverride: rec.AnthropicEndpointOverride,
-		APIKeyHint:                rec.APIKeyHint,
-		ModelsManual:              rec.ModelsManual,
-		ModelsExcluded:            rec.ModelsExcluded,
-		AutoFetchModels:           rec.AutoFetchModels,
-		Priority:                  rec.Priority,
-		TimeoutSeconds:            rec.TimeoutSeconds,
-		ExtraHeaders:              rec.ExtraHeaders,
-		ExtraBody:                 rec.ExtraBody,
-		AllowInternal:             rec.AllowInternal,
-		Enabled:                   rec.Enabled,
-		ModelCount:                len(available),
-		AvailableModels:           available,
-		LastFetchAt:               formatOptionalTime(rec.LastFetchAt),
-		LastFetchError:            rec.LastFetchError,
+		ID:                     rec.ID,
+		Name:                   rec.Name,
+		OpenAIBaseURL:          rec.OpenAIBaseURL,
+		OpenAIEndpointOverride: rec.OpenAIEndpointOverride,
+		APIKeyHint:             rec.APIKeyHint,
+		ModelsSelected:         rec.ModelsSelected,
+		ModelAliases:           rec.ModelAliases,
+		ExposedModels:          exposedModels(rec),
+		TimeoutSeconds:         rec.TimeoutSeconds,
+		ExtraHeaders:           rec.ExtraHeaders,
+		ExtraBody:              rec.ExtraBody,
+		AllowInternal:          rec.AllowInternal,
+		Enabled:                rec.Enabled,
+		ModelCount:             len(rec.ModelsSelected),
+		CandidateModels:        candidates,
+		LastFetchAt:            formatOptionalTime(rec.LastFetchAt),
+		LastFetchError:         rec.LastFetchError,
 	}
 }
 
@@ -121,10 +121,13 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
 		return
 	}
-	available := s.availableModels()
 	items := make([]providerDTO, 0, len(records))
 	for _, rec := range records {
-		items = append(items, toDTO(rec, available[rec.ID]))
+		candidates, _, cerr := s.store.LoadCandidateModels(ctx, rec.ID)
+		if cerr != nil {
+			s.logger.Debug("读取候选模型失败", "provider", rec.ID, "err", cerr)
+		}
+		items = append(items, toDTO(rec, candidates))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -142,7 +145,8 @@ func (s *Server) handleGetProvider(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toDTO(rec, s.availableModels()[rec.ID]))
+	candidates, _, _ := s.store.LoadCandidateModels(ctx, rec.ID)
+	writeJSON(w, http.StatusOK, toDTO(rec, candidates))
 }
 
 func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
@@ -168,19 +172,10 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	// 新供应商自动拉一次模型（失败不影响创建结果）
-	if s.aggregator != nil && rec.AutoFetchModels {
-		p, perr := s.loadProvider(ctx, rec.ID)
-		if perr == nil {
-			if ferr := s.aggregator.RefreshProvider(ctx, p); ferr != nil {
-				s.logger.Warn("新建供应商后拉取模型失败", "provider", rec.ID, "err", ferr)
-			}
-		}
-	}
 	_ = s.applyReload(ctx)
 
 	refreshed, _ := s.store.GetProvider(ctx, rec.ID)
-	writeJSON(w, http.StatusCreated, toDTO(refreshed, s.availableModels()[rec.ID]))
+	writeJSON(w, http.StatusCreated, toDTO(refreshed, nil))
 }
 
 func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +210,8 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toDTO(rec, s.availableModels()[id]))
+	candidates, _, _ := s.store.LoadCandidateModels(ctx, id)
+	writeJSON(w, http.StatusOK, toDTO(rec, candidates))
 }
 
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
@@ -249,15 +245,10 @@ func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := provider.Test(ctx, p, s.client)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":         result.OpenAI.OK || result.Anthropic.OK,
-		"openai":     result.OpenAI,
-		"anthropic":  result.Anthropic,
-		"checked_at": result.CheckedAt.UTC().Format(time.RFC3339),
-	})
+	writeJSON(w, http.StatusOK, provider.Test(ctx, p, s.client))
 }
 
+// handleFetchModels 拉取上游模型候选列表并缓存（不影响已勾选的模型）。
 func (s *Server) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -271,12 +262,12 @@ func (s *Server) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
 		return
 	}
-	if s.aggregator == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "聚合器不可用"})
-		return
-	}
-	if err := s.aggregator.RefreshProvider(ctx, p); err != nil {
-		// 失败原因已由聚合器写入 last_fetch_error
+
+	candidates, err := s.fetcher.Fetch(ctx, p)
+	if err != nil {
+		if serr := s.store.SetProviderFetchError(ctx, p.ID, err.Error()); serr != nil {
+			s.logger.Debug("记录拉取失败原因失败", "provider", p.ID, "err", serr)
+		}
 		rec, _ := s.store.GetProvider(ctx, p.ID)
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":            err.Error(),
@@ -284,14 +275,17 @@ func (s *Server) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	_ = s.applyReload(ctx)
+	if err := s.store.ReplaceCandidateModels(ctx, p.ID, candidates, time.Now().UTC()); err != nil {
+		s.fail(w, http.StatusInternalServerError, "写入模型候选缓存失败", err)
+		return
+	}
 
 	rec, err := s.store.GetProvider(ctx, p.ID)
 	if err != nil {
 		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toDTO(rec, s.availableModels()[p.ID]))
+	writeJSON(w, http.StatusOK, toDTO(rec, candidates))
 }
 
 // upsertProvider 把请求体转换为供应商并写库（apiKey 为空且已存在时沿用原凭证）。
@@ -319,41 +313,44 @@ func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey st
 		return store.ProviderRecord{}, errors.New("首次创建供应商必须提供 api_key")
 	}
 
+	name := strings.TrimSpace(in.Name)
+	if name == "" && hasExisting {
+		name = existing.Name
+	}
+	if name == "" {
+		return store.ProviderRecord{}, errors.New("请填写供应商名称")
+	}
+	if err := s.ensureNameAvailable(ctx, id, name); err != nil {
+		return store.ProviderRecord{}, err
+	}
+
 	base := config.Provider{
-		ID:                        id,
-		Name:                      strings.TrimSpace(in.Name),
-		OpenAIBaseURL:             strings.TrimSpace(in.OpenAIBaseURL),
-		AnthropicBaseURL:          strings.TrimSpace(in.AnthropicBaseURL),
-		OpenAIEndpointOverride:    strings.TrimSpace(in.OpenAIEndpointOverride),
-		AnthropicEndpointOverride: strings.TrimSpace(in.AnthropicEndpointOverride),
-		APIKey:                    apiKey,
-		Models:                    cleanList(in.ModelsManual),
-		ModelsExcluded:            cleanList(in.ModelsExcluded),
-		AutoFetchModels:           in.AutoFetchModels,
-		Priority:                  valueOr(in.Priority, defaultPriority),
-		TimeoutSeconds:            valueOr(in.TimeoutSeconds, defaultTimeoutSeconds),
-		ExtraHeaders:              in.ExtraHeaders,
-		ExtraBody:                 in.ExtraBody,
-		AllowInternal:             boolOr(in.AllowInternal, false),
-		Enabled:                   in.Enabled,
+		ID:                     id,
+		Name:                   name,
+		OpenAIBaseURL:          strings.TrimSpace(in.OpenAIBaseURL),
+		OpenAIEndpointOverride: strings.TrimSpace(in.OpenAIEndpointOverride),
+		APIKey:                 apiKey,
+		Models:                 cleanList(in.ModelsSelected),
+		ModelAliases:           in.ModelAliases,
+		TimeoutSeconds:         valueOr(in.TimeoutSeconds, defaultTimeoutSeconds),
+		ExtraHeaders:           in.ExtraHeaders,
+		ExtraBody:              in.ExtraBody,
+		AllowInternal:          boolOr(in.AllowInternal, false),
+		Enabled:                in.Enabled,
 	}
 	if hasExisting {
 		// 未提供的字段沿用既有值（PUT 语义贴近 PATCH，降低 Web UI 表单漏传导致配置丢失的风险）
-		if base.Name == "" {
-			base.Name = existing.Name
-		}
 		if base.OpenAIBaseURL == "" {
 			base.OpenAIBaseURL = existing.OpenAIBaseURL
 		}
-		if base.AnthropicBaseURL == "" {
-			base.AnthropicBaseURL = existing.AnthropicBaseURL
+		if base.OpenAIEndpointOverride == "" {
+			base.OpenAIEndpointOverride = existing.OpenAIEndpointOverride
 		}
-		if len(in.ModelsManual) == 0 {
-			base.Models = existing.ModelsManual
+		if in.ModelsSelected == nil {
+			base.Models = existing.ModelsSelected
 		}
-		if in.AutoFetchModels == nil {
-			auto := existing.AutoFetchModels
-			base.AutoFetchModels = &auto
+		if in.ModelAliases == nil {
+			base.ModelAliases = existing.ModelAliases
 		}
 		if in.AllowInternal == nil {
 			base.AllowInternal = existing.AllowInternal
@@ -363,12 +360,33 @@ func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey st
 			base.Enabled = &enabled
 		}
 	}
-	if base.Endpoint(config.ProtocolOpenAI) == "" && base.Endpoint(config.ProtocolAnthropic) == "" {
-		return store.ProviderRecord{}, errors.New("至少需要配置一个协议地址（openai_base_url 或 anthropic_base_url）")
+	if base.Endpoint() == "" {
+		return store.ProviderRecord{}, errors.New("请填写 OpenAI Base URL（或 OpenAI 端点覆盖）")
+	}
+	if err := base.ValidateModelSelection(); err != nil {
+		return store.ProviderRecord{}, err
 	}
 
 	// SaveProvider 内部会做 SSRF 校验（allow_internal=false 时拒绝内网地址）与 AES 加密
 	return s.store.SaveProvider(ctx, s.master, base)
+}
+
+// ensureNameAvailable 保证供应商名称唯一：名称即对外路由命名空间（忽略大小写）。
+func (s *Server) ensureNameAvailable(ctx context.Context, id, name string) error {
+	records, err := s.store.ListProviders(ctx)
+	if err != nil {
+		return err
+	}
+	want := strings.ToLower(strings.TrimSpace(name))
+	for _, rec := range records {
+		if rec.ID == id {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(rec.Name)) == want {
+			return fmt.Errorf("供应商名称 %q 已被使用，请换一个（名称用于 %s 形式的模型命名空间）", name, name+"/模型名")
+		}
+	}
+	return nil
 }
 
 // loadProvider 读出并解密单个供应商。
@@ -388,158 +406,38 @@ func (s *Server) loadProvider(ctx context.Context, id string) (config.Provider, 
 // ---------------- 模型 ----------------
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	records, err := s.store.ListProviders(ctx)
-	if err != nil {
-		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
-		return
-	}
-	// 快照里的 Models 是「手动 ∪ 自动」的合并结果；手动列表需回到数据库读取才能区分来源
-	manual := make(map[string]map[string]bool, len(records))
-	for _, rec := range records {
-		set := make(map[string]bool, len(rec.ModelsManual))
-		for _, m := range rec.ModelsManual {
-			set[m] = true
-		}
-		manual[rec.ID] = set
-	}
-
 	type entry struct {
-		Model    string `json:"model"`
-		Provider string `json:"provider_id"`
-		Default  bool   `json:"default"`
-		Source   string `json:"source"`
+		Model        string `json:"model"`
+		Upstream     string `json:"upstream_model"`
+		Alias        string `json:"alias,omitempty"`
+		ProviderID   string `json:"provider_id"`
+		ProviderName string `json:"provider_name"`
+		Default      bool   `json:"default"`
 	}
 
 	snap := s.holder.Get()
-	original := map[string]string{} // 裸名 -> 默认供应商（priority 最小者）
-	for _, p := range snap.ProvidersByPriority() {
-		for _, m := range p.Models {
-			if _, ok := original[m]; !ok {
-				original[m] = p.ID
-			}
-		}
-	}
-
+	defaults := map[string]bool{} // 对外模型名 -> 是否已确定默认供应商
 	items := make([]entry, 0, 32)
-	for _, p := range snap.ProvidersByPriority() {
-		for _, m := range p.Models {
-			source := "auto"
-			if manual[p.ID][m] {
-				source = "manual"
+	for _, p := range snap.Providers() {
+		for _, model := range p.Models {
+			exposed := p.ExposedModel(model)
+			item := entry{
+				Model:        exposed,
+				Upstream:     model,
+				ProviderID:   p.ID,
+				ProviderName: p.Name,
 			}
-			items = append(items, entry{
-				Model:    m,
-				Provider: p.ID,
-				Default:  original[m] == p.ID,
-				Source:   source,
-			})
+			if !defaults[exposed] {
+				defaults[exposed] = true
+				item.Default = true
+			}
+			if exposed != model {
+				item.Alias = exposed
+			}
+			items = append(items, item)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
-}
-
-func (s *Server) handleRefreshModels(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
-	defer cancel()
-
-	if s.aggregator == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "聚合器不可用"})
-		return
-	}
-	s.aggregator.RefreshAll(ctx)
-	_ = s.applyReload(ctx)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (s *Server) handleAddManualModel(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		ProviderID string `json:"provider_id"`
-		Model      string `json:"model"`
-	}
-	if err := decodeJSON(r, &body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-
-	model := strings.TrimSpace(body.Model)
-	if model == "" || strings.TrimSpace(body.ProviderID) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider_id 与 model 均必填"})
-		return
-	}
-	if err := s.mutateManualModels(ctx, body.ProviderID, func(list []string) []string {
-		return append(list, model)
-	}); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	_ = s.applyReload(ctx)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (s *Server) handleRemoveManualModel(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	providerID := strings.TrimSpace(q.Get("provider_id"))
-	model := strings.TrimSpace(q.Get("model"))
-	if providerID == "" || model == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider_id 与 model 均必填"})
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-
-	if err := s.mutateManualModels(ctx, providerID, func(list []string) []string {
-		out := make([]string, 0, len(list))
-		for _, m := range list {
-			if m != model {
-				out = append(out, m)
-			}
-		}
-		return out
-	}); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	_ = s.applyReload(ctx)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// mutateManualModels 读取供应商、应用变更函数后写回（凭证保持不变）。
-func (s *Server) mutateManualModels(ctx context.Context, providerID string, mutate func([]string) []string) error {
-	rec, err := s.store.GetProvider(ctx, providerID)
-	if err != nil {
-		return err
-	}
-	plain, err := crypto.Decrypt(s.master, rec.APIKeyCipher, rec.ID)
-	if err != nil {
-		return fmt.Errorf("读取凭证失败: %w", err)
-	}
-	auto := rec.AutoFetchModels
-	enabled := rec.Enabled
-	p := config.Provider{
-		ID:                        rec.ID,
-		Name:                      rec.Name,
-		OpenAIBaseURL:             rec.OpenAIBaseURL,
-		AnthropicBaseURL:          rec.AnthropicBaseURL,
-		OpenAIEndpointOverride:    rec.OpenAIEndpointOverride,
-		AnthropicEndpointOverride: rec.AnthropicEndpointOverride,
-		APIKey:                    string(plain),
-		Models:                    mutate(rec.ModelsManual),
-		ModelsExcluded:            rec.ModelsExcluded,
-		AutoFetchModels:           &auto,
-		Priority:                  rec.Priority,
-		TimeoutSeconds:            rec.TimeoutSeconds,
-		ExtraHeaders:              rec.ExtraHeaders,
-		ExtraBody:                 rec.ExtraBody,
-		AllowInternal:             rec.AllowInternal,
-		Enabled:                   &enabled,
-	}
-	_, err = s.store.SaveProvider(ctx, s.master, p)
-	return err
 }
 
 // ---------------- 设置与网关 Key ----------------
@@ -567,15 +465,13 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"gateway_key_hint":       keyInfo.KeyHint,
 		"gateway_key_created_at": formatOptionalTime(keyInfo.CreatedAt),
 		"gateway_key_last_used":  formatOptionalTime(keyInfo.LastUsedAt),
-		"model_refresh_seconds":  settings[models.SettingRefreshSeconds],
 		"log_success":            settings[store.SettingLogSuccess],
 	})
 }
 
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ModelRefreshSeconds *int  `json:"model_refresh_seconds"`
-		LogSuccess          *bool `json:"log_success"`
+		LogSuccess *bool `json:"log_success"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -584,16 +480,6 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	if body.ModelRefreshSeconds != nil {
-		if *body.ModelRefreshSeconds < 30 {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model_refresh_seconds 不能小于 30 秒"})
-			return
-		}
-		if err := s.store.SetSetting(ctx, models.SettingRefreshSeconds, strconv.Itoa(*body.ModelRefreshSeconds)); err != nil {
-			s.fail(w, http.StatusInternalServerError, "写入设置失败", err)
-			return
-		}
-	}
 	if body.LogSuccess != nil {
 		value := "false"
 		if *body.LogSuccess {

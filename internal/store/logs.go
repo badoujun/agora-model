@@ -84,8 +84,9 @@ func (s *Store) QueryLogs(ctx context.Context, f LogFilter) ([]logging.Entry, er
 		where = append(where, "status_code >= 400")
 	}
 	if f.Model != "" {
-		where = append(where, "model = ?")
-		args = append(args, f.Model)
+		// 模型筛选：忽略大小写的模糊匹配（用户输入按字面匹配，转义 LIKE 通配符）
+		where = append(where, `LOWER(model) LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(strings.ToLower(f.Model))+"%")
 	}
 	if f.ProviderID != "" {
 		where = append(where, "provider_id = ?")
@@ -167,4 +168,10 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+// escapeLike 转义 LIKE 模式中的通配符，使关键词按字面匹配。
+func escapeLike(keyword string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(keyword)
 }

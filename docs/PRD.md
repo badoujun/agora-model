@@ -2,8 +2,23 @@
 
 > 产品代号：**AgoraModel**（仓库目录 `agora-model`）
 > 一句话定义：**本地优先的「AI 模型接入网关 + 配置控制台」——给所有 AI Agent 一个固定入口。**
-> 版本：v1.0（初稿）｜状态：待评审
+> 版本：v1.1（协议收敛 + 模型勾选制）｜状态：已实现，随本轮变更落地
 > 需求来源：用户与 DeepSeek 的方案讨论（含 3 轮约束收敛 + 1 轮对抗性审查后的修正）
+
+---
+
+## 0. v1.1 变更记录（本轮）
+
+v1.0 的「双协议 + 自动聚合模型」在实现后按实际使用反馈收敛为**单协议 + 模型勾选制**。
+以下为变更内容，正文中与本节冲突的表述（§2.1 G3/G4、§3 术语、FR-1/2/4/5/6、§7 验收）以本节为准。
+
+| 编号 | 变更 | 影响 |
+| --- | --- | --- |
+| C1 | **移除 Anthropic 协议支持**：删除 `/v1/messages` 端点、双协议透传与入站错误体风格分支 | 供应商只需一个 OpenAI 兼容地址；`/v1/messages` 返回 404；错误体统一为 OpenAI 风格 |
+| C2 | **供应商配置精简**：去掉 Anthropic Base URL / Anthropic 端点覆盖、手动模型、排除模型、优先级、自动拉取模型开关 | 供应商字段 = 名称 + OpenAI Base URL（+ 端点覆盖）+ API Key + 超时 + 高级项 + 勾选的模型 |
+| C3 | **模型由编辑页拉取后勾选**：编辑供应商时一键拉取上游 `/models`，勾选要启用的模型，并可给每个模型设置**别称**；去掉定时刷新与刷新间隔设置 | 未勾选的模型不对外暴露；别称即对外模型名，转发时替换回上游真实模型名；模型刷新间隔设置移除 |
+| C4 | **路由与展示改用供应商名称**：`/v1/models` 的 `owned_by`、命名空间前缀 `供应商名/模型名`、默认路由顺序（名称升序）均以供应商名称为准 | 供应商名称需唯一（保存时校验） |
+| C5 | **请求日志模型筛选改为忽略大小写的模糊匹配** | `model` 查询参数按子串匹配，LIKE 通配符按字面处理 |
 
 ---
 
@@ -227,9 +242,9 @@
 
 ## 7. 整体验收标准
 
-1. **零模板接入**：新增任意「支持 OpenAI + Anthropic 双协议」的供应商，仅通过 Web UI 填 4 个字段（名称、双 URL、Key）即可用。
-2. **双协议可用**：Claude Code 配 `ANTHROPIC_BASE_URL=http://127.0.0.1:9090` + `ANTHROPIC_API_KEY=gw-xxx` 可正常对话；OpenAI 兼容 Agent 配 `OPENAI_BASE_URL=http://127.0.0.1:9090/v1` + `OPENAI_API_KEY=gw-xxx` 可正常对话。
-3. **模型聚合**：`GET /v1/models` 返回全部供应商模型的去重并集，且 `owned_by` 正确。
+1. **零模板接入**：新增任意 OpenAI 兼容供应商，仅通过 Web UI 填「名称 + Base URL + Key」即可用（模型在编辑页拉取后勾选）。
+2. **协议透传**：OpenAI 兼容 Agent 配 `OPENAI_BASE_URL=http://127.0.0.1:9090/v1` + `OPENAI_API_KEY=gw-xxx` 可正常对话（Anthropic 路径已于 v1.1 下线）。
+3. **模型选择**：`GET /v1/models` 返回各供应商**勾选启用**的模型（含 `供应商名/模型名` 与别称），`owned_by` 为供应商名称。
 4. **长任务不中断**：上游静默 90s 以上的推理请求，在经反向代理后仍能完成（SSE 心跳生效）。
 5. **断连无泄漏**：客户端中途断开后，网关 goroutine 数回落，上游请求被取消。
 6. **安全基线**：数据库中无明文 Key；`/api` 与 Web UI 不能在内网地址上被配置为上游（除非显式 `allow_internal`）；对外 Key 回显为掩码。
@@ -304,13 +319,10 @@
 ## 附录 B：最终用户使用方式（验收片段）
 
 ```bash
-# OpenAI 协议 Agent
+# OpenAI 协议 Agent（Codex / Cursor / 任意 OpenAI 兼容工具）
 OPENAI_BASE_URL=http://127.0.0.1:9090/v1
 OPENAI_API_KEY=gw-xxxxxxxx
-
-# Anthropic 协议 Agent（Claude Code 等）
-ANTHROPIC_BASE_URL=http://127.0.0.1:9090
-ANTHROPIC_API_KEY=gw-xxxxxxxx
 ```
 
-> 新增供应商时，只需在 Web UI 里填一次双 URL 与 Key，所有 Agent 立即生效；新出现的 Agent 只要支持自定义 Base URL，无需任何适配即可接入。
+> 新增供应商时，只需在 Web UI 里填一次 Base URL 与 Key，并在编辑页拉取模型后勾选要启用的模型，所有 Agent 立即生效；
+> 新出现的 Agent 只要支持自定义 Base URL，无需任何适配即可接入。（v1.1 起不再提供 Anthropic 协议入口。）

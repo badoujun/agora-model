@@ -84,13 +84,9 @@ func (g *Gateway) WithRecorder(r *logging.Recorder) *Gateway {
 
 // Register 注册数据面端点。
 func (g *Gateway) Register(mux *http.ServeMux) {
-	mux.HandleFunc(config.ProtocolOpenAI.Path(), g.handler(config.ProtocolOpenAI))
-	mux.HandleFunc(config.ProtocolAnthropic.Path(), g.handler(config.ProtocolAnthropic))
-	mux.HandleFunc(modelsPath, g.modelsHandler())
+	mux.HandleFunc(config.ChatCompletionsPath, g.handler())
+	mux.HandleFunc(config.ModelsPath, g.modelsHandler())
 }
-
-// modelsPath 是对外暴露聚合模型列表的路径。
-const modelsPath = "/v1/models"
 
 // modelEntry 是 /v1/models 返回的单条模型。
 type modelEntry struct {
@@ -101,40 +97,41 @@ type modelEntry struct {
 
 // modelsHandler 返回聚合后的模型列表（DESIGN §5.5）。
 //
-//   - 裸模型名：owned_by 为 priority 最小的供应商（即默认路由目标）；
-//   - 命名空间形式 provider/model：每个支持该模型的供应商各列一条，便于显式指定。
+//   - 裸模型名：owned_by 为按名称排序后第一个提供该模型的供应商（即默认路由目标）；
+//   - 命名空间形式 供应商名/模型名：每个提供该模型的供应商各列一条，便于显式指定；
+//   - 模型对外名即配置的别名（未配置别名时等于上游模型名）。
 func (g *Gateway) modelsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeError(w, config.ProtocolOpenAI, http.StatusNotFound, codeNotFound,
-				fmt.Sprintf("%s 仅支持 GET，收到 %s", modelsPath, r.Method), "")
+			writeError(w, http.StatusNotFound, codeNotFound,
+				fmt.Sprintf("%s 仅支持 GET，收到 %s", config.ModelsPath, r.Method), "")
 			return
 		}
 		if !g.authorize(r) {
-			writeError(w, config.ProtocolOpenAI, http.StatusUnauthorized, codeInvalidAPIKey,
+			writeError(w, http.StatusUnauthorized, codeInvalidAPIKey,
 				"网关 API Key 无效或缺失", "")
 			return
 		}
 
 		snap := g.holder.Get()
-		providers := snap.ProvidersByPriority()
+		providers := snap.Providers()
 
-		// 裸名：ProvidersByPriority 已按 priority 升序，首个出现者即默认供应商
+		// 裸名：Providers 已按供应商名称升序，首个出现者即默认供应商
 		seen := make(map[string]bool)
 		data := make([]modelEntry, 0, 16)
 		for _, p := range providers {
-			for _, m := range p.Models {
-				if seen[m] {
+			for _, exposed := range p.ExposedModels() {
+				if seen[exposed] {
 					continue
 				}
-				seen[m] = true
-				data = append(data, modelEntry{ID: m, Object: "model", OwnedBy: p.ID})
+				seen[exposed] = true
+				data = append(data, modelEntry{ID: exposed, Object: "model", OwnedBy: p.Name})
 			}
 		}
 		// 命名空间形式
 		for _, p := range providers {
-			for _, m := range p.Models {
-				data = append(data, modelEntry{ID: p.ID + "/" + m, Object: "model", OwnedBy: p.ID})
+			for _, exposed := range p.ExposedModels() {
+				data = append(data, modelEntry{ID: p.Name + "/" + exposed, Object: "model", OwnedBy: p.Name})
 			}
 		}
 
@@ -144,8 +141,8 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 	}
 }
 
-// handler 返回指定入站协议的处理器（DESIGN §7.1 主流程）。
-func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
+// handler 返回数据面处理器（DESIGN §7.1 主流程）。
+func (g *Gateway) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		requestID := newRequestID()
@@ -166,7 +163,7 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 			g.record(logging.Entry{
 				TS:              started,
 				RequestID:       requestID,
-				InboundProtocol: string(proto),
+				InboundProtocol: config.ProtocolName,
 				Model:           model,
 				ProviderID:      providerID,
 				UpstreamURL:     upstreamURL,
@@ -180,16 +177,16 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		}()
 
 		if r.Method != http.MethodPost {
-			writeError(w, proto, http.StatusNotFound, codeNotFound,
-				fmt.Sprintf("%s 仅支持 POST，收到 %s", proto.Path(), r.Method), "")
+			writeError(w, http.StatusNotFound, codeNotFound,
+				fmt.Sprintf("%s 仅支持 POST，收到 %s", config.ChatCompletionsPath, r.Method), "")
 			return
 		}
 
 		// 1) 入站鉴权
 		if !g.authorize(r) {
 			g.logger.Warn("网关鉴权失败",
-				"request_id", requestID, "path", proto.Path(), "client_ip", clientIP(r))
-			writeError(w, proto, http.StatusUnauthorized, codeInvalidAPIKey,
+				"request_id", requestID, "path", config.ChatCompletionsPath, "client_ip", clientIP(r))
+			writeError(w, http.StatusUnauthorized, codeInvalidAPIKey,
 				"网关 API Key 无效或缺失", "")
 			return
 		}
@@ -198,11 +195,11 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		body, err := readBody(r, cfg.MaxBodyBytes)
 		if err != nil {
 			if errors.Is(err, errBodyTooLarge) {
-				writeError(w, proto, http.StatusRequestEntityTooLarge, codePayloadTooLarge,
+				writeError(w, http.StatusRequestEntityTooLarge, codePayloadTooLarge,
 					fmt.Sprintf("请求体超过上限 %d 字节", cfg.MaxBodyBytes), "")
 				return
 			}
-			writeError(w, proto, http.StatusBadRequest, codeInvalidRequest,
+			writeError(w, http.StatusBadRequest, codeInvalidRequest,
 				"读取请求体失败: "+err.Error(), "")
 			return
 		}
@@ -210,26 +207,24 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		// 3) 探测 model 字段
 		model, err = probeModel(body)
 		if err != nil {
-			writeError(w, proto, http.StatusBadRequest, codeInvalidRequest, err.Error(), "model")
+			writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error(), "model")
 			return
 		}
 
 		// 4) 路由决策
-		decision, err := route.Resolve(snap, proto, model)
+		decision, err := route.Resolve(snap, model)
 		if err != nil {
 			rec.noteError(err.Error())
 			switch {
 			case errors.Is(err, route.ErrModelNotFound):
-				writeError(w, proto, http.StatusNotFound, codeModelNotFound, err.Error(), "model")
-			case errors.Is(err, route.ErrProtocolNotConfigured):
-				writeError(w, proto, http.StatusBadRequest, codeProtocolNotConfigured, err.Error(), "")
+				writeError(w, http.StatusNotFound, codeModelNotFound, err.Error(), "model")
 			case errors.Is(err, route.ErrProviderDisabled):
-				writeError(w, proto, http.StatusServiceUnavailable, codeNoAvailableProvider, err.Error(), "")
+				writeError(w, http.StatusServiceUnavailable, codeNoAvailableProvider, err.Error(), "")
 			default:
-				writeError(w, proto, http.StatusInternalServerError, codeInvalidRequest, err.Error(), "")
+				writeError(w, http.StatusInternalServerError, codeInvalidRequest, err.Error(), "")
 			}
 			g.logger.Warn("路由失败",
-				"request_id", requestID, "protocol", proto, "model", model, "err", err)
+				"request_id", requestID, "model", model, "err", err)
 			return
 		}
 		providerID = decision.Provider.ID
@@ -239,7 +234,7 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		// 5) 组装上游请求体（无 extra_body 且不改写 model 时零改写）
 		upstreamBody, err := prepareBody(body, decision, model)
 		if err != nil {
-			writeError(w, proto, http.StatusBadRequest, codeInvalidRequest, err.Error(), "")
+			writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error(), "")
 			return
 		}
 
@@ -248,26 +243,26 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, decision.Upstream, bytes.NewReader(upstreamBody))
 		if err != nil {
-			writeError(w, proto, http.StatusBadGateway, codeUpstreamUnreachable,
+			writeError(w, http.StatusBadGateway, codeUpstreamUnreachable,
 				"构造上游请求失败: "+err.Error(), "")
 			return
 		}
-		req.Header = buildUpstreamHeaders(r.Header, decision.Provider, proto)
+		req.Header = buildUpstreamHeaders(r.Header, decision.Provider)
 		if req.Header.Get("Content-Type") == "" {
 			req.Header.Set("Content-Type", "application/json")
 		}
 
 		g.logger.Debug("路由决策",
-			"request_id", requestID, "protocol", proto, "model", model,
-			"provider", decision.Provider.ID, "upstream", decision.Upstream,
+			"request_id", requestID, "model", model, "provider", decision.Provider.Name,
+			"upstream_model", decision.Model, "upstream", decision.Upstream,
 			"stream", streamServed)
 
 		// 6) 发送并透传响应
 		resp, err := g.client.Do(req)
 		if err != nil {
 			rec.noteError(err.Error())
-			g.logUpstreamFailure(requestID, proto, model, decision, started, err)
-			g.writeUpstreamError(w, r, proto, err)
+			g.logUpstreamFailure(requestID, model, decision, started, err)
+			g.writeUpstreamError(w, r, err)
 			return
 		}
 		defer resp.Body.Close()
@@ -275,14 +270,14 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 		if isEventStream(resp) {
 			streamServed = true
 			stats, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle(), started)
-			g.logCompletion(requestID, proto, model, decision, resp.StatusCode, started, stats, serr)
+			g.logCompletion(requestID, model, decision, resp.StatusCode, started, stats, serr)
 			return
 		}
 
 		written, cerr := copyResponse(w, resp)
 		g.logger.Info("请求完成",
-			"request_id", requestID, "protocol", proto, "model", model,
-			"provider", decision.Provider.ID, "status", resp.StatusCode,
+			"request_id", requestID, "model", model,
+			"provider", decision.Provider.Name, "status", resp.StatusCode,
 			"bytes", written, "latency_ms", time.Since(started).Milliseconds(),
 			"stream", false, "err", errString(cerr))
 	}
@@ -473,44 +468,44 @@ func probeModel(body []byte) (string, error) {
 }
 
 // writeUpstreamError 把出站错误按类型映射为响应；客户端断开时只记日志、不写响应。
-func (g *Gateway) writeUpstreamError(w http.ResponseWriter, r *http.Request, proto config.Protocol, err error) {
+func (g *Gateway) writeUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case r.Context().Err() != nil:
 		return
 	case errors.Is(err, context.DeadlineExceeded):
-		writeError(w, proto, http.StatusGatewayTimeout, codeUpstreamTimeout,
+		writeError(w, http.StatusGatewayTimeout, codeUpstreamTimeout,
 			"上游请求超时", "")
 	default:
 		var netErr net.Error
 		if errors.As(err, &netErr) && netErr.Timeout() {
-			writeError(w, proto, http.StatusGatewayTimeout, codeUpstreamTimeout,
+			writeError(w, http.StatusGatewayTimeout, codeUpstreamTimeout,
 				"上游请求超时: "+err.Error(), "")
 			return
 		}
-		writeError(w, proto, http.StatusBadGateway, codeUpstreamUnreachable,
+		writeError(w, http.StatusBadGateway, codeUpstreamUnreachable,
 			"连接上游失败: "+err.Error(), "")
 	}
 }
 
-func (g *Gateway) logUpstreamFailure(requestID string, proto config.Protocol, model string, d route.Result, started time.Time, err error) {
+func (g *Gateway) logUpstreamFailure(requestID, model string, d route.Result, started time.Time, err error) {
 	status := "upstream_error"
 	if errors.Is(err, context.DeadlineExceeded) {
 		status = "upstream_timeout"
 	}
 	g.logger.Error("上游请求失败",
-		"request_id", requestID, "protocol", proto, "model", model,
-		"provider", d.Provider.ID, "upstream", d.Upstream, "status", status,
-		"latency_ms", time.Since(started).Milliseconds(), "err", err)
+		"request_id", requestID, "model", model,
+		"provider", d.Provider.Name, "upstream_model", d.Model, "upstream", d.Upstream,
+		"status", status, "latency_ms", time.Since(started).Milliseconds(), "err", err)
 }
 
-func (g *Gateway) logCompletion(requestID string, proto config.Protocol, model string, d route.Result, status int, started time.Time, stats streamStats, err error) {
+func (g *Gateway) logCompletion(requestID, model string, d route.Result, status int, started time.Time, stats streamStats, err error) {
 	level := slog.LevelInfo
 	if err != nil {
 		level = slog.LevelWarn
 	}
 	g.logger.Log(context.Background(), level, "流式请求完成",
-		"request_id", requestID, "protocol", proto, "model", model,
-		"provider", d.Provider.ID, "status", status,
+		"request_id", requestID, "model", model,
+		"provider", d.Provider.Name, "status", status,
 		"bytes", stats.bytes, "first_byte_ms", stats.firstByteIn.Milliseconds(),
 		"latency_ms", time.Since(started).Milliseconds(), "stream", true,
 		"err", errString(err))

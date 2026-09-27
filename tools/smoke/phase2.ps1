@@ -143,10 +143,9 @@ $cfgOk = Save-Text (Join-Path $tmp 'agora-p2-ok.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": $Port, "sse_idle_seconds": 15, "max_body_bytes": 1048576 },
   "providers": [
-    { "id": "mock", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
-      "anthropic_base_url": "http://127.0.0.1:$MockPort/v1",
+    { "id": "mock", "name": "mock", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
       "api_key": "sk-mock-provider-key", "models": ["mock-gpt-4o"],
-      "priority": 10, "allow_internal": true }
+      "allow_internal": true }
   ]
 }
 "@
@@ -155,7 +154,7 @@ $cfgBad = Save-Text (Join-Path $tmp 'agora-p2-internal.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": $Port },
   "providers": [
-    { "id": "internal", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+    { "id": "internal", "name": "internal", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
       "api_key": "sk-internal", "models": ["m"], "allow_internal": false }
   ]
 }

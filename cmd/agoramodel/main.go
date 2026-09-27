@@ -25,7 +25,6 @@ import (
 	"agora-model/internal/crypto"
 	"agora-model/internal/gateway"
 	"agora-model/internal/logging"
-	"agora-model/internal/models"
 	"agora-model/internal/platform"
 	"agora-model/internal/store"
 	"agora-model/internal/webui"
@@ -177,7 +176,7 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 		return err
 	}
 
-	// 5) 构建快照：供应商 + 模型缓存（(手动 ∪ 自动) − 排除）
+	// 5) 构建快照：供应商 + 其勾选的模型
 	gwSettings := config.Gateway{
 		Listen:         config.DefaultListen,
 		Port:           config.DefaultPort,
@@ -221,13 +220,6 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 		if err != nil {
 			return nil, err
 		}
-		cache, err := st.LoadAllModelCache(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for i := range providers {
-			providers[i].Models = models.Available(providers[i].Models, cache[providers[i].ID], providers[i].ModelsExcluded)
-		}
 		return config.NewSnapshot(config.File{Gateway: gwSettings, Providers: providers})
 	}
 
@@ -237,35 +229,21 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 	}
 	holder := config.NewHolder(snapshot)
 
-	// 6) 模型聚合：启动即拉取一次，随后按间隔刷新，完成后原子替换快照
-	aggregator := models.NewAggregator(st, logger, models.Options{
-		Master: master,
-		OnRefresh: func(ctx context.Context) {
-			next, err := loadSnapshot(ctx)
-			if err != nil {
-				logger.Warn("模型聚合后重建快照失败", "err", err)
-				return
-			}
-			holder.Store(next)
-		},
-	})
-	aggregator.Start(ctx)
-
-	// 7) 请求日志记录器（异步批量写入）
+	// 6) 请求日志记录器（异步批量写入）
 	recorder := logging.NewRecorder(st, logger, logging.RecorderOptions{})
 	recorder.Start(ctx)
 
-	// 8) HTTP 服务
+	// 7) HTTP 服务
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	api.SetLogStatsFunc(recorder.Stats)
 	api.New(api.Options{
-		Store: st, Master: master, Holder: holder, Aggregator: aggregator,
+		Store: st, Master: master, Holder: holder,
 		Reload: loadSnapshot, Logger: logger, Version: version,
 		AdminPassword: adminPassword, LocalOnly: localOnly,
 	}).Register(mux)
 
-	// 9) 内嵌前端（构建后自动可用；未构建时只提供 API）
+	// 8) 内嵌前端（构建后自动可用；未构建时只提供 API）
 	if fsys, ferr := webui.FS(); ferr != nil {
 		logger.Warn("加载内嵌前端失败", "err", ferr)
 	} else if webui.Available(fsys) {
@@ -361,18 +339,17 @@ func healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func logStartup(logger *slog.Logger, addr, dataDir, dbFile string, keyInfo store.GatewayKeyInfo, snapshot *config.Snapshot, imported int) {
-	providers := snapshot.ProvidersByPriority()
+	providers := snapshot.Providers()
 	logger.Info("agoramodel 启动",
 		"version", version, "addr", addr, "data_dir", dataDir, "db", dbFile,
 		"providers", len(providers), "imported", imported, "gateway_key_hint", keyInfo.KeyHint)
 	for _, p := range providers {
 		logger.Info("已加载供应商",
-			"id", p.ID, "name", p.Name, "priority", p.Priority,
-			"openai_configured", p.Endpoint(config.ProtocolOpenAI) != "",
-			"anthropic_configured", p.Endpoint(config.ProtocolAnthropic) != "",
-			"models", len(p.Models), "allow_internal", p.AllowInternal)
+			"id", p.ID, "name", p.Name,
+			"models", len(p.Models), "aliases", len(p.ModelAliases),
+			"allow_internal", p.AllowInternal)
 		if len(p.Models) == 0 {
-			logger.Warn("该供应商未配置任何模型，Phase 3 前不会被路由命中", "id", p.ID)
+			logger.Warn("该供应商尚未勾选任何模型，不会被路由命中", "name", p.Name)
 		}
 	}
 	cfg := snapshot.Gateway()
@@ -449,7 +426,7 @@ func newService(logger *slog.Logger, opts options) (service.Service, error) {
 	return service.New(prg, &service.Config{
 		Name:        "agoramodel",
 		DisplayName: "AgoraModel Gateway",
-		Description: "AI Agent 统一接入网关（双协议透传 + 模型聚合 + Web 控制台）",
+		Description: "AI Agent 统一接入网关（OpenAI 协议透传 + 模型选择 + Web 控制台）",
 		Arguments:   serviceArguments(opts),
 	})
 }

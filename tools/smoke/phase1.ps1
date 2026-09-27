@@ -5,7 +5,7 @@
   Phase 1 端到端冒烟：启动 mock 上游与网关，逐项断言核心行为。
 
 .DESCRIPTION
-  覆盖：健康检查、认证与错误体风格（分协议）、路由与错误码、非流式与流式透传、
+  覆盖：健康检查、认证与错误体风格、路由与错误码、非流式与流式透传、
         上游凭证替换与头透传、SSE 心跳保活、上游超时、上游不可达、请求体上限、
         extra_body / extra_headers 合并、客户端断连取消。
 
@@ -86,14 +86,14 @@ $cfg = @"
     "max_body_bytes": 1024
   },
   "providers": [
-    { "id": "mock", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "anthropic_base_url": "http://127.0.0.1:$MockPort/v1",
-      "api_key": "sk-mock-provider-key", "models": ["mock-gpt-4o", "mock-claude-sonnet-4-5"], "allow_internal": true, "priority": 10, "timeout_seconds": 120 },
-    { "id": "mock-slow", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "api_key": "sk-slow",
-      "models": ["slow-model"], "allow_internal": true, "priority": 10, "timeout_seconds": 1 },
-    { "id": "dead", "openai_base_url": "http://127.0.0.1:9998/v1", "api_key": "sk-dead",
-      "models": ["dead-model"], "allow_internal": true, "priority": 10, "timeout_seconds": 5 },
-    { "id": "mock-extra", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "api_key": "sk-extra",
-      "models": ["extra-model"], "allow_internal": true, "priority": 10, "timeout_seconds": 60,
+    { "id": "mock", "name": "mock", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+      "api_key": "sk-mock-provider-key", "models": ["mock-gpt-4o", "mock-claude-sonnet-4-5"], "allow_internal": true, "timeout_seconds": 120 },
+    { "id": "mock-slow", "name": "mock-slow", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "api_key": "sk-slow",
+      "models": ["slow-model"], "allow_internal": true, "timeout_seconds": 1 },
+    { "id": "dead", "name": "dead", "openai_base_url": "http://127.0.0.1:9998/v1", "api_key": "sk-dead",
+      "models": ["dead-model"], "allow_internal": true, "timeout_seconds": 5 },
+    { "id": "mock-extra", "name": "mock-extra", "openai_base_url": "http://127.0.0.1:$MockPort/v1", "api_key": "sk-extra",
+      "models": ["extra-model"], "allow_internal": true, "timeout_seconds": 60,
       "extra_headers": { "x-tenant": "agora" }, "extra_body": { "temperature": 0.1, "top_p": 0.9 } }
   ]
 }
@@ -102,7 +102,6 @@ $cfg = @"
 
 $bodyOpenAI = Save-Text (Join-Path $tmp 'agora-req-openai.json') '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}'
 $bodyOpenAIStream = Save-Text (Join-Path $tmp 'agora-req-openai-stream.json') '{"model":"mock-gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}'
-$bodyAnthropicStream = Save-Text (Join-Path $tmp 'agora-req-anthropic-stream.json') '{"model":"mock-claude-sonnet-4-5","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
 $bodyNoModel = Save-Text (Join-Path $tmp 'agora-req-nomodel.json') '{"messages":[]}'
 $bodyUnknown = Save-Text (Join-Path $tmp 'agora-req-unknown.json') '{"model":"nope-1","messages":[]}'
 $bodySlow = Save-Text (Join-Path $tmp 'agora-req-slow.json') '{"model":"slow-model","messages":[]}'
@@ -141,7 +140,6 @@ if ($bootLog -notmatch 'gateway_key=(gw-[0-9a-f]+)') { throw "未能从启动日
 $key = $Matches[1]
 Write-Host "  网关 Key 已取得：$($key.Substring(0, 7))***"
 $openAIHeaders = $jsonHeader + @('-H', "authorization: Bearer $key")
-$anthropicHeaders = $jsonHeader + @('-H', "x-api-key: $key")
 
 $base = "http://127.0.0.1:$GatewayPort"
 try {
@@ -155,8 +153,7 @@ try {
     Assert-That 'OpenAI 风格错误体含 error.code=invalid_api_key' ($r.Body -match '"code":"invalid_api_key"')
 
     $r = Invoke-Curl "$base/v1/messages" $jsonHeader $bodyOpenAI
-    Assert-That '无凭证（Anthropic 入站）→ 401' ($r.Code -eq 401) "code=$($r.Code)"
-    Assert-That 'Anthropic 风格错误体含 type=error' ($r.Body -match '"type":"error"')
+    Assert-That 'Anthropic 端点已下线 → 404' ($r.Code -eq 404) "code=$($r.Code)"
 
     $r = Invoke-Curl "$base/v1/chat/completions" $openAIHeaders $bodyNoModel
     Assert-That '缺少 model → 400' ($r.Code -eq 400) "code=$($r.Code)"
@@ -174,13 +171,13 @@ try {
     $r = Invoke-Curl "$base/v1/chat/completions" ($openAIHeaders + @('-H', 'x-mock-chunks: 3', '-H', 'x-mock-gap: 40')) $bodyOpenAIStream -Stream
     Assert-That 'OpenAI 流式透传 → 含 [DONE]' ($r.Body -match '\[DONE\]')
 
-    $r = Invoke-Curl "$base/v1/messages" ($anthropicHeaders + @('-H', 'anthropic-version: 2023-06-01', '-H', 'x-mock-chunks: 4', '-H', 'x-mock-gap: 30')) $bodyAnthropicStream -Stream
-    Assert-That 'Anthropic 流式透传 → 含 message_stop' ($r.Body -match 'message_stop')
+    $r = Invoke-Curl "$base/v1/chat/completions" ($openAIHeaders + @('-H', 'anthropic-version: 2023-06-01', '-H', 'x-mock-chunks: 3', '-H', 'x-mock-gap: 30')) $bodyOpenAIStream -Stream
+    Assert-That '流式透传（携带业务头）→ 含 [DONE]' ($r.Body -match '\[DONE\]')
 
     $rr = Invoke-RestMethod -Uri "http://127.0.0.1:$MockPort/__requests" -UseBasicParsing
     $last = $rr.requests | Select-Object -Last 1
-    Assert-That 'anthropic-version 被透传到上游' ($last.received.'anthropic-version' -eq '2023-06-01')
-    Assert-That 'x-api-key 被替换为供应商凭证' ($last.received.'x-api-key' -eq 'sk-mock-provider-key')
+    Assert-That '业务头 anthropic-version 被透传到上游' ($last.received.'anthropic-version' -eq '2023-06-01')
+    Assert-That 'x-api-key 不再出现于上游请求' ($null -eq $last.received.'x-api-key')
 
     $r = Invoke-Curl "$base/v1/chat/completions" ($openAIHeaders + @('-H', 'x-mock-silence: 3', '-H', 'x-mock-chunks: 2')) $bodyOpenAIStream -Stream -MaxTime 12
     Assert-That 'SSE 空闲注入心跳（keep-alive）' ($r.Body -match ': keep-alive')

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CloudDownload, Pencil, Plug, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { Check, CloudDownload, Pencil, Plug, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
 import type { ProviderDTO, ProviderInput, TestResult } from '@/lib/types'
 import { formatRelative } from '@/lib/utils'
@@ -25,14 +25,14 @@ interface FormState {
   id?: string
   name: string
   openai_base_url: string
-  anthropic_base_url: string
   openai_endpoint_override: string
-  anthropic_endpoint_override: string
   api_key: string
-  models_manual: string
-  models_excluded: string
-  auto_fetch_models: boolean
-  priority: number
+  /** 候选与已选模型的展示顺序（去重） */
+  modelOrder: string[]
+  /** 上游模型名 -> 是否勾选启用 */
+  selected: Record<string, boolean>
+  /** 上游模型名 -> 别称（空串表示不设别称） */
+  aliases: Record<string, string>
   timeout_seconds: number
   extra_headers: string
   extra_body: string
@@ -43,14 +43,11 @@ interface FormState {
 const EMPTY_FORM: FormState = {
   name: '',
   openai_base_url: '',
-  anthropic_base_url: '',
   openai_endpoint_override: '',
-  anthropic_endpoint_override: '',
   api_key: '',
-  models_manual: '',
-  models_excluded: '',
-  auto_fetch_models: true,
-  priority: 100,
+  modelOrder: [],
+  selected: {},
+  aliases: {},
   timeout_seconds: 120,
   extra_headers: '',
   extra_body: '',
@@ -58,32 +55,40 @@ const EMPTY_FORM: FormState = {
   enabled: true,
 }
 
+function mergeModels(...lists: string[][]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const list of lists) {
+    for (const raw of list) {
+      const model = raw.trim()
+      if (model === '' || seen.has(model)) continue
+      seen.add(model)
+      out.push(model)
+    }
+  }
+  return out
+}
+
 function toForm(p: ProviderDTO): FormState {
+  const selected: Record<string, boolean> = {}
+  for (const model of p.models_selected ?? []) {
+    selected[model] = true
+  }
   return {
     id: p.id,
     name: p.name,
     openai_base_url: p.openai_base_url ?? '',
-    anthropic_base_url: p.anthropic_base_url ?? '',
     openai_endpoint_override: p.openai_endpoint_override ?? '',
-    anthropic_endpoint_override: p.anthropic_endpoint_override ?? '',
     api_key: '',
-    models_manual: (p.models_manual ?? []).join('\n'),
-    models_excluded: (p.models_excluded ?? []).join('\n'),
-    auto_fetch_models: p.auto_fetch_models,
-    priority: p.priority,
+    modelOrder: mergeModels(p.models_selected ?? [], p.candidate_models ?? []),
+    selected,
+    aliases: { ...(p.model_aliases ?? {}) },
     timeout_seconds: p.timeout_seconds,
     extra_headers: p.extra_headers && Object.keys(p.extra_headers).length ? JSON.stringify(p.extra_headers, null, 2) : '',
     extra_body: p.extra_body && Object.keys(p.extra_body).length ? JSON.stringify(p.extra_body, null, 2) : '',
     allow_internal: p.allow_internal,
     enabled: p.enabled,
   }
-}
-
-function splitLines(raw: string): string[] {
-  return raw
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line !== '')
 }
 
 function parseJSONField(raw: string, label: string): Record<string, unknown> | undefined {
@@ -104,16 +109,19 @@ function toInput(form: FormState): ProviderInput {
   const headers = parseJSONField(form.extra_headers, '额外请求头')
   const body = parseJSONField(form.extra_body, '额外请求体')
 
+  const modelsSelected = form.modelOrder.filter((model) => form.selected[model])
+  const aliases: Record<string, string> = {}
+  for (const model of modelsSelected) {
+    const alias = (form.aliases[model] ?? '').trim()
+    if (alias !== '') aliases[model] = alias
+  }
+
   const input: ProviderInput = {
     name: form.name.trim(),
     openai_base_url: form.openai_base_url.trim(),
-    anthropic_base_url: form.anthropic_base_url.trim(),
     openai_endpoint_override: form.openai_endpoint_override.trim(),
-    anthropic_endpoint_override: form.anthropic_endpoint_override.trim(),
-    models_manual: splitLines(form.models_manual),
-    models_excluded: splitLines(form.models_excluded),
-    auto_fetch_models: form.auto_fetch_models,
-    priority: form.priority,
+    models_selected: modelsSelected,
+    model_aliases: aliases,
     timeout_seconds: form.timeout_seconds,
     allow_internal: form.allow_internal,
     enabled: form.enabled,
@@ -135,6 +143,7 @@ export function ProvidersPage() {
   const queryClient = useQueryClient()
   const [dialogOpen, setDialogOpen] = useState(false)
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
+  const [modelFilter, setModelFilter] = useState('')
   const [formError, setFormError] = useState('')
   const [testResult, setTestResult] = useState<{ provider: ProviderDTO; result: TestResult } | null>(null)
 
@@ -150,10 +159,17 @@ export function ProvidersPage() {
       const input = toInput(state)
       return state.id ? api.updateProvider(state.id, input) : api.createProvider(input)
     },
-    onSuccess: async (saved) => {
-      setDialogOpen(false)
+    onSuccess: async (saved, variables) => {
       await invalidateAll()
-      toast.show(`已保存供应商「${saved.name || saved.id}」`, 'success')
+      setForm((prev) => ({ ...toForm(saved), aliases: { ...prev.aliases } }))
+      if (variables.id) {
+        setDialogOpen(false)
+        toast.show(`已保存供应商「${saved.name || saved.id}」`, 'success')
+        return
+      }
+      // 新建成功后保持编辑状态，方便立即拉取并勾选模型
+      toast.show(`已创建「${saved.name || saved.id}」，正在拉取模型…`, 'success')
+      fetchModels.mutate(saved.id)
     },
     onError: (err: Error) => setFormError(err instanceof ApiError ? err.message : String(err)),
   })
@@ -170,8 +186,16 @@ export function ProvidersPage() {
   const fetchModels = useMutation({
     mutationFn: api.fetchModels,
     onSuccess: async (updated) => {
+      setForm((prev) => ({
+        ...prev,
+        modelOrder: mergeModels(prev.modelOrder, updated.candidate_models ?? []),
+        // 首次拉取：把候选全部勾上，用户再按需取消
+        selected: Object.keys(prev.selected).length === 0
+          ? Object.fromEntries((updated.candidate_models ?? []).map((m) => [m, true]))
+          : prev.selected,
+      }))
       await invalidateAll()
-      toast.show(`已拉取模型：${updated.model_count} 个`, 'success')
+      toast.show(`已拉取 ${updated.candidate_models?.length ?? 0} 个候选模型，请勾选要启用的模型`, 'success')
     },
     onError: (err: Error) => toast.show(`拉取模型失败：${err.message}`, 'error'),
   })
@@ -191,14 +215,35 @@ export function ProvidersPage() {
 
   const openCreate = () => {
     setForm(EMPTY_FORM)
+    setModelFilter('')
     setFormError('')
     setDialogOpen(true)
   }
 
   const openEdit = (provider: ProviderDTO) => {
     setForm(toForm(provider))
+    setModelFilter('')
     setFormError('')
     setDialogOpen(true)
+  }
+
+  const selectedCount = useMemo(
+    () => form.modelOrder.filter((model) => form.selected[model]).length,
+    [form.modelOrder, form.selected],
+  )
+
+  const visibleModels = useMemo(() => {
+    const keyword = modelFilter.trim().toLowerCase()
+    if (!keyword) return form.modelOrder
+    return form.modelOrder.filter((model) => model.toLowerCase().includes(keyword))
+  }, [form.modelOrder, modelFilter])
+
+  const toggleModel = (model: string, checked: boolean) => {
+    setForm((prev) => ({ ...prev, selected: { ...prev.selected, [model]: checked } }))
+  }
+
+  const setAlias = (model: string, value: string) => {
+    setForm((prev) => ({ ...prev, aliases: { ...prev.aliases, [model]: value } }))
   }
 
   const submit = () => {
@@ -207,16 +252,23 @@ export function ProvidersPage() {
       setFormError('请填写名称')
       return
     }
-    if (form.openai_base_url.trim() === '' && form.anthropic_base_url.trim() === '') {
-      setFormError('至少需要填写一个协议地址（OpenAI 或 Anthropic）')
+    if (form.openai_base_url.trim() === '' && form.openai_endpoint_override.trim() === '') {
+      setFormError('请填写 OpenAI Base URL（或端点覆盖）')
       return
     }
     if (!form.id && form.api_key.trim() === '') {
       setFormError('新建供应商必须填写 API Key')
       return
     }
-    if (form.priority <= 0 || form.timeout_seconds <= 0) {
-      setFormError('优先级与超时时间必须为正整数')
+    if (form.timeout_seconds <= 0) {
+      setFormError('超时时间必须为正整数')
+      return
+    }
+    const aliases = Object.entries(form.aliases)
+      .filter(([model, alias]) => form.selected[model] && alias.trim() !== '')
+      .map(([, alias]) => alias.trim().toLowerCase())
+    if (new Set(aliases).size !== aliases.length) {
+      setFormError('别称不能重复（同一个供应商内每个模型要有唯一的对外名称）')
       return
     }
     save.mutate(form)
@@ -228,7 +280,7 @@ export function ProvidersPage() {
         <div>
           <h1 className="text-xl font-semibold text-slate-900">供应商管理</h1>
           <p className="mt-1 text-sm text-slate-500">
-            新增供应商只需填写名称、两个协议地址与 API Key——所有 Agent 立即生效，无需为每个 Agent 重复配置。
+            填写名称、OpenAI 兼容地址与 API Key，在编辑页拉取并勾选要启用的模型——所有 Agent 立即生效。
           </p>
         </div>
         <Button onClick={openCreate}>
@@ -250,27 +302,21 @@ export function ProvidersPage() {
               关闭
             </Button>
           </CardHeader>
-          <CardContent className="grid gap-2 sm:grid-cols-2">
-            {(
-              [
-                ['OpenAI', testResult.result.openai],
-                ['Anthropic', testResult.result.anthropic],
-              ] as const
-            ).map(([label, probe]) => (
-              <div key={label} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm">
-                <div className="flex items-center gap-2">
-                  <Badge variant={probe.ok ? 'success' : 'danger'}>{probe.ok ? '通过' : '失败'}</Badge>
-                  <span className="font-medium">{label}</span>
-                  {probe.status_code ? (
-                    <span className="text-xs text-slate-500">
-                      HTTP {probe.status_code} · {probe.latency_ms} ms
-                      {probe.model_count ? ` · ${probe.model_count} 个模型` : ''}
-                    </span>
-                  ) : null}
-                </div>
-                <p className="mt-1 break-all text-xs text-slate-500">{probe.message}</p>
+          <CardContent>
+            <div className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm">
+              <div className="flex items-center gap-2">
+                <Badge variant={testResult.result.ok ? 'success' : 'danger'}>
+                  {testResult.result.ok ? '通过' : '失败'}
+                </Badge>
+                {testResult.result.status_code ? (
+                  <span className="text-xs text-slate-500">
+                    HTTP {testResult.result.status_code} · {testResult.result.latency_ms} ms
+                    {testResult.result.model_count ? ` · 上游 ${testResult.result.model_count} 个模型` : ''}
+                  </span>
+                ) : null}
               </div>
-            ))}
+              <p className="mt-1 break-all text-xs text-slate-500">{testResult.result.message}</p>
+            </div>
           </CardContent>
         </Card>
       ) : null}
@@ -279,7 +325,7 @@ export function ProvidersPage() {
         <CardHeader>
           <CardTitle>已配置的供应商</CardTitle>
           <CardDescription>
-            共 {items.length} 个（启用 {summary.enabled} 个）· 聚合模型 {summary.models} 条映射
+            共 {items.length} 个（启用 {summary.enabled} 个）· 已启用模型 {summary.models} 条映射
           </CardDescription>
         </CardHeader>
         <CardContent className="p-0">
@@ -288,7 +334,7 @@ export function ProvidersPage() {
           ) : items.length === 0 ? (
             <div className="px-5 py-10 text-center text-sm text-slate-500">
               <p>还没有供应商。</p>
-              <p className="mt-1">点击右上角「新增供应商」，填写双协议地址与 API Key 即可开始使用。</p>
+              <p className="mt-1">点击右上角「新增供应商」，填写上游地址与 API Key 即可开始使用。</p>
             </div>
           ) : (
             <Table>
@@ -296,9 +342,7 @@ export function ProvidersPage() {
                 <TableRow>
                   <TableHead>名称</TableHead>
                   <TableHead>OpenAI 地址</TableHead>
-                  <TableHead>Anthropic 地址</TableHead>
-                  <TableHead>模型</TableHead>
-                  <TableHead>优先级</TableHead>
+                  <TableHead>已启用模型</TableHead>
                   <TableHead>最近拉取</TableHead>
                   <TableHead>状态</TableHead>
                   <TableHead className="text-right">操作</TableHead>
@@ -311,14 +355,10 @@ export function ProvidersPage() {
                       <div className="font-medium">{provider.name || provider.id}</div>
                       <div className="font-mono text-[11px] text-slate-400">{provider.id}</div>
                     </TableCell>
-                    <TableCell className="max-w-[220px] truncate font-mono text-xs">
+                    <TableCell className="max-w-[260px] truncate font-mono text-xs">
                       {provider.openai_base_url || <span className="text-slate-400">未配置</span>}
                     </TableCell>
-                    <TableCell className="max-w-[220px] truncate font-mono text-xs">
-                      {provider.anthropic_base_url || <span className="text-slate-400">未配置</span>}
-                    </TableCell>
                     <TableCell>{provider.model_count}</TableCell>
-                    <TableCell>{provider.priority}</TableCell>
                     <TableCell className="text-xs">
                       {provider.last_fetch_error ? (
                         <span className="text-red-600" title={provider.last_fetch_error}>
@@ -351,19 +391,6 @@ export function ProvidersPage() {
                           <Plug className="h-4 w-4" />
                           测试
                         </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => fetchModels.mutate(provider.id)}
-                          disabled={fetchModels.isPending}
-                        >
-                          {fetchModels.isPending ? (
-                            <RefreshCw className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <CloudDownload className="h-4 w-4" />
-                          )}
-                          拉取模型
-                        </Button>
                         <Button variant="ghost" size="sm" onClick={() => openEdit(provider)}>
                           <Pencil className="h-4 w-4" />
                           编辑
@@ -395,14 +422,14 @@ export function ProvidersPage() {
         open={dialogOpen}
         onClose={() => setDialogOpen(false)}
         title={form.id ? '编辑供应商' : '新增供应商'}
-        description="上游只需支持 OpenAI 或 Anthropic 之一即可接入；两者都支持时可在同一条配置里并行提供。"
+        description="上游只需提供 OpenAI 兼容接口；模型在此处拉取后勾选，未勾选的模型不会对外暴露。"
         footer={
           <>
             <Button variant="outline" onClick={() => setDialogOpen(false)}>
               取消
             </Button>
             <Button onClick={submit} disabled={save.isPending}>
-              {save.isPending ? '保存中…' : '保存'}
+              {save.isPending ? '保存中…' : form.id ? '保存' : '保存并拉取模型'}
             </Button>
           </>
         }
@@ -416,6 +443,9 @@ export function ProvidersPage() {
               onChange={(event) => setForm({ ...form, name: event.target.value })}
               placeholder="例如：供应商A"
             />
+            <p className="text-xs text-slate-500">
+              名称即模型命名空间前缀（<code className="rounded bg-slate-100 px-1">{`${form.name || '名称'}/模型名`}</code>），需唯一。
+            </p>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
@@ -429,85 +459,131 @@ export function ProvidersPage() {
               />
             </div>
             <div className="grid gap-1.5">
-              <Label htmlFor="p-anthropic">Anthropic Base URL</Label>
+              <Label htmlFor="p-key">API Key {form.id ? '' : '*'}</Label>
               <Input
-                id="p-anthropic"
-                value={form.anthropic_base_url}
-                onChange={(event) => setForm({ ...form, anthropic_base_url: event.target.value })}
-                placeholder="https://api.example.com"
+                id="p-key"
+                type="password"
+                autoComplete="new-password"
+                value={form.api_key}
+                onChange={(event) => setForm({ ...form, api_key: event.target.value })}
+                placeholder={form.id ? '留空表示不修改当前凭证' : '供应商的真实 API Key'}
               />
             </div>
           </div>
 
-          <div className="grid gap-1.5">
-            <Label htmlFor="p-key">API Key {form.id ? '' : '*'}</Label>
-            <Input
-              id="p-key"
-              type="password"
-              autoComplete="new-password"
-              value={form.api_key}
-              onChange={(event) => setForm({ ...form, api_key: event.target.value })}
-              placeholder={form.id ? '留空表示不修改当前凭证' : '供应商的真实 API Key'}
-            />
-          </div>
+          <div className="grid gap-2 rounded-md border border-slate-200 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p className="text-sm font-medium text-slate-800">模型</p>
+                <p className="text-xs text-slate-500">
+                  已勾选 {selectedCount} 个 / 候选 {form.modelOrder.length} 个。别称即对外模型名，转发时自动换回上游模型名。
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Input
+                  value={modelFilter}
+                  onChange={(event) => setModelFilter(event.target.value)}
+                  placeholder="搜索模型"
+                  className="w-40"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => form.id && fetchModels.mutate(form.id)}
+                  disabled={!form.id || fetchModels.isPending}
+                  title={form.id ? '从上游 /models 拉取候选模型' : '请先保存供应商，再拉取模型'}
+                >
+                  {fetchModels.isPending ? (
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <CloudDownload className="h-4 w-4" />
+                  )}
+                  拉取模型
+                </Button>
+              </div>
+            </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="grid gap-1.5">
-              <Label htmlFor="p-models">手动模型（每行一个）</Label>
-              <textarea
-                id="p-models"
-                rows={4}
-                className="w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-xs shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-                value={form.models_manual}
-                onChange={(event) => setForm({ ...form, models_manual: event.target.value })}
-                placeholder={'gpt-4o\nclaude-sonnet-4-5'}
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="p-excluded">排除模型（每行一个）</Label>
-              <textarea
-                id="p-excluded"
-                rows={4}
-                className="w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-xs shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-                value={form.models_excluded}
-                onChange={(event) => setForm({ ...form, models_excluded: event.target.value })}
-                placeholder="不希望出现在聚合列表里的模型"
-              />
-            </div>
-          </div>
+            {!form.id ? (
+              <p className="text-xs text-amber-700">保存后即可拉取上游模型并勾选。</p>
+            ) : null}
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="grid gap-1.5">
-              <Label htmlFor="p-priority">优先级（越小越优先）</Label>
-              <Input
-                id="p-priority"
-                type="number"
-                min={1}
-                value={form.priority}
-                onChange={(event) => setForm({ ...form, priority: Number(event.target.value) })}
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="p-timeout">超时（秒）</Label>
-              <Input
-                id="p-timeout"
-                type="number"
-                min={1}
-                value={form.timeout_seconds}
-                onChange={(event) => setForm({ ...form, timeout_seconds: Number(event.target.value) })}
-              />
-            </div>
+            {form.modelOrder.length === 0 ? (
+              <p className="py-4 text-center text-xs text-slate-500">
+                还没有模型。点击「拉取模型」从上游 <code className="rounded bg-slate-100 px-1">/models</code> 获取候选列表。
+              </p>
+            ) : (
+              <div className="max-h-72 overflow-y-auto rounded-md border border-slate-100">
+                {visibleModels.length === 0 ? (
+                  <p className="px-3 py-4 text-center text-xs text-slate-500">没有匹配的模型</p>
+                ) : (
+                  visibleModels.map((model) => {
+                    const checked = Boolean(form.selected[model])
+                    return (
+                      <div
+                        key={model}
+                        className="flex items-center gap-3 border-b border-slate-100 px-3 py-2 last:border-b-0"
+                      >
+                        <label className="flex flex-1 items-center gap-2">
+                          <input
+                            type="checkbox"
+                            className="h-4 w-4 rounded border-slate-300"
+                            checked={checked}
+                            onChange={(event) => toggleModel(model, event.target.checked)}
+                          />
+                          <span className="font-mono text-xs text-slate-700">{model}</span>
+                        </label>
+                        <Input
+                          value={form.aliases[model] ?? ''}
+                          onChange={(event) => setAlias(model, event.target.value)}
+                          disabled={!checked}
+                          placeholder="别称（可选）"
+                          className="w-44"
+                        />
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+            )}
+
+            {form.modelOrder.length > 0 ? (
+              <div className="flex items-center gap-3 text-xs text-slate-500">
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() =>
+                    setForm((prev) => ({
+                      ...prev,
+                      selected: Object.fromEntries(prev.modelOrder.map((model) => [model, true])),
+                    }))
+                  }
+                >
+                  全选
+                </button>
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => setForm((prev) => ({ ...prev, selected: {} }))}
+                >
+                  清空
+                </button>
+                {selectedCount > 0 ? (
+                  <span className="flex items-center gap-1 text-emerald-700">
+                    <Check className="h-3 w-3" />
+                    对外模型：{' '}
+                    <code className="rounded bg-slate-100 px-1">
+                      {form.modelOrder
+                        .filter((model) => form.selected[model])
+                        .map((model) => (form.aliases[model] ?? '').trim() || model)
+                        .join(', ')}
+                    </code>
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
 
           <div className="flex flex-wrap items-center gap-6">
-            <div className="flex items-center gap-2">
-              <Switch
-                id="p-auto"
-                checked={form.auto_fetch_models}
-                onCheckedChange={(checked) => setForm({ ...form, auto_fetch_models: checked })}
-              />
-              <Label htmlFor="p-auto">自动拉取模型</Label>
-            </div>
             <div className="flex items-center gap-2">
               <Switch
                 id="p-enabled"
@@ -531,25 +607,23 @@ export function ProvidersPage() {
             <div className="mt-3 grid gap-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="grid gap-1.5">
-                  <Label htmlFor="p-openai-endpoint">OpenAI 端点覆盖</Label>
+                  <Label htmlFor="p-endpoint">OpenAI 端点覆盖</Label>
                   <Input
-                    id="p-openai-endpoint"
+                    id="p-endpoint"
                     value={form.openai_endpoint_override}
-                    onChange={(event) =>
-                      setForm({ ...form, openai_endpoint_override: event.target.value })
-                    }
+                    onChange={(event) => setForm({ ...form, openai_endpoint_override: event.target.value })}
                     placeholder="路径非标准时填写完整 URL"
                   />
+                  <p className="text-xs text-slate-500">填写后不再支持拉取模型（无法推导 /models）。</p>
                 </div>
                 <div className="grid gap-1.5">
-                  <Label htmlFor="p-anthropic-endpoint">Anthropic 端点覆盖</Label>
+                  <Label htmlFor="p-timeout">超时（秒）</Label>
                   <Input
-                    id="p-anthropic-endpoint"
-                    value={form.anthropic_endpoint_override}
-                    onChange={(event) =>
-                      setForm({ ...form, anthropic_endpoint_override: event.target.value })
-                    }
-                    placeholder="路径非标准时填写完整 URL"
+                    id="p-timeout"
+                    type="number"
+                    min={1}
+                    value={form.timeout_seconds}
+                    onChange={(event) => setForm({ ...form, timeout_seconds: Number(event.target.value) })}
                   />
                 </div>
               </div>

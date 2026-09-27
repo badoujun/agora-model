@@ -2,12 +2,12 @@
 # Windows PowerShell 5.1 在无 BOM 时会按 ANSI 解码，导致中文注释/输出乱码并报解析错误。
 <#
 .SYNOPSIS
-  Phase 3 端到端冒烟：模型聚合、/v1/models、provider/model 命名空间路由。
+  Phase 3 端到端冒烟：模型拉取与勾选、/v1/models 聚合、供应商名命名空间路由、模型别名。
 
 .DESCRIPTION
-  覆盖：启动即聚合（自动拉取上游 /models）、手动模型与排除列表、失败隔离（不可达供应商不影响他人）、
-        /v1/models 的裸名与命名空间条目、用聚合得到的模型直接透传、命名空间路由改写 model、
-        未授权访问 /v1/models。
+  覆盖：启动时未勾选模型不对外暴露、按需拉取上游 /models 作为候选、勾选后立即生效、
+        勾选之外的上游模型不出现、模型别名即对外模型名（转发时换回上游名）、
+        供应商名称命名空间路由、拉取失败不影响其他供应商、未授权访问 /v1/models。
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File tools/smoke/phase3.ps1
@@ -80,27 +80,27 @@ if ($LASTEXITCODE -ne 0) { throw 'go build 失败' }
 $dataDir = Join-Path $tmp 'agora-p3-data'
 if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }
 
-# mock：models 为空 + 自动拉取；排除一个上游模型；另有手动模型
-# dead：指向未监听端口，用于验证失败隔离
+# mock：启动时未勾选任何模型，随后通过 API 拉取候选并勾选
+# dead：指向未监听端口，用于验证拉取失败隔离
 $cfg = Save-Text (Join-Path $tmp 'agora-p3-config.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": $Port, "sse_idle_seconds": 15, "max_body_bytes": 1048576 },
   "providers": [
-    { "id": "mock", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
-      "anthropic_base_url": "http://127.0.0.1:$MockPort/v1",
-      "api_key": "sk-mock-provider-key", "models": ["my-manual-model"],
-      "models_excluded": ["mock-deepseek-v3"], "auto_fetch_models": true,
-      "priority": 10, "allow_internal": true },
-    { "id": "dead", "openai_base_url": "http://127.0.0.1:9998/v1",
-      "api_key": "sk-dead", "models": [], "auto_fetch_models": true,
-      "priority": 20, "allow_internal": true }
+    { "id": "mock", "name": "mock 供应商", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+      "api_key": "sk-mock-provider-key", "models": [], "allow_internal": true },
+    { "id": "dead", "name": "dead 供应商", "openai_base_url": "http://127.0.0.1:9998/v1",
+      "api_key": "sk-dead", "models": [], "allow_internal": true }
   ]
 }
 "@
 
-$autoModel = Save-Text (Join-Path $tmp 'agora-p3-auto.json') '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}'
-$nsModel = Save-Text (Join-Path $tmp 'agora-p3-ns.json') '{"model":"mock/mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}'
-$manualModel = Save-Text (Join-Path $tmp 'agora-p3-manual.json') '{"model":"my-manual-model","messages":[{"role":"user","content":"hi"}]}'
+$selectBody = Save-Text (Join-Path $tmp 'agora-p3-select.json') (@'
+{"name":"mock 供应商","models_selected":["mock-gpt-4o","mock-claude-sonnet-4-5"],
+ "model_aliases":{"mock-gpt-4o":"我的模型"},"allow_internal":true,"enabled":true}
+'@)
+
+$aliasModel = Save-Text (Join-Path $tmp 'agora-p3-alias.json') '{"model":"我的模型","messages":[{"role":"user","content":"hi"}]}'
+$nsModel = Save-Text (Join-Path $tmp 'agora-p3-ns.json') '{"model":"mock 供应商/mock-claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}'
 $unknownNS = Save-Text (Join-Path $tmp 'agora-p3-unknown-ns.json') '{"model":"nope/nope-model","messages":[{"role":"user","content":"hi"}]}'
 
 $env:PORT = "$MockPort"
@@ -113,45 +113,62 @@ $gwOut = Join-Path $tmp 'agora-p3-gw.out'
 $gw = Start-Process $exe -ArgumentList '--config', $cfg, '--data-dir', $dataDir, '--port', "$Port", '--log-level', 'debug' -PassThru `
     -RedirectStandardOutput $gwOut -RedirectStandardError "$gwOut.err" -WindowStyle Hidden
 $base = "http://127.0.0.1:$Port"
+$json = @('-H', 'content-type: application/json')
 
 try {
-    Start-Sleep -Seconds 3  # 等待启动 + 首轮聚合完成
+    Start-Sleep -Seconds 3
 
     $log = Read-SharedText $gwOut
     if ($log -match 'gateway_key=(gw-[0-9a-f]+)') { $key = $Matches[1] } else { throw "未能取得网关 Key：$log" }
-    $auth = @('-H', 'content-type: application/json', '-H', "authorization: Bearer $key")
+    $auth = $json + @('-H', "authorization: Bearer $key")
 
     Write-Host '== 断言 =='
 
-    Assert-That '启动即完成自动聚合（记录拉到 3 个模型）' ($log -match '模型聚合完成' -and $log -match 'provider=mock' -and $log -match 'models=3')
-    Assert-That '失败隔离：不可达供应商记录拉取失败' ($log -match '模型聚合：拉取失败' -and $log -match 'provider=dead')
-
     $models = Invoke-Json "$base/v1/models" $auth
     Assert-That 'GET /v1/models 返回 200' ($models.Code -eq 200) "code=$($models.Code)"
-    $ids = @($models.Json.data | ForEach-Object { $_.id })
-    Assert-That '聚合结果包含自动拉取的模型' (($ids -contains 'mock-gpt-4o') -and ($ids -contains 'mock-claude-sonnet-4-5'))
-    Assert-That '聚合结果包含手动模型' ($ids -contains 'my-manual-model')
-    Assert-That '排除列表生效（mock-deepseek-v3 不出现）' (-not ($ids -contains 'mock-deepseek-v3'))
-    Assert-That '列出命名空间形式 provider/model' (($ids -contains 'mock/mock-gpt-4o') -and ($ids -contains 'mock/my-manual-model'))
-    Assert-That '不包含失败供应商的模型' (-not ($ids -contains 'dead/mock-gpt-4o'))
-
-    $shared = $models.Json.data | Where-Object { $_.id -eq 'mock-gpt-4o' }
-    Assert-That '裸名条目 owned_by 为供应商 id' ($shared.owned_by -eq 'mock')
+    Assert-That '未勾选模型时 /v1/models 为空' (@($models.Json.data).Count -eq 0) "count=$(@($models.Json.data).Count)"
 
     $unauth = Invoke-Json "$base/v1/models" $null
     Assert-That '未授权访问 /v1/models → 401' ($unauth.Code -eq 401) "code=$($unauth.Code)"
 
-    $auto = Invoke-Json "$base/v1/chat/completions" $auth $autoModel 'POST'
-    Assert-That '用聚合得到的模型直接透传（无需手动配置）' ($auto.Code -eq 200 -and $auto.Raw -match 'mock') "code=$($auto.Code)"
+    $fetch = Invoke-Json "$base/api/providers/mock/fetch-models" $auth $null 'POST'
+    Assert-That '拉取模型接口返回候选（3 个）' ($fetch.Code -eq 200 -and @($fetch.Json.candidate_models).Count -eq 3) "code=$($fetch.Code)"
+    Assert-That '拉取候选不改变已勾选模型' (@($fetch.Json.models_selected).Count -eq 0)
 
-    $manual = Invoke-Json "$base/v1/chat/completions" $auth $manualModel 'POST'
-    Assert-That '手动模型同样可路由' ($manual.Code -eq 200) "code=$($manual.Code)"
+    $fetchDead = Invoke-Json "$base/api/providers/dead/fetch-models" $auth $null 'POST'
+    Assert-That '不可达供应商拉取失败 → 502' ($fetchDead.Code -eq 502) "code=$($fetchDead.Code)"
+    $deadProviders = Invoke-Json "$base/api/providers" $auth
+    $deadRec = @($deadProviders.Json.items | Where-Object { $_.id -eq 'dead' })[0]
+    Assert-That '失败原因写入 last_fetch_error' ($deadRec.last_fetch_error -ne $null -and $deadRec.last_fetch_error -ne '') "err=$($deadRec.last_fetch_error)"
+    $mockRec = @($deadProviders.Json.items | Where-Object { $_.id -eq 'mock' })[0]
+    Assert-That '失败供应商不影响其他供应商' ([string]::IsNullOrEmpty($mockRec.last_fetch_error)) "err=$($mockRec.last_fetch_error)"
 
-    $ns = Invoke-Json "$base/v1/chat/completions" $auth $nsModel 'POST'
-    Assert-That '命名空间路由可用（mock/mock-gpt-4o）' ($ns.Code -eq 200 -and $ns.Raw -match 'mock') "code=$($ns.Code)"
+    $select = Invoke-Json "$base/api/providers/mock" $auth $selectBody 'PUT'
+    Assert-That '勾选模型并设置别名 → 200' ($select.Code -eq 200) "code=$($select.Code)"
+
+    $models = Invoke-Json "$base/v1/models" $auth
+    $ids = @($models.Json.data | ForEach-Object { $_.id })
+    Assert-That '勾选的模型出现在 /v1/models' (($ids -contains '我的模型') -and ($ids -contains 'mock-claude-sonnet-4-5'))
+    Assert-That '未勾选的上游模型不出现' (-not ($ids -contains 'mock-deepseek-v3'))
+    Assert-That '配置别名后不再暴露上游原名' (-not ($ids -contains 'mock-gpt-4o'))
+    Assert-That '列出命名空间形式（供应商名/模型名）' (($ids -contains 'mock 供应商/我的模型') -and ($ids -contains 'mock 供应商/mock-claude-sonnet-4-5'))
+    Assert-That '不包含失败供应商的模型' (-not ($ids -contains 'dead 供应商/mock-gpt-4o'))
+
+    $aliasEntry = @($models.Json.data | Where-Object { $_.id -eq '我的模型' })[0]
+    Assert-That '裸名条目 owned_by 为供应商名称' ($aliasEntry.owned_by -eq 'mock 供应商') "owned_by=$($aliasEntry.owned_by)"
+
+    $alias = Invoke-Json "$base/v1/chat/completions" $auth $aliasModel 'POST'
+    Assert-That '用别名请求可直接透传（Agent 立即可用）' ($alias.Code -eq 200 -and $alias.Raw -match 'mock') "code=$($alias.Code)"
 
     $mockRequests = Invoke-Json "http://127.0.0.1:$MockPort/__requests"
-    $lastNS = @($mockRequests.Json.requests | Where-Object { $_.model -eq 'mock-gpt-4o' }) | Select-Object -Last 1
+    $lastAlias = @($mockRequests.Json.requests | Where-Object { $_.model -eq 'mock-gpt-4o' }) | Select-Object -Last 1
+    Assert-That '别名已换回上游真实模型名' ($null -ne $lastAlias) "上游收到 model=$($lastAlias.model)"
+
+    $ns = Invoke-Json "$base/v1/chat/completions" $auth $nsModel 'POST'
+    Assert-That '命名空间路由可用（供应商名/模型名）' ($ns.Code -eq 200 -and $ns.Raw -match 'mock') "code=$($ns.Code)"
+
+    $mockRequests = Invoke-Json "http://127.0.0.1:$MockPort/__requests"
+    $lastNS = @($mockRequests.Json.requests | Where-Object { $_.model -eq 'mock-claude-sonnet-4-5' }) | Select-Object -Last 1
     Assert-That '命名空间前缀已从转发给上游的 model 中剥离' ($null -ne $lastNS) "上游收到 model=$($lastNS.model)"
 
     $unknown = Invoke-Json "$base/v1/chat/completions" $auth $unknownNS 'POST'

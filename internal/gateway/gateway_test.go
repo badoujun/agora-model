@@ -47,11 +47,11 @@ func buildGateway(t *testing.T, gw config.Gateway, providers ...config.Provider)
 
 func providerFor(id, upstreamURL string, models ...string) config.Provider {
 	return config.Provider{
-		ID:               id,
-		OpenAIBaseURL:    upstreamURL + "/v1",
-		AnthropicBaseURL: upstreamURL + "/v1",
-		APIKey:           "sk-upstream-" + id,
-		Models:           models,
+		ID:            id,
+		Name:          id,
+		OpenAIBaseURL: upstreamURL + "/v1",
+		APIKey:        "sk-upstream-" + id,
+		Models:        models,
 	}
 }
 
@@ -86,7 +86,7 @@ func decodeJSON(t *testing.T, body string) map[string]any {
 	return out
 }
 
-func TestAuthFailurePerProtocolStyle(t *testing.T) {
+func TestAuthFailureStyle(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -94,7 +94,7 @@ func TestAuthFailurePerProtocolStyle(t *testing.T) {
 	defer upstream.Close()
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", upstream.URL, "m"))
 
-	t.Run("OpenAI 入站错误体风格", func(t *testing.T) {
+	t.Run("缺少 Key 时返回 OpenAI 风格错误体", func(t *testing.T) {
 		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "", `{"model":"m"}`, nil)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("状态码 = %d, 期望 401", resp.StatusCode)
@@ -112,26 +112,8 @@ func TestAuthFailurePerProtocolStyle(t *testing.T) {
 		}
 	})
 
-	t.Run("Anthropic 入站错误体风格", func(t *testing.T) {
-		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/messages", "", `{"model":"m"}`, nil)
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("状态码 = %d, 期望 401", resp.StatusCode)
-		}
-		got := decodeJSON(t, body)
-		if got["type"] != "error" {
-			t.Errorf("type = %v, 期望 error", got["type"])
-		}
-		errObj, ok := got["error"].(map[string]any)
-		if !ok {
-			t.Fatalf("缺少 error 对象: %s", body)
-		}
-		if errObj["type"] != "authentication_error" {
-			t.Errorf("error.type = %v, 期望 authentication_error", errObj["type"])
-		}
-	})
-
-	t.Run("x-api-key 亦可认证 Anthropic 入站", func(t *testing.T) {
-		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/messages", "", `{"model":"m"}`,
+	t.Run("x-api-key 亦可认证", func(t *testing.T) {
+		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "", `{"model":"m"}`,
 			map[string]string{"x-api-key": gatewayKey})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
@@ -144,6 +126,17 @@ func TestAuthFailurePerProtocolStyle(t *testing.T) {
 			t.Fatalf("状态码 = %d, 期望 401", resp.StatusCode)
 		}
 	})
+}
+
+func TestAnthropicEndpointRemoved(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	srv := buildGateway(t, config.Gateway{}, providerFor("p", upstream.URL, "m"))
+
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/messages", gatewayKey, `{"model":"m"}`, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("Anthropic 端点应已下线，状态码 = %d, 期望 404", resp.StatusCode)
+	}
 }
 
 func TestMethodNotAllowed(t *testing.T) {
@@ -200,50 +193,6 @@ func TestModelNotFound(t *testing.T) {
 	}
 }
 
-func TestProtocolNotConfigured(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-
-	t.Run("OpenAI 入站但只配了 Anthropic 地址", func(t *testing.T) {
-		onlyAnthropic := config.Provider{
-			ID:               "p",
-			AnthropicBaseURL: upstream.URL + "/v1",
-			APIKey:           "sk-up",
-			Models:           []string{"m"},
-		}
-		srv := buildGateway(t, config.Gateway{}, onlyAnthropic)
-
-		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("状态码 = %d, 期望 400", resp.StatusCode)
-		}
-		errObj := decodeJSON(t, body)["error"].(map[string]any)
-		if errObj["code"] != "upstream_protocol_not_configured" {
-			t.Errorf("code = %v, 期望 upstream_protocol_not_configured", errObj["code"])
-		}
-	})
-
-	t.Run("Anthropic 入站但只配了 OpenAI 地址（错误体应为 Anthropic 风格）", func(t *testing.T) {
-		onlyOpenAI := config.Provider{
-			ID:            "p",
-			OpenAIBaseURL: upstream.URL + "/v1",
-			APIKey:        "sk-up",
-			Models:        []string{"m"},
-		}
-		srv := buildGateway(t, config.Gateway{}, onlyOpenAI)
-
-		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/messages", "", `{"model":"m"}`,
-			map[string]string{"x-api-key": gatewayKey})
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("状态码 = %d, 期望 400", resp.StatusCode)
-		}
-		errObj := decodeJSON(t, body)["error"].(map[string]any)
-		if errObj["type"] != "invalid_request_error" {
-			t.Errorf("error.type = %v, 期望 invalid_request_error", errObj["type"])
-		}
-	})
-}
-
 // captured 记录上游收到的请求，用于断言头改写与请求体保真。
 type captured struct {
 	mu     sync.Mutex
@@ -284,7 +233,7 @@ func TestPassthroughHeaderRewriteAndByteFidelity(t *testing.T) {
 
 	payload := `{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0.25}`
 	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, payload,
-		map[string]string{"anthropic-version": "2023-06-01", "x-custom": "kept"})
+		map[string]string{"openai-beta": "assistants=v2", "x-custom": "kept"})
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
@@ -309,42 +258,14 @@ func TestPassthroughHeaderRewriteAndByteFidelity(t *testing.T) {
 	if v := got.header.Get("x-api-key"); v != "" {
 		t.Errorf("x-api-key 应被剥离，得到 %q", v)
 	}
-	if v := got.header.Get("anthropic-version"); v != "2023-06-01" {
-		t.Errorf("anthropic-version 应透传，得到 %q", v)
+	if v := got.header.Get("openai-beta"); v != "assistants=v2" {
+		t.Errorf("业务头应透传，得到 %q", v)
 	}
 	if v := got.header.Get("x-custom"); v != "kept" {
 		t.Errorf("自定义头应透传，得到 %q", v)
 	}
 	if v := got.header.Get("Accept-Encoding"); v != "" {
 		t.Errorf("Accept-Encoding 应被剥离，得到 %q", v)
-	}
-}
-
-func TestAnthropicInboundUsesAPIKeyHeader(t *testing.T) {
-	var cap captured
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		cap.set(r, body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"type":"message"}`))
-	}))
-	defer upstream.Close()
-	srv := buildGateway(t, config.Gateway{}, providerFor("p", upstream.URL, "m"))
-
-	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/messages", "", `{"model":"m","max_tokens":16}`,
-		map[string]string{"x-api-key": gatewayKey, "anthropic-version": "2023-06-01"})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("状态码 = %d", resp.StatusCode)
-	}
-	got := cap.snapshot()
-	if got.path != "/v1/messages" {
-		t.Errorf("上游路径 = %q, 期望 /v1/messages", got.path)
-	}
-	if v := got.header.Get("x-api-key"); v != "sk-upstream-p" {
-		t.Errorf("x-api-key = %q, 期望供应商凭证", v)
-	}
-	if v := got.header.Get("Authorization"); v != "" {
-		t.Errorf("Authorization 不应出现在 Anthropic 上游请求中，得到 %q", v)
 	}
 }
 
@@ -516,14 +437,15 @@ func TestClientDisconnectCancelsUpstream(t *testing.T) {
 	}
 }
 
-func TestModelsEndpointAggregatesAndNamespaces(t *testing.T) {
+func TestModelsEndpointUsesProviderNamesAndAliases(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer upstream.Close()
 
 	first := providerFor("a", upstream.URL, "shared", "only-a")
-	first.Priority = 1
+	first.Name = "供应商A"
+	first.ModelAliases = map[string]string{"only-a": "别名A"}
 	second := providerFor("b", upstream.URL, "shared", "only-b")
-	second.Priority = 2
+	second.Name = "供应商B"
 	srv := buildGateway(t, config.Gateway{}, first, second)
 
 	resp, _ := doRequest(t, http.MethodGet, srv.URL+"/v1/models", "", "", nil)
@@ -557,13 +479,19 @@ func TestModelsEndpointAggregatesAndNamespaces(t *testing.T) {
 		ownedBy[id] = owner
 	}
 
-	if ownedBy["shared"] != "a" {
-		t.Errorf("裸模型名 shared 的 owned_by = %q, 期望 priority 最小的 a", ownedBy["shared"])
+	if ownedBy["shared"] != "供应商A" {
+		t.Errorf("裸模型名 shared 的 owned_by = %q, 期望名称最小的 供应商A", ownedBy["shared"])
 	}
-	if ownedBy["only-b"] != "b" {
-		t.Errorf("only-b 的 owned_by = %q, 期望 b", ownedBy["only-b"])
+	if ownedBy["别名A"] != "供应商A" {
+		t.Errorf("别名应作为对外模型名，得到 %v", ownedBy)
 	}
-	if ownedBy["a/shared"] != "a" || ownedBy["b/shared"] != "b" {
+	if _, hasOrigin := ownedBy["only-a"]; hasOrigin {
+		t.Errorf("配置了别名后不应再暴露上游原名: %v", ownedBy)
+	}
+	if ownedBy["only-b"] != "供应商B" {
+		t.Errorf("only-b 的 owned_by = %q, 期望 供应商B", ownedBy["only-b"])
+	}
+	if ownedBy["供应商A/shared"] != "供应商A" || ownedBy["供应商B/shared"] != "供应商B" {
 		t.Errorf("命名空间条目缺失或归属错误: %v", ownedBy)
 	}
 
@@ -584,13 +512,15 @@ func TestNamespaceRoutingRewritesModelBeforeForwarding(t *testing.T) {
 	defer upstream.Close()
 
 	first := providerFor("a", upstream.URL, "shared")
-	first.Priority = 1
+	first.Name = "供应商A"
 	second := providerFor("b", upstream.URL, "shared")
-	second.Priority = 2
+	second.Name = "供应商B"
+	second.ModelAliases = map[string]string{"shared": "别名共享"}
 	srv := buildGateway(t, config.Gateway{}, first, second)
 
+	// 命名空间 + 别名：两者都应被剥离/替换为上游真实模型名
 	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"b/shared","messages":[]}`, nil)
+		`{"model":"供应商B/别名共享","messages":[]}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
@@ -600,7 +530,7 @@ func TestNamespaceRoutingRewritesModelBeforeForwarding(t *testing.T) {
 		t.Fatalf("上游请求体不是 JSON: %v", err)
 	}
 	if payload["model"] != "shared" {
-		t.Fatalf("上游收到的 model 应为 shared（已剥离命名空间前缀），得到 %v", payload["model"])
+		t.Fatalf("上游收到的 model 应为 shared，得到 %v", payload["model"])
 	}
 }
 
@@ -609,12 +539,14 @@ func TestNamespaceRoutingDisabledProviderReturns503(t *testing.T) {
 	defer upstream.Close()
 
 	disabled := providerFor("off", upstream.URL, "m")
+	disabled.Name = "已停用"
 	disabled.Enabled = boolPtr(false)
 	enabled := providerFor("on", upstream.URL, "m")
+	enabled.Name = "启用中"
 	srv := buildGateway(t, config.Gateway{}, enabled, disabled)
 
 	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"off/m","messages":[]}`, nil)
+		`{"model":"已停用/m","messages":[]}`, nil)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("状态码 = %d, 期望 503", resp.StatusCode)
 	}

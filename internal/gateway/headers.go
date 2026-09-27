@@ -40,8 +40,8 @@ func isHopByHop(name string) bool { return hopByHopHeaders[canonicalHeader(name)
 
 // buildUpstreamHeaders 依据入站请求与供应商配置构造上游请求头。
 //
-// 其余业务头（anthropic-version、anthropic-beta、openai-*、user-agent 等）原样透传。
-func buildUpstreamHeaders(in http.Header, p *config.Provider, proto config.Protocol) http.Header {
+// 其余业务头（anthropic-version、openai-*、user-agent 等）原样透传。
+func buildUpstreamHeaders(in http.Header, p *config.Provider) http.Header {
 	out := make(http.Header, len(in)+len(p.ExtraHeaders)+1)
 	for name, values := range in {
 		lower := canonicalHeader(name)
@@ -53,12 +53,7 @@ func buildUpstreamHeaders(in http.Header, p *config.Provider, proto config.Proto
 		}
 	}
 
-	switch proto {
-	case config.ProtocolAnthropic:
-		out.Set("x-api-key", p.APIKey)
-	case config.ProtocolOpenAI:
-		out.Set("Authorization", "Bearer "+p.APIKey)
-	}
+	out.Set("Authorization", "Bearer "+p.APIKey)
 
 	// extra_headers 可覆盖业务头，但不允许覆盖 Host 与认证头
 	for name, value := range p.ExtraHeaders {

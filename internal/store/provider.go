@@ -18,36 +18,33 @@ var ErrNotFound = errors.New("记录不存在")
 
 // ProviderRecord 是 providers 表的一行（api_key 以密文存放）。
 type ProviderRecord struct {
-	ID                        string
-	Name                      string
-	OpenAIBaseURL             string
-	AnthropicBaseURL          string
-	OpenAIEndpointOverride    string
-	AnthropicEndpointOverride string
-	APIKeyCipher              []byte
-	APIKeyHint                string
-	ModelsManual              []string
-	ModelsExcluded            []string
-	AutoFetchModels           bool
-	Priority                  int
-	TimeoutSeconds            int
-	ExtraHeaders              map[string]string
-	ExtraBody                 map[string]any
-	AllowInternal             bool
-	Enabled                   bool
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
+	ID                     string
+	Name                   string
+	OpenAIBaseURL          string
+	OpenAIEndpointOverride string
+	APIKeyCipher           []byte
+	APIKeyHint             string
+	// ModelsSelected 是已勾选启用的上游模型名（顺序即展示顺序）。
+	ModelsSelected []string
+	// ModelAliases 把上游模型名映射为对外别名。
+	ModelAliases   map[string]string
+	TimeoutSeconds int
+	ExtraHeaders   map[string]string
+	ExtraBody      map[string]any
+	AllowInternal  bool
+	Enabled        bool
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 	// LastFetchAt 是最后一次模型拉取的时间（失败时也会刷新，用于展示"陈旧"）。
 	LastFetchAt time.Time
 	// LastFetchError 是最近一次拉取失败的原因（成功时清空）。
 	LastFetchError string
 }
 
-const providerColumns = `id, name, openai_base_url, anthropic_base_url,
-	openai_endpoint_override, anthropic_endpoint_override, api_key_cipher, api_key_hint,
-	models_manual_json, models_excluded_json, auto_fetch_models, priority, timeout_seconds,
-	extra_headers_json, extra_body_json, allow_internal, enabled, created_at, updated_at,
-	last_fetch_at, last_fetch_error`
+const providerColumns = `id, name, openai_base_url, openai_endpoint_override,
+	api_key_cipher, api_key_hint, models_selected_json, models_alias_json,
+	timeout_seconds, extra_headers_json, extra_body_json, allow_internal, enabled,
+	created_at, updated_at, last_fetch_at, last_fetch_error`
 
 // UpsertProvider 写入或更新一条供应商记录（不做加密，调用方负责传入密文）。
 func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
@@ -57,11 +54,11 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 	}
 	rec.UpdatedAt = now
 
-	manual, err := json.Marshal(nonNilStrings(rec.ModelsManual))
+	selected, err := json.Marshal(nonNilStrings(rec.ModelsSelected))
 	if err != nil {
 		return err
 	}
-	excluded, err := json.Marshal(nonNilStrings(rec.ModelsExcluded))
+	aliases, err := json.Marshal(nonNilMap(rec.ModelAliases))
 	if err != nil {
 		return err
 	}
@@ -75,19 +72,15 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 	}
 
 	const q = `INSERT INTO providers (` + providerColumns + `)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			openai_base_url=excluded.openai_base_url,
-			anthropic_base_url=excluded.anthropic_base_url,
 			openai_endpoint_override=excluded.openai_endpoint_override,
-			anthropic_endpoint_override=excluded.anthropic_endpoint_override,
 			api_key_cipher=excluded.api_key_cipher,
 			api_key_hint=excluded.api_key_hint,
-			models_manual_json=excluded.models_manual_json,
-			models_excluded_json=excluded.models_excluded_json,
-			auto_fetch_models=excluded.auto_fetch_models,
-			priority=excluded.priority,
+			models_selected_json=excluded.models_selected_json,
+			models_alias_json=excluded.models_alias_json,
 			timeout_seconds=excluded.timeout_seconds,
 			extra_headers_json=excluded.extra_headers_json,
 			extra_body_json=excluded.extra_body_json,
@@ -96,10 +89,10 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 			updated_at=excluded.updated_at`
 
 	_, err = s.db.ExecContext(ctx, q,
-		rec.ID, rec.Name, rec.OpenAIBaseURL, rec.AnthropicBaseURL,
-		rec.OpenAIEndpointOverride, rec.AnthropicEndpointOverride, rec.APIKeyCipher, rec.APIKeyHint,
-		string(manual), string(excluded), boolToInt(rec.AutoFetchModels), rec.Priority, rec.TimeoutSeconds,
-		string(headers), string(body), boolToInt(rec.AllowInternal), boolToInt(rec.Enabled),
+		rec.ID, rec.Name, rec.OpenAIBaseURL, rec.OpenAIEndpointOverride,
+		rec.APIKeyCipher, rec.APIKeyHint, string(selected), string(aliases),
+		rec.TimeoutSeconds, string(headers), string(body),
+		boolToInt(rec.AllowInternal), boolToInt(rec.Enabled),
 		rec.CreatedAt.UTC().Format(time.RFC3339), rec.UpdatedAt.UTC().Format(time.RFC3339),
 		formatTime(rec.LastFetchAt), rec.LastFetchError,
 	)
@@ -119,9 +112,11 @@ func (s *Store) GetProvider(ctx context.Context, id string) (ProviderRecord, err
 	return rec, err
 }
 
-// ListProviders 按 priority 升序返回全部供应商（含停用项）。
+// ListProviders 按名称升序返回全部供应商（含停用项）。
+//
+// 名称即对外路由顺序：LoadProviders 与快照排序都依赖它保持稳定。
 func (s *Store) ListProviders(ctx context.Context) ([]ProviderRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+providerColumns+` FROM providers ORDER BY priority ASC, id ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+providerColumns+` FROM providers ORDER BY name ASC, id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("查询供应商失败: %w", err)
 	}
@@ -138,7 +133,7 @@ func (s *Store) ListProviders(ctx context.Context) ([]ProviderRecord, error) {
 	return out, rows.Err()
 }
 
-// DeleteProvider 删除供应商并清理其模型缓存。
+// DeleteProvider 删除供应商并清理其模型候选缓存。
 func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -176,8 +171,10 @@ func (s *Store) SaveProvider(ctx context.Context, master []byte, p config.Provid
 	if p.ID == "" {
 		return ProviderRecord{}, errors.New("供应商 id 不能为空")
 	}
+	// 统一规整模型选择与别名（API 与引导配置两条路径共用同一套规则）
+	p.CleanSelection()
 	// SSRF 防护：保存时校验一次（DESIGN §7.7），转发路径不重复校验
-	for _, u := range []string{p.OpenAIBaseURL, p.AnthropicBaseURL, p.OpenAIEndpointOverride, p.AnthropicEndpointOverride} {
+	for _, u := range []string{p.OpenAIBaseURL, p.OpenAIEndpointOverride} {
 		if err := security.ValidateUpstreamURL(u, p.AllowInternal); err != nil {
 			return ProviderRecord{}, fmt.Errorf("供应商 %s 地址校验失败: %w", p.ID, err)
 		}
@@ -195,28 +192,23 @@ func (s *Store) SaveProvider(ctx context.Context, master []byte, p config.Provid
 		return ProviderRecord{}, err
 	}
 
-	autoFetch := p.FetchModels()
 	rec := ProviderRecord{
-		ID:                        p.ID,
-		Name:                      p.Name,
-		OpenAIBaseURL:             p.OpenAIBaseURL,
-		AnthropicBaseURL:          p.AnthropicBaseURL,
-		OpenAIEndpointOverride:    p.OpenAIEndpointOverride,
-		AnthropicEndpointOverride: p.AnthropicEndpointOverride,
-		APIKeyCipher:              cipherText,
-		APIKeyHint:                crypto.Mask(p.APIKey),
-		ModelsManual:              p.Models,
-		ModelsExcluded:            p.ModelsExcluded,
-		AutoFetchModels:           autoFetch,
-		Priority:                  p.Priority,
-		TimeoutSeconds:            p.TimeoutSeconds,
-		ExtraHeaders:              p.ExtraHeaders,
-		ExtraBody:                 p.ExtraBody,
-		AllowInternal:             p.AllowInternal,
-		Enabled:                   p.IsEnabled(),
-		CreatedAt:                 created,
-		LastFetchAt:               existing.LastFetchAt,
-		LastFetchError:            existing.LastFetchError,
+		ID:                     p.ID,
+		Name:                   p.Name,
+		OpenAIBaseURL:          p.OpenAIBaseURL,
+		OpenAIEndpointOverride: p.OpenAIEndpointOverride,
+		APIKeyCipher:           cipherText,
+		APIKeyHint:             crypto.Mask(p.APIKey),
+		ModelsSelected:         p.Models,
+		ModelAliases:           p.ModelAliases,
+		TimeoutSeconds:         p.TimeoutSeconds,
+		ExtraHeaders:           p.ExtraHeaders,
+		ExtraBody:              p.ExtraBody,
+		AllowInternal:          p.AllowInternal,
+		Enabled:                p.IsEnabled(),
+		CreatedAt:              created,
+		LastFetchAt:            existing.LastFetchAt,
+		LastFetchError:         existing.LastFetchError,
 	}
 	if err := s.UpsertProvider(ctx, rec); err != nil {
 		return ProviderRecord{}, err
@@ -237,24 +229,19 @@ func (s *Store) LoadProviders(ctx context.Context, master []byte) ([]config.Prov
 			return nil, fmt.Errorf("供应商 %s 的凭证解密失败: %w", rec.ID, err)
 		}
 		enabled := rec.Enabled
-		autoFetch := rec.AutoFetchModels
 		out = append(out, config.Provider{
-			ID:                        rec.ID,
-			Name:                      rec.Name,
-			OpenAIBaseURL:             rec.OpenAIBaseURL,
-			AnthropicBaseURL:          rec.AnthropicBaseURL,
-			OpenAIEndpointOverride:    rec.OpenAIEndpointOverride,
-			AnthropicEndpointOverride: rec.AnthropicEndpointOverride,
-			APIKey:                    string(plain),
-			Models:                    rec.ModelsManual,
-			ModelsExcluded:            rec.ModelsExcluded,
-			AutoFetchModels:           &autoFetch,
-			Priority:                  rec.Priority,
-			TimeoutSeconds:            rec.TimeoutSeconds,
-			ExtraHeaders:              rec.ExtraHeaders,
-			ExtraBody:                 rec.ExtraBody,
-			AllowInternal:             rec.AllowInternal,
-			Enabled:                   &enabled,
+			ID:                     rec.ID,
+			Name:                   rec.Name,
+			OpenAIBaseURL:          rec.OpenAIBaseURL,
+			OpenAIEndpointOverride: rec.OpenAIEndpointOverride,
+			APIKey:                 string(plain),
+			Models:                 rec.ModelsSelected,
+			ModelAliases:           rec.ModelAliases,
+			TimeoutSeconds:         rec.TimeoutSeconds,
+			ExtraHeaders:           rec.ExtraHeaders,
+			ExtraBody:              rec.ExtraBody,
+			AllowInternal:          rec.AllowInternal,
+			Enabled:                &enabled,
 		})
 	}
 	return out, nil
@@ -266,27 +253,26 @@ type rowScanner interface {
 
 func scanProvider(row rowScanner) (ProviderRecord, error) {
 	var (
-		rec                               ProviderRecord
-		manual, excluded, headers, body   string
-		autoFetch, allowInternal, enabled int
-		createdAt, updatedAt              string
-		lastFetchAt                       string
+		rec                    ProviderRecord
+		selected, aliases      string
+		headers, body          string
+		allowInternal, enabled int
+		createdAt, updatedAt   string
+		lastFetchAt            string
 	)
 	err := row.Scan(
-		&rec.ID, &rec.Name, &rec.OpenAIBaseURL, &rec.AnthropicBaseURL,
-		&rec.OpenAIEndpointOverride, &rec.AnthropicEndpointOverride, &rec.APIKeyCipher, &rec.APIKeyHint,
-		&manual, &excluded, &autoFetch, &rec.Priority, &rec.TimeoutSeconds,
-		&headers, &body, &allowInternal, &enabled, &createdAt, &updatedAt,
-		&lastFetchAt, &rec.LastFetchError,
+		&rec.ID, &rec.Name, &rec.OpenAIBaseURL, &rec.OpenAIEndpointOverride,
+		&rec.APIKeyCipher, &rec.APIKeyHint, &selected, &aliases,
+		&rec.TimeoutSeconds, &headers, &body, &allowInternal, &enabled,
+		&createdAt, &updatedAt, &lastFetchAt, &rec.LastFetchError,
 	)
 	if err != nil {
 		return ProviderRecord{}, err
 	}
-	rec.ModelsManual = decodeStrings(manual)
-	rec.ModelsExcluded = decodeStrings(excluded)
+	rec.ModelsSelected = decodeStrings(selected)
+	rec.ModelAliases = decodeStringMap(aliases)
 	rec.ExtraHeaders = decodeStringMap(headers)
 	rec.ExtraBody = decodeAnyMap(body)
-	rec.AutoFetchModels = autoFetch != 0
 	rec.AllowInternal = allowInternal != 0
 	rec.Enabled = enabled != 0
 	rec.CreatedAt = parseTime(createdAt)
@@ -302,6 +288,7 @@ func formatTime(t time.Time) string {
 	}
 	return t.UTC().Format(time.RFC3339)
 }
+
 func decodeStrings(raw string) []string {
 	var out []string
 	if raw == "" {

@@ -7,9 +7,6 @@ import (
 	"fmt"
 )
 
-// SettingModelRefreshSeconds 是模型聚合刷新间隔（秒）的设置键。
-const SettingModelRefreshSeconds = "model_refresh_seconds"
-
 // SettingLogSuccess 控制是否记录成功的请求（默认关闭以避免写放大）。
 const SettingLogSuccess = "log_success"
 

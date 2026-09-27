@@ -87,27 +87,16 @@ export const api = {
     request<{ ok: boolean }>(`/api/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   testProvider: (id: string) =>
     request<TestResult>(`/api/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  /** 拉取上游模型候选列表（勾选在编辑页完成） */
   fetchModels: (id: string) =>
     request<ProviderDTO>(`/api/providers/${encodeURIComponent(id)}/fetch-models`, { method: 'POST' }),
 
   // 模型
   listModels: () => request<{ items: ModelItem[] }>('/api/models'),
-  refreshModels: () => request<{ ok: boolean }>('/api/models/refresh', { method: 'POST' }),
-  addManualModel: (providerId: string, model: string) =>
-    request<{ ok: boolean }>('/api/models/manual', {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ provider_id: providerId, model }),
-    }),
-  removeManualModel: (providerId: string, model: string) =>
-    request<{ ok: boolean }>(
-      `/api/models/manual${query({ provider_id: providerId, model })}`,
-      { method: 'DELETE' },
-    ),
 
   // 设置与网关 Key
   getSettings: () => request<SettingsPayload>('/api/settings'),
-  updateSettings: (body: { model_refresh_seconds?: number; log_success?: boolean }) =>
+  updateSettings: (body: { log_success?: boolean }) =>
     request<SettingsPayload>('/api/settings', {
       method: 'PUT',
       headers: JSON_HEADERS,

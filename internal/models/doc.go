@@ -1,2 +1,2 @@
-// Package models 模型聚合、缓存与 /v1/models 组装。
+// Package models 按需从上游 OpenAI 兼容端点拉取模型候选列表。
 package models

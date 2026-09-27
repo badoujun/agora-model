@@ -6,7 +6,7 @@
 
 .DESCRIPTION
   A) 单文件交付：三平台六份产物、格式与版本注入
-  B) 八条验收：零模板接入 / 双协议可用 / 模型聚合 / 长任务不中断 / 断连无泄漏 /
+  B) 八条验收：零模板接入 / 协议透传 / 模型选择 / 长任务不中断 / 断连无泄漏 /
      安全基线 / 可排查 / 单文件交付
   C) 性能：20 并发流式请求的成功率、耗时与内存稳定性
   D) 迁移演练：导出 → 在新数据目录的实例上导入 → Agent 可继续使用
@@ -169,9 +169,8 @@ $cfgA = Save-Text (Join-Path $tmp 'agora-p5-a.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": $Port, "sse_idle_seconds": 2, "max_body_bytes": 1048576 },
   "providers": [
-    { "id": "seed", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
-      "anthropic_base_url": "http://127.0.0.1:$MockPort/v1",
-      "api_key": "sk-seed-key", "models": ["mock-gpt-4o"], "priority": 50, "allow_internal": true }
+    { "id": "seed", "name": "seed", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+      "api_key": "sk-seed-key", "models": ["mock-gpt-4o"], "allow_internal": true }
   ]
 }
 "@
@@ -179,8 +178,8 @@ $cfgB = Save-Text (Join-Path $tmp 'agora-p5-b.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": $PortB },
   "providers": [
-    { "id": "placeholder", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
-      "api_key": "sk-placeholder", "models": ["mock-gpt-4o"], "priority": 60, "allow_internal": true }
+    { "id": "placeholder", "name": "placeholder", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+      "api_key": "sk-placeholder", "models": ["mock-gpt-4o"], "allow_internal": true }
   ]
 }
 "@
@@ -188,7 +187,7 @@ $cfgInternal = Save-Text (Join-Path $tmp 'agora-p5-internal.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": 19097 },
   "providers": [
-    { "id": "internal", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+    { "id": "internal", "name": "internal", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
       "api_key": "sk-x", "models": ["m"], "allow_internal": false }
   ]
 }
@@ -215,28 +214,29 @@ try {
 
     Write-Host '== B) PRD §7 八条验收 =='
 
-    # 1) 零模板接入：只给名称 + 双 URL + Key，不选任何模板
+    # 1) 零模板接入：只给名称 + URL + Key + 勾选模型，不选任何模板
     $create = Invoke-Http "$base/api/providers" -Method POST -HeaderArgs $json `
         -Body ('{"name":"验收供应商","openai_base_url":"http://127.0.0.1:' + $MockPort + '/v1",' +
-               '"anthropic_base_url":"http://127.0.0.1:' + $MockPort + '/v1",' +
-               '"api_key":"sk-acceptance-key","allow_internal":true,"priority":1}')
+               '"api_key":"sk-acceptance-key","models_selected":["mock-gpt-4o"],"allow_internal":true}')
     $providerId = ([regex]::Match($create.Body, '"id":"([^"]+)"')).Groups[1].Value
-    Assert-That '① 零模板接入：仅填双 URL + Key 即完成新增' ($create.Code -eq 201 -and $providerId -ne '') "code=$($create.Code)"
+    Assert-That '① 零模板接入：仅填 URL + Key + 勾选模型即完成新增' ($create.Code -eq 201 -and $providerId -ne '') "code=$($create.Code)"
 
-    # 2) 双协议可用
+    # 2) 协议透传
     $openai = Invoke-Http "$base/v1/chat/completions" -Method POST -HeaderArgs $auth `
         -Body '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}'
     $anthropic = Invoke-Http "$base/v1/messages" -Method POST -HeaderArgs $auth `
         -Body '{"model":"mock-claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
-    Assert-That '② 双协议可用：OpenAI 与 Anthropic 路径均 200' ($openai.Code -eq 200 -and $anthropic.Code -eq 200) "openai=$($openai.Code) anthropic=$($anthropic.Code)"
-    Assert-That '② 原生透传：响应体来自上游（含 mock 标记）' ($openai.Body -match 'mock' -and $anthropic.Body -match 'mock')
+    Assert-That '② 协议透传：/v1/chat/completions 返回 200' ($openai.Code -eq 200) "openai=$($openai.Code)"
+    Assert-That '② 原生透传：响应体来自上游（含 mock 标记）' ($openai.Body -match 'mock')
+    Assert-That '② Anthropic 路径已下线（404）' ($anthropic.Code -eq 404) "anthropic=$($anthropic.Code)"
 
-    # 3) 模型聚合
+    # 3) 模型选择
     $models = Invoke-Http "$base/v1/models" -HeaderArgs $auth
     $modelJson = $models.Body
     $dedup = ([regex]::Matches($modelJson, '"id":"mock-gpt-4o","object":"model","owned_by":"[^"]+"')).Count
-    Assert-That '③ /v1/models 返回聚合结果（含 owned_by）' ($models.Code -eq 200 -and $modelJson -match '"object":"list"' -and $modelJson -match '"owned_by"')
+    Assert-That '③ /v1/models 返回已勾选模型（含 owned_by）' ($models.Code -eq 200 -and $modelJson -match '"object":"list"' -and $modelJson -match '"owned_by"')
     Assert-That '③ 同名模型只出现一次裸名条目' ($dedup -eq 1) "出现次数=$dedup"
+    Assert-That '③ owned_by 为供应商名称' ($modelJson -match '"owned_by":"seed"')
 
     # 4) 长任务不中断（上游静默 20s，网关心跳兜底）
     $stream = Invoke-Http "$base/v1/chat/completions" -Method POST `
@@ -337,15 +337,13 @@ try {
     $importPayload = @{
         providers = @(
             @{
-                id                 = $first.id
-                name               = $first.name
-                openai_base_url    = $first.openai_base_url
-                anthropic_base_url = $first.anthropic_base_url
-                api_key            = 'sk-migrated-key'
-                models_manual      = @($first.models_manual)
-                auto_fetch_models  = $true
-                allow_internal     = $true
-                priority           = 1
+                id              = $first.id
+                name            = $first.name
+                openai_base_url = $first.openai_base_url
+                api_key         = 'sk-migrated-key'
+                models_selected = @($first.models_selected)
+                model_aliases   = @{}
+                allow_internal  = $true
             }
         )
     } | ConvertTo-Json -Depth 6 -Compress

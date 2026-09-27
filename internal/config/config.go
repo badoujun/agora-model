@@ -11,31 +11,18 @@ import (
 	"time"
 )
 
-// Protocol 标识入站与上游的协议风格。
-type Protocol string
+// ChatCompletionsPath 是网关对外暴露的端点（OpenAI 兼容协议）。
+const ChatCompletionsPath = "/v1/chat/completions"
 
-const (
-	// ProtocolOpenAI 对应 /v1/chat/completions。
-	ProtocolOpenAI Protocol = "openai"
-	// ProtocolAnthropic 对应 /v1/messages。
-	ProtocolAnthropic Protocol = "anthropic"
-)
+// ModelsPath 是网关对外暴露聚合模型列表的端点。
+const ModelsPath = "/v1/models"
 
-// Path 返回该协议在网关对外暴露的路径。
-func (p Protocol) Path() string {
-	switch p {
-	case ProtocolOpenAI:
-		return "/v1/chat/completions"
-	case ProtocolAnthropic:
-		return "/v1/messages"
-	}
-	return ""
-}
+// ProtocolName 是网关唯一对外协议的名称（OpenAI 兼容），用于请求日志展示。
+const ProtocolName = "openai"
 
 // 默认值与上限。
 const (
 	DefaultTimeoutSeconds = 120
-	DefaultPriority       = 100
 	DefaultSSEIdleSeconds = 15
 	DefaultMaxBodyBytes   = int64(16 << 20) // 16MB
 	DefaultListen         = "127.0.0.1"
@@ -49,70 +36,139 @@ var (
 	ErrNoProviders = errors.New("未配置任何启用的供应商（providers[].enabled 需为 true）")
 )
 
-// Provider 是一个上游供应商的接入配置。
+// Provider 是一个上游供应商的接入配置（OpenAI 兼容协议）。
 //
 // Phase 1 由 JSON 引导配置提供；Phase 2 起改由 SQLite 构建快照（字段语义不变）。
 type Provider struct {
-	ID                        string            `json:"id"`
-	Name                      string            `json:"name"`
-	OpenAIBaseURL             string            `json:"openai_base_url"`
-	AnthropicBaseURL          string            `json:"anthropic_base_url"`
-	OpenAIEndpointOverride    string            `json:"openai_endpoint_override"`
-	AnthropicEndpointOverride string            `json:"anthropic_endpoint_override"`
-	APIKey                    string            `json:"api_key"`
-	Models                    []string          `json:"models"`
-	Priority                  int               `json:"priority"`
-	TimeoutSeconds            int               `json:"timeout_seconds"`
-	ExtraHeaders              map[string]string `json:"extra_headers"`
-	ExtraBody                 map[string]any    `json:"extra_body"`
-	// AllowInternal 显式放行内网地址（本地 Ollama / vLLM 等），默认 false（DESIGN §7.7）。
-	AllowInternal bool `json:"allow_internal"`
-	// ModelsExcluded 是模型排除列表（Phase 3 聚合时生效）。
-	ModelsExcluded []string `json:"models_excluded"`
-	// AutoFetchModels 控制是否自动拉取模型列表，缺省为 true。
-	AutoFetchModels *bool `json:"auto_fetch_models"`
-	Enabled         *bool `json:"enabled"`
-}
-
-// FetchModels 报告是否允许自动拉取模型列表（缺省 true）。
-func (p *Provider) FetchModels() bool {
-	return p.AutoFetchModels == nil || *p.AutoFetchModels
+	ID                     string `json:"id"`
+	Name                   string `json:"name"`
+	OpenAIBaseURL          string `json:"openai_base_url"`
+	OpenAIEndpointOverride string `json:"openai_endpoint_override"`
+	APIKey                 string `json:"api_key"`
+	// Models 是**已启用**的上游模型名（在供应商编辑页从拉取结果中勾选），顺序即展示顺序。
+	Models []string `json:"models"`
+	// ModelAliases 把上游模型名映射为对外别名；别名即 Agent 请求时使用的模型名。
+	ModelAliases   map[string]string `json:"model_aliases"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+	ExtraHeaders   map[string]string `json:"extra_headers"`
+	ExtraBody      map[string]any    `json:"extra_body"`
+	AllowInternal  bool              `json:"allow_internal"`
+	Enabled        *bool             `json:"enabled"`
 }
 
 // IsEnabled 报告该供应商是否启用（缺省视为启用）。
 func (p *Provider) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
 
-// Endpoint 返回指定协议下的完整上游 URL；空字符串表示该协议未配置。
-func (p *Provider) Endpoint(proto Protocol) string {
-	switch proto {
-	case ProtocolOpenAI:
-		if u := strings.TrimSpace(p.OpenAIEndpointOverride); u != "" {
-			return u
-		}
-		if u := strings.TrimSpace(p.OpenAIBaseURL); u != "" {
-			return strings.TrimRight(u, "/") + "/chat/completions"
-		}
-	case ProtocolAnthropic:
-		if u := strings.TrimSpace(p.AnthropicEndpointOverride); u != "" {
-			return u
-		}
-		if u := strings.TrimSpace(p.AnthropicBaseURL); u != "" {
-			return strings.TrimRight(u, "/") + "/messages"
-		}
+// Endpoint 返回上游对话接口的完整 URL；空字符串表示未配置。
+func (p *Provider) Endpoint() string {
+	if u := strings.TrimSpace(p.OpenAIEndpointOverride); u != "" {
+		return u
+	}
+	if u := strings.TrimSpace(p.OpenAIBaseURL); u != "" {
+		return strings.TrimRight(u, "/") + "/chat/completions"
 	}
 	return ""
 }
 
-// KnowsModel 报告该供应商是否声明支持某模型。
-//
-// Phase 1 只看手动模型列表；Phase 3 起改为 (手动 ∪ 自动拉取) − 排除列表。
-func (p *Provider) KnowsModel(model string) bool {
+// ModelsEndpoint 返回上游模型列表接口的 URL；端点被覆盖或未配置 base URL 时返回空。
+func (p *Provider) ModelsEndpoint() string {
+	if strings.TrimSpace(p.OpenAIEndpointOverride) != "" {
+		// 覆盖了完整对话端点，无法可靠推导 /models 地址
+		return ""
+	}
+	base := strings.TrimRight(strings.TrimSpace(p.OpenAIBaseURL), "/")
+	if base == "" {
+		return ""
+	}
+	return base + "/models"
+}
+
+// ExposedModel 返回模型对外暴露的名称：配置了别名时用别名，否则用上游模型名。
+func (p *Provider) ExposedModel(model string) string {
+	if alias := strings.TrimSpace(p.ModelAliases[model]); alias != "" {
+		return alias
+	}
+	return model
+}
+
+// RealModel 把对外模型名（裸名或别名）解析为上游真实模型名。
+func (p *Provider) RealModel(exposed string) (string, bool) {
+	exposed = strings.TrimSpace(exposed)
+	if exposed == "" {
+		return "", false
+	}
 	for _, m := range p.Models {
-		if m == model {
-			return true
+		if p.ExposedModel(m) == exposed {
+			return m, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// KnowsModel 报告该供应商是否对外提供某模型（裸名或别名）。
+func (p *Provider) KnowsModel(exposed string) bool {
+	_, ok := p.RealModel(exposed)
+	return ok
+}
+
+// ExposedModels 返回该供应商对外暴露的模型名列表（保持勾选顺序）。
+func (p *Provider) ExposedModels() []string {
+	out := make([]string, 0, len(p.Models))
+	for _, m := range p.Models {
+		out = append(out, p.ExposedModel(m))
+	}
+	return out
+}
+
+// CleanSelection 规整模型选择与别名：去空白、去重，并丢弃未勾选模型的别名。
+func (p *Provider) CleanSelection() {
+	p.Models = cleanStrings(p.Models)
+	if len(p.ModelAliases) == 0 {
+		p.ModelAliases = nil
+		return
+	}
+	selected := make(map[string]bool, len(p.Models))
+	for _, m := range p.Models {
+		selected[m] = true
+	}
+	aliases := make(map[string]string, len(p.ModelAliases))
+	for model, alias := range p.ModelAliases {
+		model = strings.TrimSpace(model)
+		alias = strings.TrimSpace(alias)
+		if model == "" || alias == "" || !selected[model] {
+			continue
+		}
+		aliases[model] = alias
+	}
+	if len(aliases) == 0 {
+		p.ModelAliases = nil
+		return
+	}
+	p.ModelAliases = aliases
+}
+
+// ValidateModelSelection 校验勾选的模型与别名的合法性。
+func (p *Provider) ValidateModelSelection() error {
+	seen := make(map[string]string, len(p.Models))
+	for _, m := range p.Models {
+		exposed := p.ExposedModel(m)
+		key := normalizeName(exposed)
+		if key == "" {
+			return fmt.Errorf("供应商 %s 的模型名不能为空", p.displayRef())
+		}
+		if prev, dup := seen[key]; dup {
+			return fmt.Errorf("供应商 %s 的模型 %q 与 %q 对外名称重复（别名冲突）", p.displayRef(), m, prev)
+		}
+		seen[key] = m
+	}
+	return nil
+}
+
+func (p *Provider) displayRef() string {
+	if strings.TrimSpace(p.Name) != "" {
+		return strings.TrimSpace(p.Name)
+	}
+	return p.ID
 }
 
 // Timeout 返回上游请求超时。
@@ -198,16 +254,25 @@ func (f File) Normalize() (File, error) {
 	if f.Gateway.MaxBodyBytes <= 0 {
 		f.Gateway.MaxBodyBytes = DefaultMaxBodyBytes
 	}
-	seen := make(map[string]bool, len(f.Providers))
+	seenIDs := make(map[string]bool, len(f.Providers))
+	seenNames := make(map[string]string, len(f.Providers))
 	enabled := 0
 	for i := range f.Providers {
 		p := &f.Providers[i]
 		p.normalize(i)
-		if seen[p.ID] {
+		if seenIDs[p.ID] {
 			return File{}, fmt.Errorf("供应商 id 重复: %s", p.ID)
 		}
-		seen[p.ID] = true
+		seenIDs[p.ID] = true
+		key := normalizeName(p.Name)
+		if prev, dup := seenNames[key]; dup {
+			return File{}, fmt.Errorf("%w：%q 与 %s 重名", ErrProviderNameConflict, p.Name, prev)
+		}
+		seenNames[key] = p.Name
 		if err := p.validate(); err != nil {
+			return File{}, err
+		}
+		if err := p.ValidateModelSelection(); err != nil {
 			return File{}, err
 		}
 		if p.IsEnabled() {
@@ -218,6 +283,14 @@ func (f File) Normalize() (File, error) {
 		return File{}, ErrNoProviders
 	}
 	return f, nil
+}
+
+// ErrProviderNameConflict 表示供应商名称重复（名称即路由命名空间，必须唯一）。
+var ErrProviderNameConflict = errors.New("供应商名称重复")
+
+// normalizeName 归一化用于比较的名称：去首尾空白 + 忽略大小写。
+func normalizeName(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
 }
 
 // cleanStrings 去空白、去空项、去重，保持原有顺序。
@@ -244,9 +317,6 @@ func (p *Provider) normalize(idx int) {
 	if p.Name == "" {
 		p.Name = p.ID
 	}
-	if p.Priority == 0 {
-		p.Priority = DefaultPriority
-	}
 	if p.TimeoutSeconds <= 0 {
 		p.TimeoutSeconds = DefaultTimeoutSeconds
 	}
@@ -254,32 +324,27 @@ func (p *Provider) normalize(idx int) {
 		enabled := true
 		p.Enabled = &enabled
 	}
-	// 模型名与排除列表去空格、去重，保持顺序
-	p.Models = cleanStrings(p.Models)
-	p.ModelsExcluded = cleanStrings(p.ModelsExcluded)
+	// 模型名与别名去空格、去空项，保持顺序
+	p.CleanSelection()
 	p.OpenAIBaseURL = strings.TrimRight(strings.TrimSpace(p.OpenAIBaseURL), "/")
-	p.AnthropicBaseURL = strings.TrimRight(strings.TrimSpace(p.AnthropicBaseURL), "/")
 	p.OpenAIEndpointOverride = strings.TrimSpace(p.OpenAIEndpointOverride)
-	p.AnthropicEndpointOverride = strings.TrimSpace(p.AnthropicEndpointOverride)
 }
 
-// validate 做基础校验；SSRF 的 IP 段校验在 Phase 2（T2.5）补充。
+// validate 做基础校验；SSRF 的 IP 段校验在 store 保存时补充。
 func (p *Provider) validate() error {
 	for _, f := range []struct {
 		field string
 		value string
 	}{
 		{"openai_base_url", p.OpenAIBaseURL},
-		{"anthropic_base_url", p.AnthropicBaseURL},
 		{"openai_endpoint_override", p.OpenAIEndpointOverride},
-		{"anthropic_endpoint_override", p.AnthropicEndpointOverride},
 	} {
 		if err := validateUpstreamURL(f.value, "providers["+p.ID+"]."+f.field); err != nil {
 			return err
 		}
 	}
-	if p.Endpoint(ProtocolOpenAI) == "" && p.Endpoint(ProtocolAnthropic) == "" {
-		return fmt.Errorf("providers[%s] 至少需要配置一个协议地址（openai_base_url 或 anthropic_base_url）", p.ID)
+	if p.Endpoint() == "" {
+		return fmt.Errorf("providers[%s] 必须配置 openai_base_url 或 openai_endpoint_override", p.ID)
 	}
 	return nil
 }

@@ -14,34 +14,23 @@ import (
 func providerFor(id, upstreamURL string, models ...string) config.Provider {
 	enabled := true
 	return config.Provider{
-		ID:               id,
-		OpenAIBaseURL:    upstreamURL + "/v1",
-		AnthropicBaseURL: upstreamURL + "/v1",
-		APIKey:           "sk-up-" + id,
-		Models:           models,
-		Enabled:          &enabled,
+		ID:            id,
+		Name:          "供应商 " + id,
+		OpenAIBaseURL: upstreamURL + "/v1",
+		APIKey:        "sk-up-" + id,
+		Models:        models,
+		Enabled:       &enabled,
 	}
 }
 
-func TestTestBothProtocolsOK(t *testing.T) {
-	var (
-		gotOpenAIAuth    string
-		gotAnthropicKey  string
-		gotAnthropicVer  string
-		gotAnthropicPath string
-	)
+func TestTestModelsEndpointOK(t *testing.T) {
+	var gotAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
-			gotOpenAIAuth = r.Header.Get("Authorization")
+			gotAuth = r.Header.Get("Authorization")
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1"},{"id":"m2"}]}`))
-		case "/v1/messages":
-			gotAnthropicKey = r.Header.Get("x-api-key")
-			gotAnthropicVer = r.Header.Get("anthropic-version")
-			gotAnthropicPath = r.URL.Path
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"pong"}]}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -50,23 +39,11 @@ func TestTestBothProtocolsOK(t *testing.T) {
 
 	res := Test(context.Background(), providerFor("p1", upstream.URL, "m1"), &http.Client{Timeout: 5 * time.Second})
 
-	if !res.OpenAI.OK || res.OpenAI.ModelCount != 2 {
-		t.Fatalf("OpenAI 探测应成功并返回模型数，得到 %+v", res.OpenAI)
+	if !res.OK || res.ModelCount != 2 {
+		t.Fatalf("探测应成功并返回模型数，得到 %+v", res)
 	}
-	if gotOpenAIAuth != "Bearer sk-up-p1" {
-		t.Errorf("OpenAI 探测的 Authorization = %q", gotOpenAIAuth)
-	}
-	if !res.Anthropic.OK {
-		t.Fatalf("Anthropic 探测应成功，得到 %+v", res.Anthropic)
-	}
-	if gotAnthropicKey != "sk-up-p1" {
-		t.Errorf("Anthropic 探测的 x-api-key = %q", gotAnthropicKey)
-	}
-	if gotAnthropicVer == "" {
-		t.Error("Anthropic 探测应带 anthropic-version 头")
-	}
-	if gotAnthropicPath != "/v1/messages" {
-		t.Errorf("Anthropic 探测路径 = %q", gotAnthropicPath)
+	if gotAuth != "Bearer sk-up-p1" {
+		t.Errorf("Authorization = %q", gotAuth)
 	}
 	if res.CheckedAt.IsZero() {
 		t.Error("CheckedAt 应被填充")
@@ -90,27 +67,38 @@ func TestTestFallsBackToChatWhenModelsUnavailable(t *testing.T) {
 	defer upstream.Close()
 
 	res := Test(context.Background(), providerFor("p1", upstream.URL, "m1"), &http.Client{Timeout: 5 * time.Second})
-	if !res.OpenAI.OK {
-		t.Fatalf("应回退到最小对话探测并成功，得到 %+v", res.OpenAI)
+	if !res.OK {
+		t.Fatalf("应回退到最小对话探测并成功，得到 %+v", res)
 	}
 	if !chatCalled {
 		t.Fatal("/models 返回 404 后应尝试 /chat/completions")
 	}
+	if !strings.Contains(res.Message, "最小对话请求") {
+		t.Errorf("回退提示缺失: %q", res.Message)
+	}
 }
 
-func TestTestReportsMissingProtocols(t *testing.T) {
-	onlyOpenAI := config.Provider{
-		ID:            "p1",
-		OpenAIBaseURL: "http://127.0.0.1:1/v1",
-		APIKey:        "sk",
-		Models:        []string{"m"},
+func TestTestEndpointOverrideUsesChatProbe(t *testing.T) {
+	var chatCalled bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/custom/completions" {
+			chatCalled = true
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	p := config.Provider{
+		ID:                     "p1",
+		OpenAIEndpointOverride: upstream.URL + "/custom/completions",
+		APIKey:                 "sk-up",
+		Models:                 []string{"m1"},
 	}
-	res := Test(context.Background(), onlyOpenAI, &http.Client{Timeout: time.Second})
-	if res.Anthropic.OK {
-		t.Fatal("未配置 Anthropic 地址时该项应失败")
-	}
-	if !strings.Contains(res.Anthropic.Message, "未配置 Anthropic") {
-		t.Errorf("Anthropic 结果应说明未配置: %q", res.Anthropic.Message)
+	res := Test(context.Background(), p, &http.Client{Timeout: 5 * time.Second})
+	if !res.OK || !chatCalled {
+		t.Fatalf("端点覆盖模式应直接用最小对话探测，得到 %+v", res)
 	}
 }
 
@@ -121,25 +109,36 @@ func TestTestReportsUpstreamStatus(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// 只配了 OpenAI 地址，避免 Anthropic 侧的空模型提示干扰
 	p := config.Provider{ID: "p1", OpenAIBaseURL: upstream.URL + "/v1", APIKey: "sk-bad", Models: []string{"m"}}
 	res := Test(context.Background(), p, &http.Client{Timeout: 5 * time.Second})
-	if res.OpenAI.OK {
+	if res.OK {
 		t.Fatal("401 不应被视为成功")
 	}
-	if res.OpenAI.StatusCode != http.StatusUnauthorized {
-		t.Errorf("StatusCode = %d", res.OpenAI.StatusCode)
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("StatusCode = %d", res.StatusCode)
 	}
-	if !strings.Contains(res.OpenAI.Message, "401") {
-		t.Errorf("Message 应包含状态码: %q", res.OpenAI.Message)
+	if !strings.Contains(res.Message, "401") {
+		t.Errorf("Message 应包含状态码: %q", res.Message)
 	}
 }
 
 func TestTestWithoutModelsReportsHint(t *testing.T) {
-	// Anthropic 侧需要模型名才能探测
-	p := config.Provider{ID: "p1", AnthropicBaseURL: "http://127.0.0.1:1/v1", APIKey: "sk"}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	// 未勾选任何模型时无法做最小对话探测
+	p := config.Provider{ID: "p1", OpenAIBaseURL: upstream.URL + "/v1", APIKey: "sk"}
 	res := Test(context.Background(), p, &http.Client{Timeout: time.Second})
-	if res.Anthropic.OK || !strings.Contains(res.Anthropic.Message, "未配置任何模型") {
-		t.Fatalf("无模型时应给出提示，得到 %+v", res.Anthropic)
+	if res.OK || !strings.Contains(res.Message, "未勾选任何模型") {
+		t.Fatalf("无模型时应给出提示，得到 %+v", res)
+	}
+}
+
+func TestTestWithoutBaseURLReportsHint(t *testing.T) {
+	res := Test(context.Background(), config.Provider{ID: "p1", APIKey: "sk"}, &http.Client{Timeout: time.Second})
+	if res.OK || !strings.Contains(res.Message, "openai_base_url") {
+		t.Fatalf("未配置地址时应给出提示，得到 %+v", res)
 	}
 }

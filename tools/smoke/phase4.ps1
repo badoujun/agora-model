@@ -6,7 +6,7 @@
 
 .DESCRIPTION
   覆盖：内嵌前端可访问（index.html / assets 缓存头 / SPA fallback）、/api 与 /v1 未知路径不被前端路由吞掉、
-        健康检查与会话状态、模拟 Web UI 的操作序列（新增供应商 → 自动拉取模型 → 连接测试 →
+        健康检查与会话状态、模拟 Web UI 的操作序列（新增供应商 → 拉取并勾选模型 → 连接测试 →
         用新模型直接透传 → 日志可查 → 编辑保持凭证 → 删除）、以及设置 ADMIN_PASSWORD 后的登录流程。
 
 .EXAMPLE
@@ -128,9 +128,8 @@ $configA = Save-Text (Join-Path $tmp 'agora-p4-a.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": $Port, "sse_idle_seconds": 15, "max_body_bytes": 1048576 },
   "providers": [
-    { "id": "seed", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
-      "anthropic_base_url": "http://127.0.0.1:$MockPort/v1",
-      "api_key": "sk-seed-key", "models": ["mock-gpt-4o"], "priority": 50, "allow_internal": true }
+    { "id": "seed", "name": "seed", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+      "api_key": "sk-seed-key", "models": ["mock-gpt-4o"], "allow_internal": true }
   ]
 }
 "@
@@ -138,7 +137,7 @@ $configB = Save-Text (Join-Path $tmp 'agora-p4-b.json') @"
 {
   "gateway": { "listen": "127.0.0.1", "port": $AuthPort },
   "providers": [
-    { "id": "seed", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
+    { "id": "seed", "name": "seed", "openai_base_url": "http://127.0.0.1:$MockPort/v1",
       "api_key": "sk-seed-key", "models": ["mock-gpt-4o"], "allow_internal": true }
   ]
 }
@@ -198,22 +197,28 @@ try {
 
     $createBody = @"
 {"name":"界面新增供应商","openai_base_url":"http://127.0.0.1:$MockPort/v1",
- "anthropic_base_url":"http://127.0.0.1:$MockPort/v1",
- "api_key":"sk-ui-created-abcdefgh","models_manual":[],"auto_fetch_models":true,
- "priority":5,"timeout_seconds":60,"allow_internal":true,"enabled":true}
+ "api_key":"sk-ui-created-abcdefgh","models_selected":[],"timeout_seconds":60,
+ "allow_internal":true,"enabled":true}
 "@
     $created = Invoke-Http "$base/api/providers" -Method POST -Body $createBody -HeaderArgs @('-H', 'content-type: application/json')
     Assert-That 'POST /api/providers 创建成功（201）' ($created.Code -eq 201) "code=$($created.Code)"
     Assert-That '响应只回凭证掩码' ($created.Body -match '"api_key_hint":"sk-\*\*\*\*efgh"' -and $created.Body -notmatch 'sk-ui-created-abcdefgh')
     $newId = ([regex]::Match($created.Body, '"id":"([^"]+)"')).Groups[1].Value
-    Assert-That '创建后自动拉取模型（model_count > 0）' (($created.Body -match '"model_count":(\d+)') -and ([int]$Matches[1] -gt 0))
+    Assert-That '新建供应商默认没有已启用模型' ($created.Body -match '"model_count":0')
+
+    $fetched = Invoke-Http "$base/api/providers/$newId/fetch-models" -Method POST -HeaderArgs $authHeader
+    Assert-That '拉取模型接口返回上游候选列表' ($fetched.Code -eq 200 -and $fetched.Body -match '"candidate_models"') "code=$($fetched.Code)"
+
+    $selectBody = '{"name":"界面新增供应商","models_selected":["mock-deepseek-v3"],"allow_internal":true,"enabled":true}'
+    $selected = Invoke-Http "$base/api/providers/$newId" -Method PUT -Body $selectBody -HeaderArgs @('-H', 'content-type: application/json')
+    Assert-That '勾选模型后立即生效（model_count=1）' ($selected.Code -eq 200 -and $selected.Body -match '"model_count":1') "code=$($selected.Code)"
 
     $test = Invoke-Http "$base/api/providers/$newId/test" -Method POST -HeaderArgs $authHeader
-    Assert-That 'POST /api/providers/{id}/test 双协议探测通过' ($test.Code -eq 200 -and $test.Body -match '"ok":true')
+    Assert-That 'POST /api/providers/{id}/test 连接测试通过' ($test.Code -eq 200 -and $test.Body -match '"ok":true')
 
     $models = Invoke-Http "$base/api/models" -HeaderArgs $authHeader
-    Assert-That 'GET /api/models 含自动拉取到的模型' ($models.Body -match '"model":"mock-deepseek-v3"')
-    Assert-That 'GET /api/models 标注来源（auto/manual）' ($models.Body -match '"source":"manual"' -and $models.Body -match '"source":"auto"')
+    Assert-That 'GET /api/models 含勾选的模型' ($models.Body -match '"model":"mock-deepseek-v3"')
+    Assert-That 'GET /api/models 标注供应商名称' ($models.Body -match '"provider_name":"界面新增供应商"')
 
     $chatBody = '{"model":"mock-deepseek-v3","messages":[{"role":"user","content":"hi"}]}'
     $chat = Invoke-Http "$base/v1/chat/completions" -Method POST -Body $chatBody -HeaderArgs $authHeader

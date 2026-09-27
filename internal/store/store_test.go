@@ -54,20 +54,36 @@ func newTestStore(t *testing.T) (*Store, []byte) {
 
 func sampleProvider(id string) config.Provider {
 	enabled := true
-	autoFetch := true
 	return config.Provider{
-		ID:               id,
-		Name:             "供应商 " + id,
-		OpenAIBaseURL:    "https://api.example.com/v1",
-		AnthropicBaseURL: "https://api.example.com",
-		APIKey:           "sk-secret-" + id,
-		Models:           []string{"m1", "m2"},
-		Priority:         10,
-		TimeoutSeconds:   60,
-		AllowInternal:    true, // 测试跳过 DNS/IP 校验，SSRF 单测另行覆盖
-		AutoFetchModels:  &autoFetch,
-		Enabled:          &enabled,
+		ID:             id,
+		Name:           "供应商 " + id,
+		OpenAIBaseURL:  "https://api.example.com/v1",
+		APIKey:         "sk-secret-" + id,
+		Models:         []string{"m1", "m2"},
+		ModelAliases:   map[string]string{"m1": "别名一"},
+		TimeoutSeconds: 60,
+		AllowInternal:  true, // 测试跳过 DNS/IP 校验，SSRF 单测另行覆盖
+		Enabled:        &enabled,
 	}
+}
+
+// tableColumns 返回某张表的列名集合。
+func tableColumns(t *testing.T, st *Store, table string) map[string]bool {
+	t.Helper()
+	rows, err := st.DB().QueryContext(context.Background(), `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		t.Fatalf("读取 %s 表结构失败: %v", table, err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		cols[name] = true
+	}
+	return cols
 }
 
 func TestOpenIsIdempotentAndMigrates(t *testing.T) {
@@ -104,6 +120,66 @@ func TestOpenIsIdempotentAndMigrates(t *testing.T) {
 	}
 }
 
+func TestMigrationV3MigratesLegacyProviders(t *testing.T) {
+	path := tempDBPath(t)
+	ctx := context.Background()
+
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// 回退到 v2 结构，模拟升级前的数据库
+	for _, table := range []string{"providers", "gateway_keys", "model_cache", "logs", "settings"} {
+		if _, err := st.DB().ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, stmt := range append(append([]string{}, schemaV1...), schemaV2...) {
+		if _, err := st.DB().ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("重建 v2 结构失败: %v（%s）", err, stmt)
+		}
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO providers (id, name, openai_base_url, api_key_cipher, api_key_hint,
+			models_manual_json, models_excluded_json, created_at, updated_at)
+		 VALUES ('legacy', '旧供应商', 'https://api.example.com/v1', x'00', 'sk-****',
+			'["m1","m2"]', '["m2"]', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("迁移 v3 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	rec, err := reopened.GetProvider(ctx, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.ModelsSelected) != 2 || rec.ModelsSelected[0] != "m1" || rec.ModelsSelected[1] != "m2" {
+		t.Fatalf("旧的手动模型应迁移为已勾选模型，得到 %v", rec.ModelsSelected)
+	}
+
+	cols := tableColumns(t, reopened, "providers")
+	for _, gone := range []string{"anthropic_base_url", "anthropic_endpoint_override", "models_manual_json", "models_excluded_json", "auto_fetch_models", "priority"} {
+		if cols[gone] {
+			t.Errorf("旧列 %s 应已被删除", gone)
+		}
+	}
+	for _, want := range []string{"models_selected_json", "models_alias_json", "last_fetch_at", "last_fetch_error"} {
+		if !cols[want] {
+			t.Errorf("providers 表缺少字段 %s", want)
+		}
+	}
+}
+
 func TestProviderRoundTripStoresCiphertext(t *testing.T) {
 	st, master := newTestStore(t)
 	ctx := context.Background()
@@ -118,8 +194,8 @@ func TestProviderRoundTripStoresCiphertext(t *testing.T) {
 	if strings.Contains(string(saved.APIKeyCipher), "sk-secret-p1") {
 		t.Fatal("落库的凭证必须是密文")
 	}
-	if saved.AutoFetchModels != true || !saved.Enabled {
-		t.Errorf("布尔字段落库异常: auto=%v enabled=%v", saved.AutoFetchModels, saved.Enabled)
+	if !saved.Enabled {
+		t.Error("enabled 字段落库异常")
 	}
 
 	providers, err := st.LoadProviders(ctx, master)
@@ -133,11 +209,17 @@ func TestProviderRoundTripStoresCiphertext(t *testing.T) {
 	if got.APIKey != "sk-secret-p1" {
 		t.Errorf("解密后凭证 = %q", got.APIKey)
 	}
-	if got.Name != "供应商 p1" || len(got.Models) != 2 || got.Priority != 10 {
+	if got.Name != "供应商 p1" || len(got.Models) != 2 {
 		t.Errorf("字段往返异常: %+v", got)
 	}
-	if got.Endpoint(config.ProtocolOpenAI) != "https://api.example.com/v1/chat/completions" {
-		t.Errorf("endpoint = %q", got.Endpoint(config.ProtocolOpenAI))
+	if got.ModelAliases["m1"] != "别名一" {
+		t.Errorf("别名往返异常: %#v", got.ModelAliases)
+	}
+	if got.Endpoint() != "https://api.example.com/v1/chat/completions" {
+		t.Errorf("endpoint = %q", got.Endpoint())
+	}
+	if got.ModelsEndpoint() != "https://api.example.com/v1/models" {
+		t.Errorf("models endpoint = %q", got.ModelsEndpoint())
 	}
 }
 
@@ -174,6 +256,36 @@ func TestSaveProviderRejectsInternalURLWithoutAllow(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "内网") {
 		t.Errorf("错误信息应说明内网地址被拒: %v", err)
+	}
+}
+
+func TestListProvidersOrderedByName(t *testing.T) {
+	st, master := newTestStore(t)
+	ctx := context.Background()
+
+	for _, p := range []config.Provider{
+		{ID: "b", Name: "Beta", OpenAIBaseURL: "https://b.example/v1", APIKey: "sk-b", AllowInternal: true},
+		{ID: "a", Name: "Alpha", OpenAIBaseURL: "https://a.example/v1", APIKey: "sk-a", AllowInternal: true},
+		{ID: "c", Name: "Gamma", OpenAIBaseURL: "https://c.example/v1", APIKey: "sk-c", AllowInternal: true},
+	} {
+		if _, err := st.SaveProvider(ctx, master, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	records, err := st.ListProviders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(records))
+	for _, rec := range records {
+		got = append(got, rec.Name)
+	}
+	want := []string{"Alpha", "Beta", "Gamma"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("顺序 = %v, 期望 %v", got, want)
+		}
 	}
 }
 
@@ -298,10 +410,10 @@ func TestLogsInsertQueryRedactAndPrune(t *testing.T) {
 	ctx := context.Background()
 
 	entries := []logging.Entry{
-		{TS: time.Now().UTC(), RequestID: "r1", InboundProtocol: "openai", Model: "m1", StatusCode: 200, LatencyMS: 12},
-		{TS: time.Now().UTC(), RequestID: "r2", InboundProtocol: "anthropic", Model: "m2", StatusCode: 404, LatencyMS: 3,
+		{TS: time.Now().UTC(), RequestID: "r1", InboundProtocol: "openai", Model: "GPT-4O", StatusCode: 200, LatencyMS: 12},
+		{TS: time.Now().UTC(), RequestID: "r2", InboundProtocol: "openai", Model: "claude-3-5", StatusCode: 404, LatencyMS: 3,
 			ErrorMsg: "上游拒绝：authorization=Bearer sk-leaked-secret-value"},
-		{TS: time.Now().UTC(), RequestID: "r3", InboundProtocol: "openai", Model: "m1", StatusCode: 504, LatencyMS: 1000, Stream: true},
+		{TS: time.Now().UTC(), RequestID: "r3", InboundProtocol: "openai", Model: "gpt-4o-mini", StatusCode: 504, LatencyMS: 1000, Stream: true},
 	}
 	if err := st.InsertLogs(ctx, entries); err != nil {
 		t.Fatalf("InsertLogs: %v", err)
@@ -326,6 +438,33 @@ func TestLogsInsertQueryRedactAndPrune(t *testing.T) {
 		}
 	}
 
+	// 模型筛选：忽略大小写的模糊匹配
+	for _, kw := range []string{"gpt-4o", "GPT", "-4O", "claude"} {
+		hits, err := st.QueryLogs(ctx, LogFilter{Model: kw})
+		if err != nil {
+			t.Fatalf("QueryLogs(%q): %v", kw, err)
+		}
+		if kw == "claude" {
+			if len(hits) != 1 || hits[0].Model != "claude-3-5" {
+				t.Fatalf("模型筛选 %q 命中 %d 条, 期望 1", kw, len(hits))
+			}
+			continue
+		}
+		if len(hits) != 2 {
+			t.Fatalf("模型筛选 %q 命中 %d 条, 期望 2（GPT-4O 与 gpt-4o-mini）", kw, len(hits))
+		}
+	}
+	if hits, _ := st.QueryLogs(ctx, LogFilter{Model: "不存在"}); len(hits) != 0 {
+		t.Fatalf("无关关键词不应命中，实际 %d 条", len(hits))
+	}
+	// LIKE 通配符按字面匹配
+	if hits, _ := st.QueryLogs(ctx, LogFilter{Model: "%"}); len(hits) != 0 {
+		t.Fatalf("%% 应按字面匹配，实际 %d 条", len(hits))
+	}
+	if hits, _ := st.QueryLogs(ctx, LogFilter{Model: "gpt_4o"}); len(hits) != 0 {
+		t.Fatalf("_ 应按字面匹配，实际 %d 条", len(hits))
+	}
+
 	if _, err := st.PruneLogs(ctx, 2); err != nil {
 		t.Fatalf("PruneLogs: %v", err)
 	}
@@ -334,22 +473,10 @@ func TestLogsInsertQueryRedactAndPrune(t *testing.T) {
 	}
 }
 
-func TestLogsSchemaDropAndRecreateUnsuitableColumns(t *testing.T) {
+func TestLogsSchemaColumns(t *testing.T) {
 	// 保证 logs 表包含 first_byte_ms / stream 等字段（防止 DDL 漂移）
 	st, _ := newTestStore(t)
-	rows, err := st.DB().QueryContext(context.Background(), `SELECT name FROM pragma_table_info('logs')`)
-	if err != nil {
-		t.Fatalf("读取表结构失败: %v", err)
-	}
-	defer rows.Close()
-	cols := map[string]bool{}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
-		cols[name] = true
-	}
+	cols := tableColumns(t, st, "logs")
 	for _, want := range []string{"first_byte_ms", "stream", "error_msg", "client_ip", "provider_id"} {
 		if !cols[want] {
 			t.Errorf("logs 表缺少字段 %s", want)
@@ -357,29 +484,7 @@ func TestLogsSchemaDropAndRecreateUnsuitableColumns(t *testing.T) {
 	}
 }
 
-func TestProviderFetchStatusColumnsAfterMigration(t *testing.T) {
-	st, _ := newTestStore(t)
-	rows, err := st.DB().QueryContext(context.Background(), `SELECT name FROM pragma_table_info('providers')`)
-	if err != nil {
-		t.Fatalf("读取表结构失败: %v", err)
-	}
-	defer rows.Close()
-	cols := map[string]bool{}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
-		cols[name] = true
-	}
-	for _, want := range []string{"last_fetch_at", "last_fetch_error"} {
-		if !cols[want] {
-			t.Errorf("providers 表缺少迁移 v2 引入的字段 %s", want)
-		}
-	}
-}
-
-func TestModelCacheReplaceLoadAndFetchError(t *testing.T) {
+func TestCandidateModelsReplaceLoadAndFetchError(t *testing.T) {
 	st, master := newTestStore(t)
 	ctx := context.Background()
 
@@ -391,37 +496,29 @@ func TestModelCacheReplaceLoadAndFetchError(t *testing.T) {
 	}
 
 	fetchedAt := time.Now().UTC().Truncate(time.Second)
-	if err := st.ReplaceModelCache(ctx, "p1", []string{"m1", "m2"}, fetchedAt); err != nil {
-		t.Fatalf("ReplaceModelCache: %v", err)
+	if err := st.ReplaceCandidateModels(ctx, "p1", []string{"m1", "m2"}, fetchedAt); err != nil {
+		t.Fatalf("ReplaceCandidateModels: %v", err)
 	}
 
-	models, at, err := st.LoadModelCache(ctx, "p1")
+	models, at, err := st.LoadCandidateModels(ctx, "p1")
 	if err != nil {
-		t.Fatalf("LoadModelCache: %v", err)
+		t.Fatalf("LoadCandidateModels: %v", err)
 	}
 	if len(models) != 2 || models[0] != "m1" || models[1] != "m2" {
-		t.Fatalf("模型缓存 = %v", models)
+		t.Fatalf("候选缓存 = %v", models)
 	}
 	if !at.Equal(fetchedAt) {
 		t.Errorf("fetched_at = %v, 期望 %v", at, fetchedAt)
 	}
-
-	all, err := st.LoadAllModelCache(ctx)
-	if err != nil {
-		t.Fatalf("LoadAllModelCache: %v", err)
-	}
-	if len(all["p1"]) != 2 {
-		t.Errorf("批量读取结果 = %v", all)
-	}
-	if _, ok := all["p2"]; ok {
-		t.Error("未拉取的供应商不应出现在缓存中")
+	if got, _, _ := st.LoadCandidateModels(ctx, "p2"); len(got) != 0 {
+		t.Errorf("未拉取的供应商不应有候选缓存: %v", got)
 	}
 
 	// 覆盖式替换：旧模型应被清掉
-	if err := st.ReplaceModelCache(ctx, "p1", []string{"m3"}, time.Now().UTC()); err != nil {
+	if err := st.ReplaceCandidateModels(ctx, "p1", []string{"m3"}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	models, _, _ = st.LoadModelCache(ctx, "p1")
+	models, _, _ = st.LoadCandidateModels(ctx, "p1")
 	if len(models) != 1 || models[0] != "m3" {
 		t.Fatalf("替换后缓存 = %v", models)
 	}
@@ -438,7 +535,7 @@ func TestModelCacheReplaceLoadAndFetchError(t *testing.T) {
 		t.Errorf("last_fetch_error = %q", rec.LastFetchError)
 	}
 
-	if err := st.ReplaceModelCache(ctx, "p1", []string{"m4"}, time.Now().UTC()); err != nil {
+	if err := st.ReplaceCandidateModels(ctx, "p1", []string{"m4"}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	rec, _ = st.GetProvider(ctx, "p1")
@@ -458,12 +555,13 @@ func TestSaveProviderPreservesFetchStatus(t *testing.T) {
 	if _, err := st.SaveProvider(ctx, master, p); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ReplaceModelCache(ctx, "p1", []string{"cached-model"}, time.Now().UTC()); err != nil {
+	if err := st.ReplaceCandidateModels(ctx, "p1", []string{"cached-model"}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
 	// 再次保存（例如 Web UI 改了名称）不应清空拉取状态
 	p.Name = "改名后的供应商"
+	p.Models = []string{"m3"}
 	if _, err := st.SaveProvider(ctx, master, p); err != nil {
 		t.Fatal(err)
 	}
@@ -476,5 +574,11 @@ func TestSaveProviderPreservesFetchStatus(t *testing.T) {
 	}
 	if rec.Name != "改名后的供应商" {
 		t.Errorf("Name = %q", rec.Name)
+	}
+	if len(rec.ModelsSelected) != 1 || rec.ModelsSelected[0] != "m3" {
+		t.Errorf("勾选模型应被更新: %v", rec.ModelsSelected)
+	}
+	if got, _, _ := st.LoadCandidateModels(ctx, "p1"); len(got) != 1 || got[0] != "cached-model" {
+		t.Errorf("候选缓存不应被 SaveProvider 影响: %v", got)
 	}
 }

@@ -6,20 +6,19 @@
 - 痛点 A（横向）：每出现一个新的 AI Agent，就要在 CC Switch 之类的工具里为它单独配置供应商。
 - 痛点 B（纵向）：每接入一个新供应商，就要给**每一个** Agent 重复配置一遍（N×M 重复劳动）。
 - AgoraModel 的做法：**把供应商配置与 Agent 配置解耦**。所有 Agent 只对接网关
-  （一个 Base URL + 一个 Key），由网关按协议与模型名路由到任意供应商。
+  （一个 Base URL + 一个 Key），由网关按模型名路由到任意供应商。
 
 ```
-Agent（Claude Code / Codex / Cursor / 任意支持自定义 Base URL 的工具）
-        │  ANTHROPIC_BASE_URL / OPENAI_BASE_URL 指向同一个网关
+Agent（Codex / Cursor / 任意支持自定义 Base URL 的工具）
+        │  OPENAI_BASE_URL 指向同一个网关
         ▼
    AgoraModel 网关（单可执行文件）
-   ├─ /v1/messages          ← Anthropic 协议，原样透传
-   ├─ /v1/chat/completions  ← OpenAI 协议，原样透传
-   ├─ /v1/models            ← 聚合后的模型列表（含 provider/model 命名空间）
+   ├─ /v1/chat/completions  ← OpenAI 兼容协议，原样透传
+   ├─ /v1/models            ← 已启用模型列表（含 供应商名/模型名 命名空间）
    └─ Web 控制台            ← 供应商 / 模型 / 设置 / 日志
         │
         ▼
-   供应商 A（OpenAI URL + Anthropic URL + 1 个 Key）
+   供应商 A（OpenAI 兼容 URL + 1 个 Key）
    供应商 B（…）  供应商 C（…）
 ```
 
@@ -27,13 +26,13 @@ Agent（Claude Code / Codex / Cursor / 任意支持自定义 Base URL 的工具�
 
 | 能力 | 说明 |
 | --- | --- |
-| **零模板接入** | 不预设供应商类型：填「名称 + 两个协议地址 + API Key」即可，无需选择模板或改代码 |
-| **双协议原生透传** | 同时对外提供 OpenAI 与 Anthropic 两套接口，**不做格式转换**，流式响应逐字节透传 |
-| **模型聚合** | 定时从各供应商 `/models` 拉取并聚合，`/v1/models` 同时给出裸名与 `provider/model` |
-| **显式路由** | 裸模型名按优先级选默认供应商；`provider/model` 可强制指定供应商 |
+| **零模板接入** | 不预设供应商类型：填「名称 + OpenAI 兼容地址 + API Key」即可，无需选择模板或改代码 |
+| **协议原生透传** | 对外提供 OpenAI 兼容接口，**不做格式转换**，流式响应逐字节透传 |
+| **模型选择** | 在供应商编辑页一键拉取上游 `/models`，勾选要启用的模型，并可为每个模型设置别称 |
+| **显式路由** | 裸模型名按供应商名称升序选默认供应商；`供应商名/模型名` 可强制指定供应商 |
 | **单文件交付** | 前端内嵌，无运行时依赖（无 JVM/Node/libc 要求），Windows / Linux / macOS 各一份 |
 | **安全默认** | 仅监听本机回环；供应商凭证 AES-256-GCM 加密落库；SSRF 校验；日志脱敏 |
-| **可排查** | 请求日志页可按状态码/模型/供应商筛选，明确区分「Agent 发错了」与「上游拒了」 |
+| **可排查** | 请求日志页可按状态码/模型（模糊匹配，忽略大小写）/供应商筛选，明确区分「Agent 发错了」与「上游拒了」 |
 
 ## 快速开始
 
@@ -68,16 +67,12 @@ pwsh -File build.ps1 -Target dist   # Windows
 ### 3. 让 Agent 接入
 
 ```bash
-# Anthropic 协议（Claude Code 等）
-export ANTHROPIC_BASE_URL=http://127.0.0.1:9090
-export ANTHROPIC_API_KEY=gw-你的网关Key
-
 # OpenAI 协议（Codex / Cursor / 任意 OpenAI 兼容工具）
 export OPENAI_BASE_URL=http://127.0.0.1:9090/v1
 export OPENAI_API_KEY=gw-你的网关Key
 ```
 
-新增供应商后无需重启：所有 Agent 的后续请求立即按新配置路由。
+新增供应商后无需重启：所有 Agent 的后续请求立即按新配置路由（在供应商编辑页拉取并勾选模型后即可使用）。
 
 ## 启动参数与环境变量
 
@@ -147,10 +142,10 @@ WantedBy=multi-user.target
 
 | 页面 | 用途 |
 | --- | --- |
-| 供应商管理 | 列表 / 新增 / 编辑 / 删除、**连接测试**（双协议）、**拉取模型**、启用停用、优先级 |
-| 模型列表 | 聚合结果（裸名与 `provider/model` 视图切换）、来源标注、手动增删、全量刷新 |
-| 网关设置 | 网关 Key（掩码 / 重置）、Agent 环境变量片段一键复制、模型刷新间隔、成功日志开关 |
-| 请求日志 | 按状态码 / 模型 / 供应商 / 仅失败筛选，分页与错误展开，可 5 秒自动刷新 |
+| 供应商管理 | 列表 / 新增 / 编辑 / 删除、**连接测试**、**拉取模型并勾选（可设别称）**、启用停用 |
+| 模型列表 | 已启用模型的对外名与上游名对照、来源供应商、默认路由标注、搜索 |
+| 网关设置 | 网关 Key（掩码 / 重置）、Agent 环境变量片段一键复制、成功日志开关 |
+| 请求日志 | 按状态码 / 模型（模糊匹配，忽略大小写）/ 供应商 / 仅失败筛选，分页与错误展开，可 5 秒自动刷新 |
 | 登录页 | 仅当设置了 `ADMIN_PASSWORD` 时出现 |
 
 ## 反向代理（如需 HTTPS 或远程访问）
@@ -174,14 +169,18 @@ location / {
 ## 常见问题
 
 **Q：上游 `/models` 不可用，模型列表是空的？**
-在供应商的「手动模型」里填写模型名；或在高级选项里设置端点覆盖。手动模型始终生效，并可配置「排除模型」。
+在供应商编辑页点「拉取模型」获取候选；若上游没有该接口，可在「OpenAI 端点覆盖」里填完整地址（此时无法拉取，需要上游提供 `/models` 才能勾选模型）。
 
 **Q：添加供应商时报“解析到内网或回环地址”？**
 这是 SSRF 防护。确实要接入本机 Ollama / 公司内网服务时，打开该供应商的「允许内网地址」。
 
 **Q：模型不出现 / 拉取失败？**
 供应商的 `openai_base_url` 需要指向能提供 `/models` 的端点（自动补 `/models`）。
-失败原因会写在供应商列表的「最近拉取」与 Web UI 中，且**不会清空上一次的缓存**。
+失败原因会写在供应商列表的「最近拉取」与 Web UI 中，且**不会清空上一次的候选列表**。
+
+**Q：多个供应商有同名模型，请求会走哪一个？**
+裸模型名按供应商名称升序选第一个提供该模型的供应商；需要指定时用 `供应商名/模型名`。
+为模型配置了别称后，别称就是对外模型名（原名不再对外暴露），网关转发前会自动换回上游真实模型名。
 
 **Q：换了一台机器要重新配置吗？**
 不需要。复制 `agora.db` + `master.key`（或在新机器上用 `GW_MASTER_KEY`），
@@ -208,10 +207,11 @@ go test ./... -count=1                    # 单元测试
 go vet ./... && gofmt -l cmd internal      # 静态检查
 
 # 端到端冒烟（会自行构建前端与二进制）
-pwsh -File tools/smoke/phase1.ps1   # 双协议透传、SSE 心跳、取消、错误码
+pwsh -File tools/smoke/phase1.ps1   # OpenAI 协议透传、SSE 心跳、取消、错误码
 pwsh -File tools/smoke/phase2.ps1   # 持久化、加密、网关 Key 生命周期、SSRF
-pwsh -File tools/smoke/phase3.ps1   # 模型聚合、命名空间路由
+pwsh -File tools/smoke/phase3.ps1   # 模型拉取与勾选、供应商名命名空间路由、模型别名
 pwsh -File tools/smoke/phase4.ps1   # Web UI 与 API 全流程、登录模式
+pwsh -File tools/smoke/phase5.ps1   # PRD 八条验收、性能冒烟、迁移演练
 
 # 本地 mock 上游（冒烟脚本会自动启动；也可单独用于调试）
 node tools/mock-upstream/server.mjs
@@ -226,7 +226,7 @@ internal/config     配置模型与不可变快照
 internal/crypto     AES-256-GCM 与主密钥
 internal/gateway    数据面透传（/v1/*，SSE 保活与取消）
 internal/logging    请求日志异步批量写入与脱敏
-internal/models     模型聚合
+internal/models     模型候选列表拉取（/models）
 internal/platform   跨平台数据目录
 internal/provider   供应商连接测试
 internal/route      模型名路由（含命名空间）
