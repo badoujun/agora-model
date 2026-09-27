@@ -274,7 +274,7 @@ func (g *Gateway) handler(proto config.Protocol) http.HandlerFunc {
 
 		if isEventStream(resp) {
 			streamServed = true
-			stats, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle())
+			stats, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle(), started)
 			g.logCompletion(requestID, proto, model, decision, resp.StatusCode, started, stats, serr)
 			return
 		}

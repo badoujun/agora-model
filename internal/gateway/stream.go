@@ -20,7 +20,7 @@ type readChunk struct {
 
 type streamStats struct {
 	bytes       int64
-	firstByteIn time.Duration // 从开始转发到写出第一个数据块的耗时
+	firstByteIn time.Duration // 从入站请求开始到写出第一个数据块的耗时
 }
 
 // pumpUpstream 把上游字节搬进 channel。
@@ -53,9 +53,14 @@ func pumpUpstream(ctx context.Context, body io.ReadCloser, out chan<- readChunk)
 
 // streamResponse 透传 SSE 响应，并在空闲超过 idle 时注入心跳注释行。
 //
+// started 是入站请求的起始时刻。首字节延迟以它为起点，才包含「读请求体 + 路由 +
+// 上游往返」这整段，从而把「上游慢」与「网关慢」区分开（DESIGN §7.4 第 5 条）；
+// 若以本函数内的时刻为起点，`http.Client.Do` 返回时首批 body 字节往往已在本地
+// 缓冲中，读数会恒为 0，该指标随即失去意义。
+//
 // 退出保证：无论主循环因何退出（客户端断开、写失败、上游结束），
 // defer cancel() + defer resp.Body.Close() 都会让读协程结束，不留下阻塞的 goroutine。
-func streamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, idle time.Duration) (streamStats, error) {
+func streamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, idle time.Duration, started time.Time) (streamStats, error) {
 	var stats streamStats
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -74,7 +79,6 @@ func streamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Respo
 	chunks := make(chan readChunk, 16)
 	go pumpUpstream(ctx, resp.Body, chunks)
 
-	started := time.Now()
 	ticker := time.NewTicker(idle)
 	defer ticker.Stop()
 
