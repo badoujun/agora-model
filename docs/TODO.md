@@ -303,10 +303,48 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 - [x] **T5.6｜导出/导入与迁移演练** ｜ 2h ｜ 依赖 T5.1
   - `/api/export`、`/api/import`；演练换机：导出 → 新机导入 → Agent 连接成功。
   - **验收**：导出文件不含明文 Key（对应 PRD 场景 S3）。
+  - **第 11 轮修订（用户要求）**：导出改为**包含 API Key 明文**，导入时用目标机器的主密钥重新加密；
+    验收更新为「导出（含明文）→ 新机导入 → Agent 直接可用」，页面导出前二次确认并提示按凭证保管。
+    同时新增迁移 v4（`providers.website_url`、`gateway_keys.key_cipher`）与控制台改动：
+    左上角显示程序版本号、供应商官网地址、新增供应商时保存与拉取模型解耦、网关 Key 明文可查看/复制、新增「数据位置」页。
+    配套：冒烟脚本断言随新行为同步（`phase2.ps1` 22 项、`phase4.ps1` 31 项、`phase5.ps1` 29 项，含「导出含明文」「网关 Key 可复制」「数据库无明文 Key」新增断言），五个冒烟脚本全部通过。
 - [x] **T5.7｜服务化集成（`kardianos/service`）** ｜ 3h ｜ 依赖 T5.1
   - 内建 `install / uninstall / start / stop / restart / status` 子命令；`Service.Stop()` 接入优雅关闭（`http.Server.Shutdown` → flush 日志批次 → SQLite checkpoint 与关闭）。
   - 三平台验证：Windows SCM、Linux systemd、macOS launchd；确认服务模式下日志落文件、重启自动恢复、停止时不丢日志。
   - **验收**：三平台均可 `install → start → 压一次 → stop → uninstall` 走通；`stop` 后无 WAL 残留异常、日志完整。
+- [x] **T5.7b｜服务化健壮性补齐** ｜ 2h ｜ 依赖 T5.7
+  - `--log-file`（PRD FR-11.4 的「服务模式日志落文件」此前未实现，`newLogger` 硬编码 stdout；Windows SCM 下 stdout 直接被丢弃）。
+  - `install` 固化绝对 `--data-dir`：服务账户与前台运行不同（Windows SCM 默认 `LocalSystem`），原先缺省时不写入该参数，导致数据落到 `…\systemprofile\AppData\Roaming\AgoraModel`。
+  - `service.Config.Executable` 指向 `<数据目录>/bin/` 下的二进制副本：原实现走 `os.Executable()`，在 npm / npx 场景指向会被整体删除重建的缓存目录。
+  - `--service-env KEY=VALUE` 注入 `service.Config.EnvVars`（此前 `EnvVars`/`UserName`/`WorkingDirectory` 三个字段均未使用，无法注入 `ADMIN_PASSWORD` / `GW_MASTER_KEY`）。
+  - 幂等安装（已存在则先 Stop + Uninstall 再 Install）、权限类失败的人话提示、子命令参数两种位置都支持。
+  - 服务化逻辑集中到 `internal/platform`（符合 DESIGN §12「平台差异集中在 platform 包」）。
+  - **实测（Windows）**：`go test ./... -count=1` 全绿；`internal/platform` 新增 16 个测试函数（共 35 个通过点）；`--version` 正常；`install --data-dir X` 复制副本并给出权限提示（非管理员下未误注册服务）；`--log-file` 前台落盘、`/healthz` 200。
+  - **未实测**：三平台实机 `install → start`（需管理员 / root 环境）、服务模式下的日志与优雅关闭。
+- [x] **T5.8｜npm 分发** ｜ 3h ｜ 依赖 T5.7
+  - `npm/` 目录：主包 `@bakeroot/agoramodel`（Node 转发器）+ 6 个平台包 `@bakeroot/agoramodel-<os>-<cpu>`（各含一个预编译二进制）。
+  - 平台包用 `os` / `cpu` 字段经 `optionalDependencies` 在**安装期**筛选，**不使用 postinstall**（npm 11+ 默认不执行依赖脚本，postinstall 方案会静默失败）；包内不含任何 `scripts`。
+  - **自写 tar 打包**（`npm/scripts/tarball.mjs`）而不调 `npm pack`：Windows 上 `fs.chmod()` 是空操作（实测 mode 恒为 666），npm pack 出来的 Linux / macOS 平台包里二进制是 644、装完无法执行；且 Windows 调 npm CLI 必须经 shell，Node 24 会报 DEP0190。自写后在 tar 头里直接写 0755。
+  - `publish.mjs` 默认发官方 registry（不沿用 `npm config get registry`——本机即为只读镜像 `registry.npmmirror.com`），先发平台包再发主包，`--tag` / `--otp` / `--registry` 经白名单校验后才拼进命令。
+  - **实测（Windows）**：`node --test` 20 项通过（含用系统 `tar` 独立校验 tar 头 checksum 与 `-rwxr-xr-x`）；`npm install <tgz>` 解包正确；经 npm 生成的 `node_modules/.bin/agoramodel` 运行正常，退出码 0 / 1 / 2 与 stdout/stderr 转发均正确；注入尝试（`--tag=bad;rm -rf /`、`--registry=https://x.com;whoami`）全部被拒；`npm publish --dry-run` 被 npm 接受。
+  - **未实测**：Linux / macOS 上安装与运行、真实 `npm publish`（需 npm 账号与 2FA）。
+- [x] **T5.8b｜改用 scope（实发失败驱动的返工）** ｜ 1h
+  - **实发失败**：2FA 已通过，但无 scope 的 `agoramodel-win32-x64` 被 npm **服务端**拒绝：`403 Forbidden - Package name triggered spam detection`。这类拦截只在发布时由服务端执行，`--dry-run` 预检不到。
+  - 该筛查对 `<名字>-<平台>-<架构>` 模式特别敏感，公开案例：`do-harness-win32-x64`（同款失败，Windows 二进制最终改走 GitHub Release）、`archons-win32-x64-msvc`（同批其他平台包正常）。
+  - **改为全 scope**：`@bakeroot/agoramodel` + `@bakeroot/agoramodel-<os>-<cpu>`。scope 是账号独占命名空间，包名不参与相似度判定。
+  - 配套改动：`bin` 的 key 用**命令名**而非包名（装完仍叫 `agoramodel`）；发布显式带 `--access public`（scope 默认按私有处理）；tarball 文件名按 npm 约定扁平化为 `bakeroot-agoramodel-<ver>.tgz`。
+  - **实测**：`node --test` 22 项通过；本地 tarball 安装后布局为 `node_modules/@bakeroot/agoramodel`，`.bin/agoramodel` 运行正常（`--version` → 0.1.0，退出码 0 / 2 正确）；`publish --dry-run` 显示 `public access` 且顺序为「6 个平台包 → 主包」。
+  - **已发布**：`@bakeroot/agoramodel@0.1.0`（用户账号 bakeroot，2FA web 认证流程）。
+- [x] **T5.10｜修复首次启动死锁（零供应商）** ｜ 1h
+  - **用户实测**：`npm i -g @bakeroot/agoramodel` 后直接运行 `agoramodel`，报 `启动失败 err="未配置任何启用的供应商（providers[].enabled 需为 true）"` 并退出。而该提示让人「等待 Web UI 添加供应商」——Web UI 必须先启动网关才能访问，构成死锁。
+  - **根因**：`config.NewSnapshot` 复用了 `File.Normalize` 的「必须至少有一个启用的供应商」校验，把「数据库为空」这个**合法初始状态**误判成配置错误。
+  - **修复**：拆出 `normalize(requireProviders bool)`。`Normalize`（引导配置，经 `LoadFile`）保持严格；新增 `NormalizeAllowEmpty` 供 `NewSnapshot`（运行时快照）使用。启动日志从 ERROR 退出改为 WARN + 给出 Web UI 地址。
+  - **顺带**：`/v1/chat/completions` 在零供应商时返回「网关尚未配置任何供应商…请在 Web UI 的『供应商管理』中添加」，而不是笼统的「模型未被任何供应商声明」；「删除最后一个供应商」也不再失败。
+  - **实测（Windows）**：空数据目录启动后进程存活、`/healthz` 200、Web UI 200、`/v1/models` 无 Key 仍 401；运行时 `POST /api/providers` 添加后 `/v1/models` 立即返回 4 条（裸名 + 命名空间形式），删除该供应商后服务仍存活；`go test ./...` 全绿（新增 `TestAllowEmptyProvidersForRuntimeSnapshot`、`TestNormalizeAllowEmptyStillValidatesOtherFields`、`TestWebUIURL`）。
+  - **安全审查**：独立 security-review 子代理结论为「未引入可利用的安全回归」——鉴权位于路由决策之前且与供应商数量正交，非回环强制管理密码绑定 `Listen`、未被改动，空配置响应不泄露信息。另已穷尽核对调用点：走宽松路径的入口**只有** `NewSnapshot`，引导配置仍走严格的 `Normalize`。
+- [x] **T5.9｜许可证** ｜ 0.5h
+  - 新增 `LICENSE`（MIT，参考 cc-switch 的许可证文本，逐字一致，仅版权行不同：`Copyright (c) 2026 badoujun`）。
+  - npm 包的 `license` / `author` 字段由 `build.mjs` **从 LICENSE 解析**，避免元数据与许可证文本漂移；`LICENSE` 随每个 tarball 一起分发。
 
 ---
 
@@ -323,7 +361,7 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 - [ ] WebDAV 导出（用户已明确暂不考虑；当前靠 `/api/export` + 服务端集中配置）。
 - [ ] MCP 服务器代理。
 - [ ] 多用户/多租户与 RBAC。
-- [ ] Windows 托盘/开机自启一键安装包。
+- [ ] Windows 托盘 / 一键安装包（`.msi`）。开机自启本身已由 `install` 子命令覆盖，见 T5.7 / T5.8。
 - [ ] macOS 代码签名与公证（notarize），消除 Gatekeeper 拦截提示。
 
 ---

@@ -30,6 +30,22 @@ type Options struct {
 	AdminPassword string
 	// LocalOnly 报告网关是否只监听本机回环（决定未设密码时是否免登录）。
 	LocalOnly bool
+	// Paths 是「数据位置」页面展示的本地落点（由 main 按实际启动参数填充）。
+	Paths DataPaths
+}
+
+// DataPaths 描述本程序在磁盘上产生的数据位置。
+type DataPaths struct {
+	// DataDir 是数据目录（数据库、主密钥、日志都在其下）。
+	DataDir string
+	// DBPath 是 SQLite 数据库文件路径。
+	DBPath string
+	// MasterKeyPath 是 AES 主密钥文件路径（主密钥也可能来自环境变量）。
+	MasterKeyPath string
+	// LogFile 是日志文件路径；空表示前台运行写标准输出。
+	LogFile string
+	// ServiceBinary 是服务模式下运行的可执行文件副本路径。
+	ServiceBinary string
 }
 
 // Server 提供 Web UI 使用的管理接口（DESIGN §6）。
@@ -41,6 +57,7 @@ type Server struct {
 	logger    *slog.Logger
 	version   string
 	localOnly bool
+	paths     DataPaths
 	auth      *Authenticator
 	client    *http.Client
 	fetcher   *models.Fetcher
@@ -60,6 +77,7 @@ func New(opts Options) *Server {
 		logger:    logger,
 		version:   opts.Version,
 		localOnly: opts.LocalOnly,
+		paths:     opts.Paths,
 		auth:      NewAuthenticator(opts.AdminPassword),
 		fetcher:   models.NewFetcher(),
 		client: &http.Client{
@@ -88,6 +106,8 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/providers/{id}", s.guard(s.handleDeleteProvider))
 	mux.HandleFunc("POST /api/providers/{id}/test", s.guard(s.handleTestProvider))
 	mux.HandleFunc("POST /api/providers/{id}/fetch-models", s.guard(s.handleFetchModels))
+	// 尚未保存的供应商（草稿）也可以直接拉取模型候选
+	mux.HandleFunc("POST /api/providers/fetch-models", s.guard(s.handleFetchDraftModels))
 
 	// 模型
 	mux.HandleFunc("GET /api/models", s.guard(s.handleListModels))
@@ -102,6 +122,9 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/logs", s.guard(s.handleListLogs))
 	mux.HandleFunc("GET /api/export", s.guard(s.handleExport))
 	mux.HandleFunc("POST /api/import", s.guard(s.handleImport))
+
+	// 数据位置（本机落盘路径）
+	mux.HandleFunc("GET /api/data-locations", s.guard(s.handleDataLocations))
 }
 
 // guard 包装需要授权的处理器。
@@ -207,12 +230,25 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // ---------------- 导出 / 导入 ----------------
 
-// exportPayload 是 /api/export 的响应体（不含任何明文凭证）。
+// exportPayload 是 /api/export 的响应体。
+//
+// 注意：供应商的 api_key 以**明文**导出（便于换机迁移），导出文件等同于凭证载体。
 type exportPayload struct {
-	Gateway   config.Gateway    `json:"gateway"`
-	Providers []providerDTO     `json:"providers"`
-	Notes     map[string]string `json:"notes,omitempty"`
+	Format     string             `json:"format"`
+	ExportedAt string             `json:"exported_at"`
+	Gateway    config.Gateway     `json:"gateway"`
+	Providers  []exportedProvider `json:"providers"`
+	Notes      map[string]string  `json:"notes,omitempty"`
 }
+
+// exportedProvider 在普通 DTO 之上附带明文凭证，仅用于导出与导入。
+type exportedProvider struct {
+	providerDTO
+	APIKey string `json:"api_key"`
+}
+
+// exportFormat 标识导出文件格式，便于导入时判断与后续演进。
+const exportFormat = "agoramodel.providers/v1"
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -225,15 +261,26 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := exportPayload{
-		Gateway:   s.holder.Get().Gateway(),
-		Providers: make([]providerDTO, 0, len(records)),
+		Format:     exportFormat,
+		ExportedAt: time.Now().UTC().Format(time.RFC3339),
+		Gateway:    s.holder.Get().Gateway(),
+		Providers:  make([]exportedProvider, 0, len(records)),
 		Notes: map[string]string{
-			"api_key": "出于安全考虑未导出供应商凭证；导入后需重新填写（或用 GW_MASTER_KEY + 数据库文件迁移）",
+			"api_key": "导出文件包含供应商 API Key 明文，请按凭证同等对待；导入时会用目标机器的密钥重新加密",
 		},
 	}
 	for _, rec := range records {
-		out.Providers = append(out.Providers, toDTO(rec, nil))
+		plain, derr := crypto.Decrypt(s.master, rec.APIKeyCipher, rec.ID)
+		if derr != nil {
+			s.fail(w, http.StatusInternalServerError, "解密供应商凭证失败", derr)
+			return
+		}
+		out.Providers = append(out.Providers, exportedProvider{
+			providerDTO: toDTO(rec, nil),
+			APIKey:      string(plain),
+		})
 	}
+	s.logger.Info("已导出供应商配置（含明文凭证）", "count", len(out.Providers))
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -248,6 +295,10 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	if len(payload.Providers) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "导入文件里没有 providers 数组（或数组为空）"})
+		return
+	}
 
 	imported := 0
 	for _, in := range payload.Providers {
@@ -257,9 +308,8 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			apiKey = strings.TrimSpace(*in.APIKey)
 		}
 		if apiKey == "" {
-			// 导入时凭证必填（导出不含明文）
 			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": fmt.Sprintf("供应商 %q 缺少 api_key：导出文件不含明文凭证，导入时需补齐", in.displayName()),
+				"error": fmt.Sprintf("供应商 %q 缺少 api_key：请使用含明文凭证的导出文件（或手工补齐）", in.displayName()),
 			})
 			return
 		}
@@ -274,6 +324,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "重建配置快照失败", err)
 		return
 	}
+	s.logger.Info("已导入供应商配置", "count", imported)
 	writeJSON(w, http.StatusOK, map[string]any{"imported": imported})
 }
 

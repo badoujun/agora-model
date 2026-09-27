@@ -18,8 +18,12 @@ type Snapshot struct {
 }
 
 // NewSnapshot 由配置构建快照（会执行规范化与校验）。
+//
+// 允许没有任何启用的供应商：全新安装时数据库为空是合法初始状态——
+// 用户必须先能启动网关，才能通过 Web UI 添加第一个供应商。
+// （引导配置的严格校验在 Normalize / LoadFile 里，不受影响。）
 func NewSnapshot(f File) (*Snapshot, error) {
-	normalized, err := f.Normalize()
+	normalized, err := f.NormalizeAllowEmpty()
 	if err != nil {
 		return nil, err
 	}

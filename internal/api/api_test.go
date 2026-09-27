@@ -82,6 +82,7 @@ type harness struct {
 	holder      *config.Holder
 	upstream    *upstreamStub
 	upstreamURL string
+	dataDir     string
 	reloadCount int
 }
 
@@ -135,7 +136,7 @@ func newHarness(t *testing.T, adminPassword string) *harness {
 	}
 	holder := config.NewHolder(snap)
 
-	h := &harness{t: t, store: st, master: master, holder: holder, upstream: upstream, upstreamURL: upstreamSrv.URL}
+	h := &harness{t: t, store: st, master: master, holder: holder, upstream: upstream, upstreamURL: upstreamSrv.URL, dataDir: dir}
 	mux := http.NewServeMux()
 	New(Options{
 		Store:  st,
@@ -148,6 +149,11 @@ func newHarness(t *testing.T, adminPassword string) *harness {
 		Version:       "test-version",
 		AdminPassword: adminPassword,
 		LocalOnly:     true,
+		Paths: DataPaths{
+			DataDir:       dir,
+			DBPath:        filepath.Join(dir, "agora.db"),
+			MasterKeyPath: filepath.Join(dir, "master.key"),
+		},
 	}).Register(mux)
 
 	h.srv = httptest.NewServer(mux)
@@ -680,18 +686,25 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("导出状态码 = %d", code)
 	}
-	if strings.Contains(raw, "sk-seed") {
-		t.Fatal("导出不得包含明文凭证")
+	if body["format"] != exportFormat {
+		t.Errorf("导出格式标识 = %v", body["format"])
 	}
 	providers, _ := body["providers"].([]any)
 	if len(providers) != 1 {
 		t.Fatalf("导出供应商数 = %d", len(providers))
 	}
 	exported := providers[0].(map[string]any)
-	exported["api_key"] = "sk-rotated-key-123456"
+	// 导出包含 API Key 明文（换机迁移用），并带上官网地址
+	if exported["api_key"] != "sk-seed" {
+		t.Fatalf("导出应包含明文凭证，得到 %v", exported["api_key"])
+	}
+	if _, ok := exported["website_url"]; !ok {
+		t.Errorf("导出应包含 website_url: %v", exported)
+	}
+
+	// 导入时沿用导出文件里的明文凭证（换机迁移的常规路径）
 	exported["id"] = "imported"
 	exported["name"] = "导入的供应商"
-
 	code, body, raw = h.do(client, http.MethodPost, "/api/import", map[string]any{
 		"providers": []any{exported},
 	})
@@ -710,7 +723,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 	for _, p := range providers2 {
 		if p.ID == "imported" {
 			found = true
-			if p.APIKey != "sk-rotated-key-123456" {
+			if p.APIKey != "sk-seed" {
 				t.Errorf("导入的凭证 = %q", p.APIKey)
 			}
 			if len(p.Models) != 1 || p.Models[0] != "seed-model" {
@@ -722,12 +735,19 @@ func TestExportImportRoundTrip(t *testing.T) {
 		t.Fatal("导入后未找到供应商")
 	}
 
-	// 缺少 api_key 的导入应被拒绝（导出文件不含明文）
-	exported["id"] = "no-key"
+	// 缺少 api_key 的导入应被拒绝
+	delete(exported, "id")
+	exported["name"] = "无凭证"
 	delete(exported, "api_key")
 	code, _, _ = h.do(client, http.MethodPost, "/api/import", map[string]any{"providers": []any{exported}})
 	if code != http.StatusBadRequest {
 		t.Fatalf("缺少凭证的导入状态码 = %d, 期望 400", code)
+	}
+
+	// 空文件应给出明确错误
+	code, _, _ = h.do(client, http.MethodPost, "/api/import", map[string]any{"providers": []any{}})
+	if code != http.StatusBadRequest {
+		t.Fatalf("空导入状态码 = %d, 期望 400", code)
 	}
 }
 
@@ -757,5 +777,236 @@ func TestProviderListIncludesFetchStatusAndCandidates(t *testing.T) {
 	candidates, _ := seed["candidate_models"].([]any)
 	if len(candidates) != 2 {
 		t.Errorf("candidate_models = %v", candidates)
+	}
+}
+
+// TestProviderWebsiteURL 覆盖官网地址字段：创建、更新沿用、显式清空与非法值。
+func TestProviderWebsiteURL(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	code, body, raw := h.do(client, http.MethodPost, "/api/providers", map[string]any{
+		"name":            "带官网",
+		"openai_base_url": h.upstreamURL + "/v1",
+		"api_key":         "sk-aaaaaaaaaaaa",
+		"website_url":     " https://example.com/pricing ",
+		"allow_internal":  true,
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("创建状态码 = %d（%s）", code, raw)
+	}
+	id, _ := body["id"].(string)
+	if body["website_url"] != "https://example.com/pricing" {
+		t.Errorf("website_url 应去掉首尾空白，得到 %v", body["website_url"])
+	}
+
+	// 未提供 website_url → 沿用原值
+	code, body, raw = h.do(client, http.MethodPut, "/api/providers/"+id, map[string]any{"name": "带官网-改名"})
+	if code != http.StatusOK {
+		t.Fatalf("更新状态码 = %d（%s）", code, raw)
+	}
+	if body["website_url"] != "https://example.com/pricing" {
+		t.Errorf("未提供时应沿用官网地址，得到 %v", body["website_url"])
+	}
+
+	// 显式传空串 → 清空
+	code, body, raw = h.do(client, http.MethodPut, "/api/providers/"+id, map[string]any{"name": "带官网-改名", "website_url": ""})
+	if code != http.StatusOK {
+		t.Fatalf("清空状态码 = %d（%s）", code, raw)
+	}
+	if body["website_url"] != "" {
+		t.Errorf("显式空串应清空官网地址，得到 %v", body["website_url"])
+	}
+
+	// 非法地址（非 http/https）应被拒绝
+	code, _, _ = h.do(client, http.MethodPut, "/api/providers/"+id, map[string]any{
+		"name": "带官网-改名", "website_url": "ftp://example.com",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("非法官网地址状态码 = %d, 期望 400", code)
+	}
+}
+
+// TestFetchDraftModelsEndpoint 覆盖「未保存的供应商」直接拉取模型。
+func TestFetchDraftModelsEndpoint(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	code, body, raw := h.do(client, http.MethodPost, "/api/providers/fetch-models", map[string]any{
+		"openai_base_url": h.upstreamURL + "/v1",
+		"api_key":         "sk-draft-aaaaaaaa",
+		"allow_internal":  true,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("草稿拉取状态码 = %d（%s）", code, raw)
+	}
+	candidates, _ := body["candidate_models"].([]any)
+	if len(candidates) != 2 {
+		t.Errorf("候选模型 = %v", candidates)
+	}
+	if body["fetched_at"] == "" {
+		t.Errorf("fetched_at 应被设置: %v", body)
+	}
+	// 草稿拉取不得落库任何供应商
+	records, err := h.store.ListProviders(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Errorf("草稿拉取不应新增供应商，当前 %d 条", len(records))
+	}
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{"缺少 API Key", map[string]any{"openai_base_url": h.upstreamURL + "/v1"}},
+		{"缺少上游地址", map[string]any{"api_key": "sk-draft-aaaaaaaa"}},
+		{"内网地址未放行", map[string]any{"openai_base_url": "http://127.0.0.1:11434/v1", "api_key": "sk-draft-aaaaaaaa"}},
+		{"端点覆盖模式", map[string]any{
+			"openai_base_url": h.upstreamURL + "/v1", "openai_endpoint_override": h.upstreamURL + "/v1/chat/completions",
+			"api_key": "sk-draft-aaaaaaaa", "allow_internal": true,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, raw := h.do(client, http.MethodPost, "/api/providers/fetch-models", tc.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("状态码 = %d, 期望 400（%s）", code, raw)
+			}
+		})
+	}
+
+	// 上游拒绝 → 502
+	h.upstream.setFail(true)
+	code, _, _ = h.do(client, http.MethodPost, "/api/providers/fetch-models", map[string]any{
+		"openai_base_url": h.upstreamURL + "/v1", "api_key": "sk-draft-aaaaaaaa", "allow_internal": true,
+	})
+	if code != http.StatusBadGateway {
+		t.Fatalf("上游失败时状态码 = %d, 期望 502", code)
+	}
+}
+
+// TestGatewayKeyPlaintextForConsole 覆盖「网关 Key 可随时查看/复制」。
+func TestGatewayKeyPlaintextForConsole(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	code, body, raw := h.do(client, http.MethodPost, "/api/gateway-key/reset", nil)
+	if code != http.StatusOK {
+		t.Fatalf("重置状态码 = %d（%s）", code, raw)
+	}
+	plain, _ := body["gateway_key"].(string)
+	if plain == "" {
+		t.Fatalf("重置响应应包含明文: %v", body)
+	}
+
+	// 之后仍可从设置接口取回同一明文（页面复制按钮用）
+	code, body, raw = h.do(client, http.MethodGet, "/api/settings", nil)
+	if code != http.StatusOK {
+		t.Fatalf("读取设置状态码 = %d（%s）", code, raw)
+	}
+	if body["gateway_key"] != plain {
+		t.Errorf("设置接口应返回可复制的明文 Key，得到 %v", body["gateway_key"])
+	}
+	if body["gateway_key_revealable"] != true {
+		t.Errorf("gateway_key_revealable = %v", body["gateway_key_revealable"])
+	}
+	if body["gateway_key_hint"] != crypto.Mask(plain) {
+		t.Errorf("掩码 = %v", body["gateway_key_hint"])
+	}
+
+	// 旧版本只存哈希的记录：无法查看，但不影响校验
+	if _, err := h.store.DB().ExecContext(context.Background(), `UPDATE gateway_keys SET key_cipher = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	code, body, raw = h.do(client, http.MethodGet, "/api/settings", nil)
+	if code != http.StatusOK {
+		t.Fatalf("只存哈希的记录不应让接口报错，状态码 = %d（%s）", code, raw)
+	}
+	if body["gateway_key"] != "" || body["gateway_key_revealable"] != false {
+		t.Errorf("只存哈希的记录应标记为不可查看: %v（%s）", body, raw)
+	}
+
+	// 主密钥被更换（密文无法解密）：同样降级为「不可查看 + 提示重置」，而不是 500
+	bogus := make([]byte, 64)
+	for i := range bogus {
+		bogus[i] = byte(i + 1)
+	}
+	if _, err := h.store.DB().ExecContext(context.Background(), `UPDATE gateway_keys SET key_cipher = ?`, bogus); err != nil {
+		t.Fatal(err)
+	}
+	code, body, raw = h.do(client, http.MethodGet, "/api/settings", nil)
+	if code != http.StatusOK {
+		t.Fatalf("密文无法解密时应降级为不可查看，状态码 = %d（%s）", code, raw)
+	}
+	if body["gateway_key"] != "" || body["gateway_key_revealable"] != false {
+		t.Errorf("密文无法解密时应标记为不可查看: %v（%s）", body, raw)
+	}
+	if body["gateway_key_hint"] == "" {
+		t.Errorf("掩码仍应回显: %v", body)
+	}
+}
+
+// TestDataLocationsEndpoint 覆盖「数据位置」页面接口。
+func TestDataLocationsEndpoint(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	code, body, raw := h.do(client, http.MethodGet, "/api/data-locations", nil)
+	if code != http.StatusOK {
+		t.Fatalf("数据位置状态码 = %d（%s）", code, raw)
+	}
+	if body["os"] == "" || body["os_label"] == "" {
+		t.Errorf("缺少系统信息: %v", body)
+	}
+	if body["version"] != "test-version" {
+		t.Errorf("version = %v", body["version"])
+	}
+	if body["data_dir"] != h.dataDir {
+		t.Errorf("data_dir = %v, 期望 %v", body["data_dir"], h.dataDir)
+	}
+
+	items, _ := body["items"].([]any)
+	byKey := map[string]map[string]any{}
+	for _, item := range items {
+		entry := item.(map[string]any)
+		byKey[entry["key"].(string)] = entry
+	}
+	db, ok := byKey["database"]
+	if !ok {
+		t.Fatalf("缺少数据库项: %v", items)
+	}
+	if db["path"] != filepath.Join(h.dataDir, "agora.db") {
+		t.Errorf("数据库路径 = %v", db["path"])
+	}
+	if db["exists"] != true || db["size_bytes"].(float64) <= 0 {
+		t.Errorf("数据库项应报告存在与大小: %v", db)
+	}
+	if byKey["data_dir"]["exists"] != true {
+		t.Errorf("数据目录应存在: %v", byKey["data_dir"])
+	}
+	if _, ok := byKey["master_key"]; !ok {
+		t.Errorf("缺少主密钥项: %v", items)
+	}
+	// 未配置日志文件：前台运行写 stdout
+	if byKey["log_file"]["kind"] != "stdout" {
+		t.Errorf("log_file kind = %v", byKey["log_file"]["kind"])
+	}
+}
+
+// TestHumanSize 覆盖大小格式化（页面展示用）。
+func TestHumanSize(t *testing.T) {
+	cases := map[int64]string{
+		0:                      "0 B",
+		512:                    "512 B",
+		2048:                   "2.0 KB",
+		5 * 1024 * 1024:        "5.0 MB",
+		3 * 1024 * 1024 * 1024: "3.0 GB",
+	}
+	for input, want := range cases {
+		if got := humanSize(input); got != want {
+			t.Errorf("humanSize(%d) = %q, 期望 %q", input, got, want)
+		}
 	}
 }

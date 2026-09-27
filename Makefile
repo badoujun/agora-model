@@ -7,11 +7,15 @@
 #   make tidy     整理 go.mod
 #   make clean    清理 dist/
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# 版本号优先取最近的 semver tag；仓库还没有 tag 时不注入，
+# 由 cmd/agoramodel 内置的版本号兜底（页面上显示可读版本号而不是构建哈希）
+# 去掉 tag 的 v 前缀：控制台统一按 "v<version>" 展示，避免出现 vv0.2.0
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null)
+VERSION := $(patsubst v%,%,$(VERSION))
 DIST    := dist
 CMD     := ./cmd/agoramodel
 GOFLAGS := -trimpath
-LDFLAGS := -s -w -X main.version=$(VERSION)
+LDFLAGS := -s -w $(if $(VERSION),-X main.version=$(VERSION),)
 
 # 目标矩阵（与 docs/DESIGN.md ADR-001 一致）
 TARGETS := windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64

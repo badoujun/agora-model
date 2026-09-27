@@ -58,6 +58,7 @@ func sampleProvider(id string) config.Provider {
 		ID:             id,
 		Name:           "供应商 " + id,
 		OpenAIBaseURL:  "https://api.example.com/v1",
+		WebsiteURL:     "https://www.example.com/pricing",
 		APIKey:         "sk-secret-" + id,
 		Models:         []string{"m1", "m2"},
 		ModelAliases:   map[string]string{"m1": "别名一"},
@@ -212,6 +213,9 @@ func TestProviderRoundTripStoresCiphertext(t *testing.T) {
 	if got.Name != "供应商 p1" || len(got.Models) != 2 {
 		t.Errorf("字段往返异常: %+v", got)
 	}
+	if got.WebsiteURL != "https://www.example.com/pricing" {
+		t.Errorf("官网地址往返异常: %q", got.WebsiteURL)
+	}
 	if got.ModelAliases["m1"] != "别名一" {
 		t.Errorf("别名往返异常: %#v", got.ModelAliases)
 	}
@@ -329,17 +333,17 @@ func TestImportProviders(t *testing.T) {
 }
 
 func TestGatewayKeyLifecycle(t *testing.T) {
-	st, _ := newTestStore(t)
+	st, master := newTestStore(t)
 	ctx := context.Background()
 
-	plain, created, err := st.EnsureGatewayKey(ctx)
+	plain, created, err := st.EnsureGatewayKey(ctx, master)
 	if err != nil {
 		t.Fatalf("EnsureGatewayKey: %v", err)
 	}
 	if !created || !strings.HasPrefix(plain, GatewayKeyPrefix) {
 		t.Fatalf("首次应生成带前缀的 Key，得到 %q created=%v", plain, created)
 	}
-	if again, created2, err := st.EnsureGatewayKey(ctx); err != nil || created2 || again != "" {
+	if again, created2, err := st.EnsureGatewayKey(ctx, master); err != nil || created2 || again != "" {
 		t.Fatalf("二次调用不应重新生成: %q created=%v err=%v", again, created2, err)
 	}
 
@@ -358,6 +362,18 @@ func TestGatewayKeyLifecycle(t *testing.T) {
 		t.Fatal("数据库中不得存放网关 Key 明文")
 	}
 
+	// 明文以密文保存，可随时解密查看/复制（控制台用）
+	if len(info.KeyCipher) == 0 || strings.Contains(string(info.KeyCipher), plain) {
+		t.Fatalf("key_cipher 应为密文，得到 %q", info.KeyCipher)
+	}
+	revealed, err := st.RevealGatewayKey(ctx, master)
+	if err != nil {
+		t.Fatalf("RevealGatewayKey: %v", err)
+	}
+	if revealed != plain {
+		t.Errorf("解密出的网关 Key = %q, 期望 %q", revealed, plain)
+	}
+
 	if _, ok, err := st.VerifyGatewayKey(ctx, plain); err != nil || !ok {
 		t.Fatalf("正确 Key 应通过校验: ok=%v err=%v", ok, err)
 	}
@@ -365,7 +381,7 @@ func TestGatewayKeyLifecycle(t *testing.T) {
 		t.Fatalf("错误 Key 不应通过: ok=%v err=%v", ok, err)
 	}
 
-	newPlain, err := st.ResetGatewayKey(ctx)
+	newPlain, err := st.ResetGatewayKey(ctx, master)
 	if err != nil {
 		t.Fatalf("ResetGatewayKey: %v", err)
 	}
@@ -378,8 +394,58 @@ func TestGatewayKeyLifecycle(t *testing.T) {
 	if _, ok, _ := st.VerifyGatewayKey(ctx, newPlain); !ok {
 		t.Fatal("重置后新 Key 应可用")
 	}
+	if revealed, err := st.RevealGatewayKey(ctx, master); err != nil || revealed != newPlain {
+		t.Fatalf("重置后应能查看新 Key: %q err=%v", revealed, err)
+	}
 	if err := st.TouchGatewayKey(ctx, info.ID); err != nil {
 		t.Fatalf("TouchGatewayKey: %v", err)
+	}
+}
+
+// TestRevealGatewayKeyRejectsHashOnlyRecord 覆盖旧版本（只保存哈希）留下的记录。
+func TestRevealGatewayKeyRejectsHashOnlyRecord(t *testing.T) {
+	st, master := newTestStore(t)
+	ctx := context.Background()
+
+	plain, _, err := st.EnsureGatewayKey(ctx, master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE gateway_keys SET key_cipher = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.RevealGatewayKey(ctx, master)
+	if !errors.Is(err, ErrGatewayKeyNotRevealable) || !IsGatewayKeyUnrevealable(err) {
+		t.Fatalf("只保存哈希的记录应报 ErrGatewayKeyNotRevealable，得到 %v", err)
+	}
+	if _, ok, _ := st.VerifyGatewayKey(ctx, plain); !ok {
+		t.Fatal("明文不可查看不应影响 Key 校验")
+	}
+}
+
+// TestRevealGatewayKeyWithWrongMasterKey 覆盖主密钥被更换：属于"看不了明文请重置"，不是系统故障。
+func TestRevealGatewayKeyWithWrongMasterKey(t *testing.T) {
+	st, master := newTestStore(t)
+	ctx := context.Background()
+
+	plain, _, err := st.EnsureGatewayKey(ctx, master)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wrong := make([]byte, crypto.KeySize)
+	for i := range wrong {
+		wrong[i] = byte(0xA0 + i)
+	}
+	_, err = st.RevealGatewayKey(ctx, wrong)
+	if !errors.Is(err, ErrGatewayKeyDecryptFailed) || !IsGatewayKeyUnrevealable(err) {
+		t.Fatalf("主密钥不匹配应报 ErrGatewayKeyDecryptFailed（且可判定为不可查看），得到 %v", err)
+	}
+	if _, err := st.RevealGatewayKey(ctx, master); err != nil {
+		t.Fatalf("正确主密钥应能解出明文: %v", err)
+	}
+	if _, ok, _ := st.VerifyGatewayKey(ctx, plain); !ok {
+		t.Fatal("主密钥不匹配不应影响网关 Key 校验（校验只依赖 sha256）")
 	}
 }
 

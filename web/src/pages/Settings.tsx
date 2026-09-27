@@ -15,20 +15,17 @@ export function SettingsPage() {
   const settings = useQuery({ queryKey: ['settings'], queryFn: api.getSettings })
 
   const [newKey, setNewKey] = useState<string | null>(null)
-  const [acknowledged, setAcknowledged] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
 
   const resetKey = useMutation({
     mutationFn: api.resetGatewayKey,
     onSuccess: async (data) => {
       setNewKey(data.gateway_key)
-      setAcknowledged(false)
       await queryClient.invalidateQueries({ queryKey: ['settings'] })
       toast.show('已生成新的网关 Key：旧 Key 立即失效，请更新所有 Agent 配置', 'success')
     },
     onError: (err: Error) => toast.show(`重置失败：${err.message}`, 'error'),
   })
-
   const saveSettings = useMutation({
     mutationFn: (payload: { log_success?: boolean }) => api.updateSettings(payload),
     onSuccess: async () => {
@@ -48,11 +45,15 @@ export function SettingsPage() {
     }
   }
 
-  const origin = window.location.origin
-  const openaiSnippet = `OPENAI_BASE_URL=${origin}/v1\nOPENAI_API_KEY=<你的网关 Key>`
-
   const data = settings.data
   const logSuccess = data?.log_success === 'true'
+  // 当前网关 Key 的明文（可随时查看/复制）；旧版本的 Key 只能重置
+  const currentKey = data?.gateway_key || ''
+  // 接入示例里的 Key 直接带上明文，方便一键复制
+  const keyForSnippet = currentKey || '<你的网关 Key>'
+
+  const origin = window.location.origin
+  const openaiSnippet = `OPENAI_BASE_URL=${origin}/v1\nOPENAI_API_KEY=${keyForSnippet}`
 
   return (
     <div className="flex flex-col gap-5">
@@ -69,16 +70,25 @@ export function SettingsPage() {
             <KeyRound className="h-4 w-4" />
             网关 API Key
           </CardTitle>
-          <CardDescription>明文只在生成时显示一次；数据库里只保存哈希与掩码。</CardDescription>
+          <CardDescription>
+            所有 Agent 共用这一个 Key；明文以 AES 加密保存在本机数据库中，仅同源控制台可查看，可随时复制。
+          </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2">
-            <code className="rounded bg-slate-100 px-2 py-1 font-mono text-sm">
-              {data?.gateway_key_hint || '（尚未生成）'}
+            <code className="min-w-0 flex-1 break-all rounded bg-slate-100 px-2 py-1 font-mono text-sm">
+              {currentKey || '（尚未生成）'}
             </code>
-            <span className="text-xs text-slate-500">
-              创建于 {formatTime(data?.gateway_key_created_at)} · 最近使用 {formatTime(data?.gateway_key_last_used)}
-            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => copy('current-key', currentKey)}
+              disabled={!currentKey}
+              title={currentKey ? '复制网关 Key' : '暂无可复制的明文'}
+            >
+              {copied === 'current-key' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+              复制
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -93,26 +103,31 @@ export function SettingsPage() {
               重置网关 Key
             </Button>
           </div>
+          <span className="text-xs text-slate-500">
+            创建于 {formatTime(data?.gateway_key_created_at)} · 最近使用 {formatTime(data?.gateway_key_last_used)}
+            {data?.gateway_key_hint ? ` · 掩码 ${data.gateway_key_hint}` : ''}
+          </span>
+
+          {data && data.gateway_key_hint && !data.gateway_key_revealable ? (
+            <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              无法还原这个 Key 的明文：可能是旧版本创建的 Key（数据库里只保存了哈希），或主密钥被更换后无法解密已保存的密文。
+              点「重置网关 Key」即可生成一个可随时复制的新 Key。
+            </p>
+          ) : null}
 
           {newKey ? (
             <div className="rounded-md border border-amber-200 bg-amber-50 p-3">
-              <p className="text-sm font-medium text-amber-900">请立即保存这个 Key（只显示这一次）</p>
+              <p className="text-sm font-medium text-amber-900">已生成新的网关 Key（旧 Key 已失效）</p>
               <div className="mt-2 flex items-center gap-2">
-                <code className="flex-1 break-all rounded bg-white px-2 py-1 font-mono text-sm">{newKey}</code>
+                <code className="min-w-0 flex-1 break-all rounded bg-white px-2 py-1 font-mono text-sm">{newKey}</code>
                 <Button variant="outline" size="sm" onClick={() => copy('new-key', newKey)}>
                   {copied === 'new-key' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
                   复制
                 </Button>
-              </div>
-              <label className="mt-2 flex items-center gap-2 text-sm text-amber-900">
-                <input type="checkbox" checked={acknowledged} onChange={(e) => setAcknowledged(e.target.checked)} />
-                我已保存，可以隐藏
-              </label>
-              {acknowledged ? (
-                <Button variant="ghost" size="sm" className="mt-1" onClick={() => setNewKey(null)}>
-                  隐藏
+                <Button variant="ghost" size="sm" onClick={() => setNewKey(null)}>
+                  知道了
                 </Button>
-              ) : null}
+              </div>
             </div>
           ) : null}
         </CardContent>

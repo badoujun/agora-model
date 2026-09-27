@@ -183,7 +183,7 @@ try {
     [void]$procs.Add($gwA)
     Start-Sleep -Seconds 2
     $key1 = Get-KeyFromLog $logA
-    Assert-That '首次启动打印网关 Key 明文（仅一次）' ($null -ne $key1) "hint=$(if ($key1) { $key1.Substring(0, 7) + '***' })"
+    Assert-That '首次启动打印网关 Key（控制台亦可查看/复制）' ($null -ne $key1) "hint=$(if ($key1) { $key1.Substring(0, 7) + '***' })"
 
     $logAText = Read-SharedText $logA
     Assert-That '首次启动从引导配置导入供应商' ($logAText -match '已从引导配置导入供应商' -and $logAText -match 'count=1')
@@ -196,6 +196,10 @@ try {
     Assert-That '使用数据库中的网关 Key 可完成透传' ($resp.Code -eq 200 -and $resp.Body -match 'mock') "code=$($resp.Code)"
     Assert-That '错误网关 Key 被拒' ((Invoke-Curl "$base/v1/chat/completions" @('-H', 'content-type: application/json', '-H', 'authorization: Bearer gw-nope') $bodyFile).Code -eq 401)
 
+    # 控制台可随时查看/复制当前网关 Key（明文以密文入库，sha256 仍用于校验）
+    $settingsA = Invoke-Curl "$base/api/settings" -Method GET
+    Assert-That '网关 Key 明文可从 /api/settings 取回（控制台可复制）' ($settingsA.Code -eq 200 -and $settingsA.Body -match [regex]::Escape($key1))
+
     $masterPath = Join-Path $dataDirA 'master.key'
     Assert-That '数据目录含 agora.db 与 master.key' ((Test-Path (Join-Path $dataDirA 'agora.db')) -and (Test-Path $masterPath))
     $masterText = (Read-SharedText $masterPath).Trim()
@@ -204,6 +208,8 @@ try {
     Start-Sleep -Milliseconds 1500  # 等待异步日志批量落库
     Assert-That '请求日志已落库（可按模型检索到）' (Find-BytesInDB -DataDir $dataDirA -Needle 'mock-gpt-4o')
     Assert-That '数据库中不含供应商凭证明文' (-not (Find-BytesInDB -DataDir $dataDirA -Needle 'sk-mock-provider-key'))
+    # 网关 Key 明文以 AES 密文入库（控制台可解密查看），因此库里检索不到明文字符串
+    Assert-That '数据库中不含网关 Key 明文字符串（只存密文与哈希）' ($null -ne $key1 -and -not (Find-BytesInDB -DataDir $dataDirA -Needle $key1))
 
     Stop-Process -Id $gwA.Id -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
@@ -228,6 +234,8 @@ try {
     $auth2 = @('-H', 'content-type: application/json', '-H', "authorization: Bearer $key2")
     Assert-That '重置后新 Key 可用' ((Invoke-Curl "$base/v1/chat/completions" $auth2 $bodyFile).Code -eq 200)
     Assert-That '重置后旧 Key 立即失效（401）' ((Invoke-Curl "$base/v1/chat/completions" $auth $bodyFile).Code -eq 401)
+    $settingsC = Invoke-Curl "$base/api/settings" -Method GET
+    Assert-That '重置后 /api/settings 返回的是新 Key 明文（控制台可继续复制）' ($settingsC.Code -eq 200 -and $settingsC.Body -match [regex]::Escape($key2))
     Stop-Process -Id $gwC.Id -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
 

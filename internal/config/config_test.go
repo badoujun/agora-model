@@ -291,3 +291,59 @@ func TestLoadFileMissing(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// 回归：全新安装时数据库为空是**合法**初始状态——用户必须先能启动网关，
+// 才能通过 Web UI 添加第一个供应商。此前 NewSnapshot 复用了 Normalize 的严格校验，
+// 导致首次启动直接失败并提示「等待 Web UI 添加供应商」，而 Web UI 恰恰需要网关先跑起来。
+func TestAllowEmptyProvidersForRuntimeSnapshot(t *testing.T) {
+	empty := File{}
+
+	// 引导配置（用户显式提供）仍然严格
+	if _, err := empty.Normalize(); !errors.Is(err, ErrNoProviders) {
+		t.Fatalf("Normalize 应拒绝空供应商，得到 %v", err)
+	}
+
+	// 运行时路径允许空
+	normalized, err := empty.NormalizeAllowEmpty()
+	if err != nil {
+		t.Fatalf("NormalizeAllowEmpty 不应拒绝空供应商: %v", err)
+	}
+	if normalized.Gateway.Listen != DefaultListen || normalized.Gateway.Port != DefaultPort {
+		t.Fatalf("默认值未补齐: %+v", normalized.Gateway)
+	}
+
+	snap, err := NewSnapshot(empty)
+	if err != nil {
+		t.Fatalf("NewSnapshot 不应拒绝空供应商: %v", err)
+	}
+	if got := len(snap.Providers()); got != 0 {
+		t.Fatalf("空快照的启用供应商数 = %d，期望 0", got)
+	}
+	if snap.Gateway().Addr() != "127.0.0.1:9090" {
+		t.Fatalf("默认监听地址未补齐: %s", snap.Gateway().Addr())
+	}
+}
+
+func TestNormalizeAllowEmptyStillValidatesOtherFields(t *testing.T) {
+	// 「允许空」只针对供应商数量，其它校验一个都不能松
+	if _, err := (File{Providers: []Provider{{ID: "a", Name: "a"}}}).NormalizeAllowEmpty(); err == nil {
+		t.Fatal("缺上游地址仍应报错")
+	}
+	if _, err := (File{Providers: []Provider{
+		{ID: "dup", Name: "a", OpenAIBaseURL: "http://x/v1"},
+		{ID: "dup", Name: "b", OpenAIBaseURL: "http://y/v1"},
+	}}).NormalizeAllowEmpty(); err == nil {
+		t.Fatal("id 重复仍应报错")
+	}
+
+	// 全部停用：严格模式拒绝，宽松模式放行（用户可能先停用、稍后再启用）
+	disabled := File{Providers: []Provider{
+		{ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1", Enabled: boolPtr(false)},
+	}}
+	if _, err := disabled.Normalize(); !errors.Is(err, ErrNoProviders) {
+		t.Fatalf("Normalize 应拒绝全部停用的供应商，得到 %v", err)
+	}
+	if _, err := disabled.NormalizeAllowEmpty(); err != nil {
+		t.Fatalf("NormalizeAllowEmpty 应放行全部停用的供应商: %v", err)
+	}
+}

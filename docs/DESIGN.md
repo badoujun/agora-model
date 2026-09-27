@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS providers (
   anthropic_base_url          TEXT,                          -- 如 https://api.a.com
   openai_endpoint_override    TEXT,                          -- 完整 URL，优先于 base_url 拼接
   anthropic_endpoint_override TEXT,
+  website_url                 TEXT    NOT NULL DEFAULT '',   -- v4 迁移新增：供应商官网地址（仅展示）
   api_key_cipher              BLOB    NOT NULL,              -- AES-256-GCM: nonce||ct||tag
   api_key_hint                TEXT    NOT NULL,              -- 仅用于展示：sk-****abcd
   models_manual_json          TEXT    NOT NULL DEFAULT '[]', -- 手动添加的模型
@@ -214,8 +215,9 @@ CREATE TABLE IF NOT EXISTS providers (
 CREATE TABLE IF NOT EXISTS gateway_keys (
   id           TEXT    PRIMARY KEY,
   name         TEXT    NOT NULL DEFAULT 'default',
-  key_hash     TEXT    NOT NULL UNIQUE,   -- sha256(gw-key)，比对用，不存明文
+  key_hash     TEXT    NOT NULL UNIQUE,   -- sha256(gw-key)，比对用
   key_hint     TEXT    NOT NULL,          -- gw-****abcd
+  key_cipher   BLOB,                      -- v4 迁移新增：明文的 AES-256-GCM 密文（控制台可查看/复制）
   enabled      INTEGER NOT NULL DEFAULT 1,
   created_at   TEXT    NOT NULL,
   last_used_at TEXT,
@@ -412,17 +414,19 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | `DELETE` | `/api/providers/{id}` | 删除（级联删除其 `model_cache`） |
 | `POST` | `/api/providers/{id}/test` | 连接测试，返回 `{ok, status_code, latency_ms, message, detected_protocols}` |
 | `POST` | `/api/providers/{id}/fetch-models` | 立即拉取该供应商模型列表 |
+| `POST` | `/api/providers/fetch-models` | **未保存的供应商**按表单信息拉取候选模型（不落库，供「保存 / 拉取」分离使用） |
 | `GET` | `/api/models` | 聚合模型列表（含来源、是否默认、是否手动、抓取时间） |
 | `POST` | `/api/models/refresh` | 全量刷新 |
 | `POST` | `/api/models/manual` | 手动添加模型到某供应商 |
 | `DELETE` | `/api/models/manual` | 移除手动模型 |
-| `GET` | `/api/settings` | 读取设置（含 GateWay Key 掩码、监听地址、刷新间隔） |
-| `PUT` | `/api/settings` | 更新设置（刷新间隔、日志级别等） |
-| `GET` | `/api/gateway-key` | 返回掩码与提示 |
-| `POST` | `/api/gateway-key/reset` | 重新生成网关 Key（明文仅在本响应中返回一次） |
+| `GET` | `/api/settings` | 读取设置（含网关 Key 掩码与可复制的明文、监听地址） |
+| `PUT` | `/api/settings` | 更新设置（日志开关等） |
+| `GET` | `/api/gateway-key` | 返回掩码与提示（不含明文） |
+| `POST` | `/api/gateway-key/reset` | 重新生成网关 Key；明文同时以密文入库，控制台可随时查看/复制 |
 | `GET` | `/api/logs` | 查询日志：`?status=&model=&provider_id=&from=&to=&limit=&offset=` |
-| `GET` | `/api/export` | 导出配置（不含明文 Key） |
-| `POST` | `/api/import` | 导入配置（合并/覆盖可选） |
+| `GET` | `/api/export` | 导出配置（**含明文 API Key**，按凭证保管） |
+| `POST` | `/api/import` | 导入配置（含明文 API Key；导入后用本机主密钥重新加密） |
+| `GET` | `/api/data-locations` | 数据位置：按当前系统返回数据目录、数据库、主密钥、日志等路径与大小 |
 
 ### 6.2 关键请求/响应约定
 
@@ -734,6 +738,8 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 - AAD = `provider.id`：防止把 A 供应商的密文复制到 B 行后被解密使用。
 - 掩码函数：`hint(s) = s[:3] + "****" + s[len(s)-4:]`（长度不足时全掩码）。
 - **出口唯一性**：所有 API 响应经由序列化结构体（不含 `api_key`/`api_key_cipher` 字段），从类型层面杜绝明文泄露；禁止直接 `SELECT *` 后 `json.Marshal`。
+  唯一的例外是显式的导出/迁移接口：`/api/export` 输出明文 `api_key`（用户要求换机迁移可用），
+  网关 Key 的明文只出现在 `/api/settings`（同源控制台复制用），两者都经会话鉴权保护。
 - 日志与错误信息过滤：正则剔除 `sk-[A-Za-z0-9_\-]{8,}`、`gw-[A-Za-z0-9_\-]{8,}` 形态的字符串。
 
 ### 7.9 日志写入策略
@@ -763,11 +769,12 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 | `/models` | 模型列表（聚合视图） | `/api/models` |
 | `/settings` | 网关设置（Key、端口、刷新间隔、Base URL 片段） | `/api/settings`、`/api/gateway-key` |
 | `/logs` | 请求日志 | `/api/logs` |
+| `/data` | 数据位置（本机落盘路径与大小） | `/api/data-locations` |
 | `/login` | 登录（仅远程模式） | `/api/auth/login` |
 
 ### 8.2 供应商管理页
 
-**列表列**：名称 · OpenAI URL · Anthropic URL · 模型数 · 优先级 · 状态（启用/停用）· 最近抓取（成功/失败 + 时间）· 操作（测试连接 / 拉取模型 / 编辑 / 删除）。
+**列表列**：名称 · OpenAI URL · 官网（可点链接） · 模型数 · 状态（启用/停用）· 最近抓取（成功/失败 + 时间）· 操作（测试连接 / 编辑 / 删除）；页面右上角提供「导入 / 导出 / 新增供应商」。
 
 **表单字段与校验**
 
@@ -775,11 +782,12 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 | --- | --- | --- |
 | 名称 | Input | 必填，1–64 字符 |
 | OpenAI Base URL | Input | 可选；若填需为合法 http(s) URL |
+| 供应商官网地址 | Input | 可选；若填需为合法 http(s) URL（仅展示与跳转，不做 SSRF 校验） |
 | Anthropic Base URL | Input | 同上 |
 | （至少填一个 URL） | — | 两者皆空 → 阻止保存并提示 |
 | 端点覆盖（折叠高级区） | Input ×2 | 可选，需为完整 URL |
 | API Key | Password Input | 编辑态显示掩码，占位符「留空表示不修改」 |
-| 模型列表 | Tag 输入 | 可手工输入；「拉取模型」按钮填充候选 |
+| 模型列表 | 勾选 + 别称 | 「拉取模型」填充候选；**未保存时也可直接拉取**（走草稿接口，不落库），勾选后保存写入 |
 | 排除模型 | Tag 输入 | 可选 |
 | 自动拉取模型 | Switch | 默认开 |
 | 优先级 | Number | 整数，默认 100，越小越优先 |
@@ -787,7 +795,8 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 | extra_headers / extra_body | KV 编辑器 | 可选，JSON 合法性校验 |
 | 允许内网地址 | Switch | 默认关；开启弹出风险确认 |
 
-**交互细节**：保存后局部刷新列表并显示 toast；删除需输入名称或二次确认；「测试连接」显示双协议结果（状态码 / 耗时 / 错误摘要）。
+**交互细节**：「保存」与「拉取模型」是两个独立动作——未保存的供应商可以先拉取、勾选，再保存；
+保存后局部刷新列表并显示 toast；「导出」下载含明文 API Key 的 JSON（先二次确认），「导入」选择该 JSON 后合并写入。
 
 ### 8.3 模型列表页
 
@@ -798,10 +807,12 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 
 ### 8.4 网关设置页
 
-- 展示 **Base URL**（依据当前监听地址生成）与**网关 Key**（掩码），提供一键复制。
-- 直接给出可粘贴到 Agent 的两段环境变量片段（OpenAI 协议 / Anthropic 协议），并提供「复制」按钮——对应 PRD 的 S2 场景。
-- 网关 Key 重置：二次确认 + 明文仅显示一次 + 「我已保存」确认。
-- 刷新间隔、成功日志开关、监听地址（修改需重启时给出明确提示）。
+- 展示 **Base URL**（依据当前监听地址生成）与**网关 Key**（明文，附「复制」按钮），提供一键复制。
+- 直接给出可粘贴到 Agent 的环境变量片段（并把当前网关 Key 填进片段），并提供「复制」按钮——对应 PRD 的 S2 场景。
+- 网关 Key 重置：二次确认 + 旧 Key 立即失效提示；明文以密文入库，重置后可继续查看/复制。
+  明文还原不了时（旧版本只存哈希，或主密钥被更换后密文无法解密）接口仍返回 200、
+  `gateway_key_revealable=false`，页面提示「请重置网关 Key」，并在服务端日志留一条 WARN——不按接口故障处理。
+- 成功日志开关、监听地址（修改需重启时给出明确提示）。
 
 ### 8.5 日志页
 
@@ -809,13 +820,20 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 - 表格：时间 · 协议 · 模型 · 供应商 · 上游 URL · 状态码 · 延迟 · 首字节 · 错误摘要（可展开查看截断错误体）。
 - 分页（`limit`/`offset`），默认按时间倒序。
 
-### 8.6 前端工程约束
+### 8.6 数据位置页（`/data`）
+
+- 展示运行环境：操作系统、程序版本号、当前可执行文件路径。
+- 逐项列出本程序产生的数据（数据目录 / SQLite 数据库 / 主密钥 / 运行日志 / 服务二进制副本）：
+  路径、用途说明、是否已存在、占用大小，并提供「复制路径」按钮。
+- 路径来自 `main` 的实际启动参数（`Options.Paths`），不做任何猜测；前台运行无日志文件时说明写入标准输出。
+
+### 8.7 前端工程约束
 
 - 类型与后端契约同源：手写 `types.ts` 或由 OpenAPI 生成；后端管理 API 提供 OpenAPI 描述（P2）。
 - 请求封装统一处理 401（跳转登录）、错误 toast、加载态。
 - 不引入重型状态库：`@tanstack/react-query`（或 SWR）足够。
 
-### 8.7 实现说明（Phase 4 落地）
+### 8.8 实现说明（Phase 4 落地）
 
 - **技术栈**：Vite + React 19 + TypeScript + Tailwind CSS v4（`@tailwindcss/vite`）+ `@tanstack/react-query` + `react-router-dom`；
 - **组件**：按 shadcn/ui 的组织方式与工具链（`class-variance-authority` + `clsx` + `tailwind-merge`）手写所需组件，
@@ -895,7 +913,24 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 ## 12. 部署与运维
 
 - **构建**：`make build`（或 `build.ps1`）：`npm --prefix web ci && npm --prefix web run build` → 按 ADR-001 的矩阵执行 `CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -ldflags="-s -w -X main.version=<ver>"`，产出 `dist/agoramodel-<os>-<arch>[.exe]`。构建脚本必须一次产出 Windows 与 Linux 两套产物（跨平台兼容性见下文）。
+- **npm 分发（可选通道）**：`npm/` 目录提供「1 个主包 + 6 个平台包」的构建与发布脚本。
+  - **包结构**：主包 `@bakeroot/agoramodel` 只含 Node 转发器（`bin/agoramodel.js`）；二进制由平台包 `@bakeroot/agoramodel-<os>-<cpu>` 提供。
+  - **必须用 scope**：无 scope 的 `agoramodel-<os>-<cpu>` 被 npm 服务端的**包名反垃圾 / 防抢注筛查**拒绝（`403 Forbidden - Package name triggered spam detection`，已实测）。该筛查对 `<名字>-<平台>-<架构>` 这种模式特别敏感（`do-harness-win32-x64`、`archons-win32-x64-msvc` 都有公开记录），且**只在服务端发布时执行，`--dry-run` 预检不到**。scope 是账号独占的命名空间，包名不参与相似度判定。
+    - scope 包发布必须显式带 `--access public`，否则按私有处理被拒。
+    - `bin` 字段的 key 是**命令名**而非包名：scope 包安装后命令仍叫 `agoramodel`。
+    - 打包产物的文件名按 npm 约定扁平化：`@bakeroot/agoramodel` → `bakeroot-agoramodel-<ver>.tgz`。
+  - **包元数据**：`license` / `author` 由 `build.mjs` **从仓库根 `LICENSE` 解析**（单一数据源，避免与许可证文本漂移），`LICENSE` 随每个 tarball 一起分发。
+  - **必须用 `optionalDependencies` 而非 postinstall 下载**：npm 11+ 默认不执行依赖的安装脚本（本项目构建时就踩过 esbuild 的 `allow-scripts` 提示），postinstall 方案会静默失败；`os` / `cpu` 字段的筛选发生在**安装期**，由 npm 自己完成，全程零脚本执行。包内因此也**不含任何 `scripts`**。
+  - **平台包清单不设 `exports`**：转发器需要 `require.resolve('<pkg>/package.json')` 来定位二进制——这样 npm / pnpm / yarn 各自不同的依赖提升布局都能正确处理，不硬编码 `node_modules` 路径。
+  - **发布顺序**：先 6 个平台包、后主包（主包的 optionalDependencies 指向平台包）。
+  - **registry**：`publish.mjs` 默认发到 `https://registry.npmjs.org`，不经 `npm config get registry`（国内环境常设为只读镜像，发布必然失败）。
+  - **自写 tar**：`npm/scripts/tarball.mjs` 直接按 tar 格式打包而不调用 `npm pack`。原因有二：① Windows 文件系统无法表达 Unix 权限位（`fs.chmod()` 是空操作，实测 mode 恒为 666），npm pack 出来的 Linux / macOS 平台包里二进制是 644，装到 Linux 上无法执行；② Windows 上调 npm CLI 必须经 shell，Node 24 会给出 DEP0190 警告。自写后在 tar 头里直接写入 0755，任何平台打包的结果都正确，也不必依赖运行期 chmod 兜底。
+  - **与服务的配合**：转发器只服务交互式调用；`install` 注册的服务指向 `<数据目录>/bin/` 下的二进制副本，因此 `npm install -g @bakeroot/agoramodel@新版本` 不影响正在运行的服务。
+  - **实测（Windows）**：`node --test` 20 项通过（含用系统 tar 独立校验 tar 头 checksum 与权限位）；`npm install <tgz>` 能正确解包；经 npm 生成的 `node_modules/.bin/agoramodel` 运行正常，退出码（0 / 1 / 2）与 stdout/stderr 均正确转发；`npm publish --dry-run` 被 npm 接受。
+  - **未实测**：在 Linux / macOS 上安装并运行（本地无对应环境）。
 - **运行**：`./agoramodel --listen 127.0.0.1 --port 9090 --db ./data/agora.db`。
+- **零供应商启动**：数据库中没有（或全部停用了）供应商是**合法初始状态**——网关照常启动并挂载 Web UI，只是 `/v1` 暂时无法路由（`/v1/models` 返回空列表，`/v1/chat/completions` 返回 `model_not_found` 并说明需先添加供应商）；启动日志会直接给出 Web UI 地址。这也是「删掉最后一个供应商能成功」与「运行时新增供应商无需重启」的前提。
+  - 实现上区分两条路径：`File.Normalize`（校验**用户提供的**引导配置，零供应商即报错）与 `File.NormalizeAllowEmpty` / `NewSnapshot`（运行时快照，允许为空）。两者曾复用同一校验，导致首次启动死锁——提示「等待 Web UI 添加供应商」，而 Web UI 恰恰需要网关先跑起来（见 TODO T5.10）。
 - **依赖**：无外部服务依赖；单文件 + 数据库文件。
 - **反向代理**（若需要 HTTPS/远程）：
 
@@ -912,10 +947,17 @@ location / {
 ```
 
 - **服务化（已定案：`kardianos/service`）**：同一二进制内建 `install / uninstall / start / stop / restart / status` 子命令，自动对接各平台服务管理器——**Windows：SCM；Linux：systemd；macOS：launchd**。
-  - **实现状态**：子命令已实现并自检；install 时会把 --config/--data-dir/--db/--port 转为绝对路径写入服务配置；管理密码**不写入**服务参数（避免明文落盘），需通过环境变量注入；实机安装需管理员/root 权限。
+  - **实现状态**：子命令已实现并自检；全部服务化逻辑集中在 `internal/platform`（`ServiceSpec` / `RunServiceCommand` / `RunAsService` / `NewLogger`），`cmd/agoramodel` 只负责参数解析与注入运行回调。
+    - **路径转绝对**：`--config` / `--data-dir` / `--db` / `--log-file` 一律转绝对路径写入服务配置（服务的工作目录与安装时不同）。
+    - **数据目录固化**：`--data-dir` 缺省时取系统数据目录再绝对化。服务账户与前台运行往往不同（Windows SCM 默认 `LocalSystem`），不固化会导致 `os.UserConfigDir()` 解析到 `…\systemprofile\…`，表现为「服务起来了但供应商是空的」。
+    - **可执行文件副本**：`install` 缺省把当前二进制复制到 `<数据目录>/bin/`，并用 `service.Config.Executable` 指向该副本。原因是 npm / npx 场景下 `os.Executable()` 位于 `node_modules` 或 `_npx` 缓存目录，升级或清理缓存会整体删除该目录，已注册的服务随即失效。可用 `--service-exec` 覆盖。
+    - **环境变量注入**：`--service-env KEY=VALUE`（可重复）→ `service.Config.EnvVars`（Linux 渲染为 `Environment=`，Windows 写入注册表 `Environment`）。管理密码**不写入服务参数**，只能经此注入。
+    - **幂等安装**：同名服务已存在时先 `Stop` + `Uninstall` 再 `Install`；这同时释放了被占用的二进制副本（Windows 不允许覆盖运行中的 exe），因此升级后重跑 `install` 即可。
+    - 实机安装需管理员 / root 权限，权限类失败会附加可读提示。
+  - **子命令参数位置**：`install --data-dir X` 与 `--data-dir X install` 两种写法都支持（flag 包在首个非 flag 参数处停止解析，故对子命令之后的参数补解析一次）。
   - 该库为**纯 Go（无 CGO）**，不影响 ADR-001 的跨平台基线。
   - **停止事件必须接入优雅关闭**：`service.Interface.Stop()` → `cancel()` → `http.Server.Shutdown(ctx)` → 停止日志批量写入并 flush → 关闭 SQLite 连接（WAL checkpoint），确保不丢日志、不损坏数据库。
-  - **服务模式没有控制台**：日志必须落文件（或平台日志），不得依赖 stdout；建议 `--log-format=json` 便于采集。
+  - **服务模式没有控制台**（PRD FR-11.4）：日志必须落文件，不得依赖 stdout（Windows SCM 下 stdout 直接被丢弃）。`--log-file` 追加写入并自动建目录，`install` 时缺省注入 `<数据目录>/logs/agoramodel.log`；建议配合 `--log-format=json` 便于采集。
   - Linux 安装通常需要 root 权限；若不想用服务子命令，也可手工用下面的 systemd unit 托管（二选一即可）。
 
 ```ini

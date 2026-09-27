@@ -12,7 +12,7 @@
 .EXAMPLE
   pwsh -File build.ps1                 # 默认 dist：构建六份产物并校验
   pwsh -File build.ps1 -Target build   # 只构建当前平台
-  pwsh -File build.ps1 -Version 0.1.0  # 指定版本号
+  pwsh -File build.ps1 -Version 0.2.0  # 指定版本号
 #>
 [CmdletBinding()]
 param(
@@ -37,13 +37,21 @@ if (-not $env:GOPROXY) {
 }
 
 if (-not $Version) {
-    $Version = (git describe --tags --always --dirty 2>$null)
-    if (-not $Version) { $Version = 'dev' }
+    # 版本号优先取最近的 semver tag；仓库还没有 tag 时不注入，
+    # 由 cmd/agoramodel 内置的版本号兜底（页面上显示可读版本号而不是构建哈希）
+    $Version = (git describe --tags --abbrev=0 2>$null)
+}
+if ($Version) {
+    # 去掉 semver tag 的 v 前缀：控制台统一按 "v<version>" 展示，避免出现 vv0.2.0
+    $Version = $Version -replace '^v', ''
 }
 
 $dist = Join-Path $PSScriptRoot 'dist'
 $cmd = './cmd/agoramodel'
-$ldflags = "-s -w -X main.version=$Version"
+$ldflags = '-s -w'
+if ($Version) {
+    $ldflags += " -X main.version=$Version"
+}
 
 $targets = @(
     [pscustomobject]@{ Os = 'windows'; Arch = 'amd64' }
@@ -143,5 +151,6 @@ switch ($Target) {
     }
 }
 
-Write-Host "完成（version=$Version，target=$Target）"
+$versionLabel = if ($Version) { $Version } else { '内置版本' }
+Write-Host "完成（version=$versionLabel，target=$Target）"
 exit 0

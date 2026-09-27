@@ -7,6 +7,7 @@ import { ProvidersPage } from '@/pages/Providers'
 import { ModelsPage } from '@/pages/Models'
 import { SettingsPage } from '@/pages/Settings'
 import { LogsPage } from '@/pages/Logs'
+import { DataLocationPage } from '@/pages/DataLocation'
 import { LoginPage } from '@/pages/Login'
 
 export default function App() {
@@ -46,6 +47,7 @@ export default function App() {
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/logs" element={<LogsPage />} />
+          <Route path="/data" element={<DataLocationPage />} />
           <Route path="*" element={<Navigate to="/providers" replace />} />
         </Routes>
       </Layout>

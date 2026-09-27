@@ -15,7 +15,7 @@ Agent（Codex / Cursor / 任意支持自定义 Base URL 的工具）
    AgoraModel 网关（单可执行文件）
    ├─ /v1/chat/completions  ← OpenAI 兼容协议，原样透传
    ├─ /v1/models            ← 已启用模型列表（含 供应商名/模型名 命名空间）
-   └─ Web 控制台            ← 供应商 / 模型 / 设置 / 日志
+   └─ Web 控制台            ← 供应商 / 模型 / 设置 / 日志 / 数据位置
         │
         ▼
    供应商 A（OpenAI 兼容 URL + 1 个 Key）
@@ -28,11 +28,13 @@ Agent（Codex / Cursor / 任意支持自定义 Base URL 的工具）
 | --- | --- |
 | **零模板接入** | 不预设供应商类型：填「名称 + OpenAI 兼容地址 + API Key」即可，无需选择模板或改代码 |
 | **协议原生透传** | 对外提供 OpenAI 兼容接口，**不做格式转换**，流式响应逐字节透传 |
-| **模型选择** | 在供应商编辑页一键拉取上游 `/models`，勾选要启用的模型，并可为每个模型设置别称 |
+| **模型选择** | 在供应商编辑页一键拉取上游 `/models`，勾选要启用的模型，并可为每个模型设置别称（保存前即可先拉取） |
 | **显式路由** | 裸模型名按供应商名称升序选默认供应商；`供应商名/模型名` 可强制指定供应商 |
+| **配置迁移** | 供应商支持导入/导出 JSON（含 API Key 明文），换机时导出→导入即可 |
 | **单文件交付** | 前端内嵌，无运行时依赖（无 JVM/Node/libc 要求），Windows / Linux / macOS 各一份 |
 | **安全默认** | 仅监听本机回环；供应商凭证 AES-256-GCM 加密落库；SSRF 校验；日志脱敏 |
 | **可排查** | 请求日志页可按状态码/模型（模糊匹配，忽略大小写）/供应商筛选，明确区分「Agent 发错了」与「上游拒了」 |
+| **数据透明** | 「数据位置」页按当前系统列出数据库、主密钥、日志等落盘路径，支持一键复制路径 |
 
 ## 快速开始
 
@@ -60,7 +62,8 @@ pwsh -File build.ps1 -Target dist   # Windows
 
 1. 在数据目录生成主密钥 `master.key`（请备份）；
 2. 从 `config.example.json` 导入示例供应商（**仅在数据库为空时导入一次**）；
-3. **打印一次网关 Key**（`gateway_key=gw-…`）——这就是所有 Agent 要填的 Key，请立即保存。
+3. **打印一次网关 Key**（`gateway_key=gw-…`）——这就是所有 Agent 要填的 Key；
+   之后可随时在 Web 控制台「网关设置」页查看或复制。
 
 随后访问 <http://127.0.0.1:9090> 打开 Web 控制台，在「供应商管理」里改成你自己的供应商即可。
 
@@ -86,6 +89,9 @@ export OPENAI_API_KEY=gw-你的网关Key
 | `--admin-password` | `ADMIN_PASSWORD` | 空 | Web UI 管理密码；设置后 /api 需要登录 |
 | `--log-format` | — | `text` | `text` 或 `json` |
 | `--log-level` | — | `info` | `debug` / `info` / `warn` / `error` |
+| `--log-file` | — | 空（写 stdout） | 日志文件路径（追加写入，自动建目录）；**服务模式没有控制台，必须落文件**，`install` 时缺省为 `<数据目录>/logs/agoramodel.log` |
+| `--service-env` | — | 空 | 仅 `install`：注入服务进程的环境变量，可重复（如 `--service-env ADMIN_PASSWORD=…`）；**明文会写入服务配置** |
+| `--service-exec` | — | 空 | 仅 `install`：服务要运行的可执行文件；缺省把当前二进制复制到 `<数据目录>/bin/` 后运行该副本 |
 | — | `GW_MASTER_KEY` | 空 | 主密钥（64 位 hex）；**推荐用它替代 master.key 文件** |
 
 数据目录默认位置：Windows `%AppData%\AgoraModel`、Linux `~/.config/agoramodel`、
@@ -94,11 +100,13 @@ macOS `~/Library/Application Support/AgoraModel`。
 ## 数据、安全与备份
 
 - **数据 = 两个文件**：`agora.db`（SQLite，WAL 模式）与 `master.key`。备份这两个即可迁移。
-- **凭证加密**：供应商 API Key 以 AES-256-GCM 密文存储（AAD 绑定供应商 id），
-  数据库或备份泄露也拿不到明文；Web UI 与 API 只回显掩码。
+  控制台的「数据位置」页会按当前系统列出这两个文件的绝对路径。
+- **凭证加密**：供应商 API Key 与网关 Key 明文都以 AES-256-GCM 密文存储（AAD 绑定记录 id），
+  数据库泄露也拿不到可直接使用的明文；供应商列表只回显掩码，网关 Key 仅同源控制台可查看。
 - **主密钥丢失 = 凭证不可解密**：此时启动会直接失败并提示，**不会静默降级为明文**。
   若不想依赖文件，用 `GW_MASTER_KEY` 环境变量（例如放在 systemd 的 `Environment=`）。
-- **网关 Key**：以 sha256 存储，重置后旧 Key 立即失效；明文只在生成/重置时显示一次。
+- **网关 Key**：以 sha256 校验，重置后旧 Key 立即失效；「网关设置」页可随时查看/复制当前 Key
+  （旧版本只存哈希的 Key 无法还原，页面会提示重置）。
 - **访问控制**：默认只监听 `127.0.0.1`（本机免登录）；一旦监听非回环地址，
   必须设置 `ADMIN_PASSWORD`，否则启动直接拒绝。
 
@@ -114,9 +122,36 @@ macOS `~/Library/Application Support/AgoraModel`。
 ./agoramodel uninstall
 ```
 
-> 安装/卸载需要管理员（Windows）或 root（Linux）权限。
-> 服务启动参数由 `install` 时的 `--config/--data-dir/--port` 决定（路径已转绝对）。
-> **服务模式没有控制台**，日志请写文件或交给平台日志；`ADMIN_PASSWORD` 建议通过服务配置注入，不要写在命令行里。
+> 安装/卸载需要管理员（Windows）或 root（Linux）权限；权限不足时会给出提示而不是原始错误码。
+
+`install` 会做三件事，避免服务启动后出现「数据是空的」「日志丢了」「二进制不见了」：
+
+1. **固化数据目录**：`--data-dir` 缺省时取系统数据目录并转成绝对路径写进服务配置。
+   服务账户与前台运行往往不是同一个（Windows SCM 默认 `LocalSystem`），
+   不固化的话 `%AppData%` 会解析到 `…\systemprofile\…`，看起来就是「服务起来了但供应商是空的」。
+2. **复制二进制到稳定位置**：缺省把当前二进制复制到 `<数据目录>/bin/agoramodel[.exe]` 并运行该副本。
+   通过 npm / npx 运行时，原路径位于 `node_modules` 或 `_npx` 缓存，升级或清理缓存都会整体删除该目录，
+   已注册的服务随即指向一个不存在的文件。用 `--service-exec` 可指定其它路径。
+3. **日志落文件**：`--log-file` 缺省为 `<数据目录>/logs/agoramodel.log`。
+   服务模式没有控制台（Windows SCM 尤其如此），不落文件就无处排查。
+
+`install` 是幂等的：同名服务已存在时会先停止并卸载再重新安装，因此**升级二进制后重跑一次 `install` 即可**。
+
+环境变量（`ADMIN_PASSWORD`、`GW_MASTER_KEY` 等）通过 `--service-env` 注入：
+
+```bash
+# Windows（管理员）
+.\agoramodel.exe install --data-dir "D:\AgoraModel" --service-env ADMIN_PASSWORD=你的密码
+
+# Linux（root）
+sudo ./agoramodel install --data-dir /var/lib/agoramodel \
+  --service-env ADMIN_PASSWORD=你的密码 --service-env GW_MASTER_KEY=<64 位 hex>
+```
+
+> `--service-env` 的明文会写入服务配置（Linux systemd unit / Windows 注册表），请限制该文件权限。
+> 不注入 `GW_MASTER_KEY` 时服务会依赖数据目录下的 `master.key` 文件，务必一起备份。
+
+参数两种写法都支持（`install --data-dir X` 与 `--data-dir X install`）。
 
 <details>
 <summary>手工托管（systemd 示例）</summary>
@@ -138,14 +173,41 @@ WantedBy=multi-user.target
 
 </details>
 
+## 通过 npm 安装（可选）
+
+除了下载单文件二进制，也可以把 npm 当作分发通道：
+
+```bash
+npm install -g @bakeroot/agoramodel
+agoramodel --version
+```
+
+包结构与 esbuild / biome 相同：主包 `@bakeroot/agoramodel` 只含一个 Node 转发器，真正的二进制由
+6 个平台包（`@bakeroot/agoramodel-<os>-<cpu>`）通过 `optionalDependencies` 提供——npm 在**安装期**
+按 `os` / `cpu` 自动选装，**不执行任何安装脚本**（兼容 npm 11+ 默认禁用依赖脚本的策略）。
+
+> 注册开机自启服务请先 `npm install -g`，**不要用 `npx`**：
+> npx 的临时缓存目录随时会被清理，注册好的服务会随即失效。
+>
+> `install` 会把二进制复制到 `<数据目录>/bin/` 再注册服务，因此后续
+> `npm install -g @bakeroot/agoramodel@新版本` 不会影响正在运行的服务；升级后重跑一次 `install` 即可。
+
+卸载：
+
+```bash
+agoramodel uninstall         # 先注销系统服务（数据目录会保留）
+npm uninstall -g @bakeroot/agoramodel  # 再卸载包
+```
+
 ## Web 控制台
 
 | 页面 | 用途 |
 | --- | --- |
-| 供应商管理 | 列表 / 新增 / 编辑 / 删除、**连接测试**、**拉取模型并勾选（可设别称）**、启用停用 |
+| 供应商管理 | 列表 / 新增 / 编辑 / 删除、**导入 / 导出 JSON**、**连接测试**、**拉取模型并勾选（可设别称，保存前也能拉）**、官网地址、启用停用 |
 | 模型列表 | 已启用模型的对外名与上游名对照、来源供应商、默认路由标注、搜索 |
-| 网关设置 | 网关 Key（掩码 / 重置）、Agent 环境变量片段一键复制、成功日志开关 |
+| 网关设置 | 网关 Key（明文，可一键复制 / 重置）、Agent 环境变量片段一键复制、成功日志开关 |
 | 请求日志 | 按状态码 / 模型（模糊匹配，忽略大小写）/ 供应商 / 仅失败筛选，分页与错误展开，可 5 秒自动刷新 |
+| 数据位置 | 按当前系统列出数据目录 / 数据库 / 主密钥 / 日志等落盘路径、占用大小，一键复制路径 |
 | 登录页 | 仅当设置了 `ADMIN_PASSWORD` 时出现 |
 
 ## 反向代理（如需 HTTPS 或远程访问）
@@ -184,7 +246,9 @@ location / {
 
 **Q：换了一台机器要重新配置吗？**
 不需要。复制 `agora.db` + `master.key`（或在新机器上用 `GW_MASTER_KEY`），
-各 Agent 的环境变量指向新地址即可。（导出功能故意不导出明文凭证。）
+各 Agent 的环境变量指向新地址即可。
+也可以只迁移供应商：在「供应商管理」页点「导出」得到 JSON（**含 API Key 明文**，请妥善保管），
+到新实例点「导入」即可，凭证会用新机器的密钥重新加密。
 
 **Q：macOS 上提示「无法验证开发者」？**
 二进制未签名：`xattr -dr com.apple.quarantine agoramodel-darwin-arm64` 后再运行。
@@ -215,7 +279,35 @@ pwsh -File tools/smoke/phase5.ps1   # PRD 八条验收、性能冒烟、迁移�
 
 # 本地 mock 上游（冒烟脚本会自动启动；也可单独用于调试）
 node tools/mock-upstream/server.mjs
+
+# npm 分发包
+node --test npm/test/npm-package.test.mjs npm/test/tarball.test.mjs
 ```
+
+### npm 包构建与发布
+
+```bash
+# 1) 先产出六份 Go 产物（版本号建议与 npm 版本保持一致）
+pwsh -File build.ps1 -Target dist -Version 0.2.0   # 或 make dist
+
+# 2) 打成 7 个包：主包 agoramodel + 6 个平台包 agoramodel-<os>-<cpu>
+node npm/scripts/build.mjs --version=0.2.0
+
+# 3) 预演（不发布） / 正式发布
+node npm/scripts/publish.mjs --dry-run
+node npm/scripts/publish.mjs
+```
+
+- 产物在 `npm/dist/tarballs/`，共 7 个 `.tgz`（每个约 5 MB）。
+- 发布顺序固定在 `publish.mjs` 里：**先平台包、后主包**——主包的 `optionalDependencies`
+  指向平台包，反过来发会让先安装的人拿到一个拉不到二进制的版本。
+- `publish.mjs` 默认发到 `https://registry.npmjs.org`，**不沿用** `npm config get registry`
+  （国内环境常把它设成只读镜像如 `registry.npmmirror.com`，发布必然失败且报错晦涩）；
+  需要私有源时显式传 `--registry=`。
+- 发布前先 `npm login`；账号开了 2FA 时传 `--otp=123456`。
+- `build.mjs` **自己写 tar** 而不调用 `npm pack`：Windows 文件系统无法表达 Unix 权限位
+  （`chmod` 是空操作，实测 mode 恒为 666），npm pack 出来的 Linux / macOS 平台包里
+  二进制会是 644，装到 Linux 上无法执行。
 
 目录结构：
 
@@ -227,12 +319,13 @@ internal/crypto     AES-256-GCM 与主密钥
 internal/gateway    数据面透传（/v1/*，SSE 保活与取消）
 internal/logging    请求日志异步批量写入与脱敏
 internal/models     模型候选列表拉取（/models）
-internal/platform   跨平台数据目录
+internal/platform   跨平台数据目录、日志落文件、服务化
 internal/provider   供应商连接测试
 internal/route      模型名路由（含命名空间）
 internal/security   SSRF 校验
 internal/store      SQLite 持久化与迁移
 internal/webui      内嵌前端与 SPA 路由
+npm                 npm 分发：主包转发器 + 平台包构建/发布脚本
 web                 前端工程（Vite + React）
 docs                PRD / 功能明细设计说明书 / 待办清单
 ```
@@ -240,3 +333,7 @@ docs                PRD / 功能明细设计说明书 / 待办清单
 更多设计细节见：
 [`docs/PRD.md`](docs/PRD.md)（需求与验收）、[`docs/DESIGN.md`](docs/DESIGN.md)（接口契约与实现）、
 [`docs/TODO.md`](docs/TODO.md)（分阶段任务与实测证据）。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 badoujun

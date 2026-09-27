@@ -12,6 +12,7 @@ import (
 	"agora-model/internal/config"
 	"agora-model/internal/crypto"
 	"agora-model/internal/provider"
+	"agora-model/internal/security"
 	"agora-model/internal/store"
 )
 
@@ -24,6 +25,7 @@ type providerDTO struct {
 	Name                   string            `json:"name"`
 	OpenAIBaseURL          string            `json:"openai_base_url"`
 	OpenAIEndpointOverride string            `json:"openai_endpoint_override"`
+	WebsiteURL             string            `json:"website_url"`
 	APIKeyHint             string            `json:"api_key_hint"`
 	ModelsSelected         []string          `json:"models_selected"`
 	ModelAliases           map[string]string `json:"model_aliases"`
@@ -44,18 +46,20 @@ type providerDTO struct {
 //
 // 指针字段用于区分「未提供」与「显式置零/置 false」。
 type providerInput struct {
-	ID                     string            `json:"id"`
-	Name                   string            `json:"name"`
-	OpenAIBaseURL          string            `json:"openai_base_url"`
-	OpenAIEndpointOverride string            `json:"openai_endpoint_override"`
-	APIKey                 *string           `json:"api_key"`
-	ModelsSelected         []string          `json:"models_selected"`
-	ModelAliases           map[string]string `json:"model_aliases"`
-	TimeoutSeconds         *int              `json:"timeout_seconds"`
-	ExtraHeaders           map[string]string `json:"extra_headers"`
-	ExtraBody              map[string]any    `json:"extra_body"`
-	AllowInternal          *bool             `json:"allow_internal"`
-	Enabled                *bool             `json:"enabled"`
+	ID                     string  `json:"id"`
+	Name                   string  `json:"name"`
+	OpenAIBaseURL          string  `json:"openai_base_url"`
+	OpenAIEndpointOverride string  `json:"openai_endpoint_override"`
+	APIKey                 *string `json:"api_key"`
+	// WebsiteURL 使用指针：nil 表示未提供（沿用既有值），空串表示显式清空。
+	WebsiteURL     *string           `json:"website_url"`
+	ModelsSelected []string          `json:"models_selected"`
+	ModelAliases   map[string]string `json:"model_aliases"`
+	TimeoutSeconds *int              `json:"timeout_seconds"`
+	ExtraHeaders   map[string]string `json:"extra_headers"`
+	ExtraBody      map[string]any    `json:"extra_body"`
+	AllowInternal  *bool             `json:"allow_internal"`
+	Enabled        *bool             `json:"enabled"`
 }
 
 func (in providerInput) displayName() string {
@@ -87,6 +91,7 @@ func toDTO(rec store.ProviderRecord, candidates []string) providerDTO {
 		Name:                   rec.Name,
 		OpenAIBaseURL:          rec.OpenAIBaseURL,
 		OpenAIEndpointOverride: rec.OpenAIEndpointOverride,
+		WebsiteURL:             rec.WebsiteURL,
 		APIKeyHint:             rec.APIKeyHint,
 		ModelsSelected:         rec.ModelsSelected,
 		ModelAliases:           rec.ModelAliases,
@@ -288,6 +293,81 @@ func (s *Server) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toDTO(rec, candidates))
 }
 
+// draftFetchInput 是「尚未保存的供应商」拉取模型候选的请求体。
+//
+// 与保存接口分开：这里只做一次上游 /models 探测，明文凭证不落库。
+type draftFetchInput struct {
+	OpenAIBaseURL          string            `json:"openai_base_url"`
+	OpenAIEndpointOverride string            `json:"openai_endpoint_override"`
+	APIKey                 string            `json:"api_key"`
+	ExtraHeaders           map[string]string `json:"extra_headers"`
+	TimeoutSeconds         int               `json:"timeout_seconds"`
+	AllowInternal          bool              `json:"allow_internal"`
+}
+
+// handleFetchDraftModels 在供应商尚未保存时，用表单里填写的信息直接拉取上游模型候选。
+//
+// 结果不落库：用户在编辑页勾选后再点保存即可（保存接口负责持久化勾选结果）。
+func (s *Server) handleFetchDraftModels(w http.ResponseWriter, r *http.Request) {
+	var in draftFetchInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	apiKey := strings.TrimSpace(in.APIKey)
+	if apiKey == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请先填写 API Key，再拉取模型"})
+		return
+	}
+
+	base := strings.TrimSpace(in.OpenAIBaseURL)
+	override := strings.TrimSpace(in.OpenAIEndpointOverride)
+	if base == "" && override == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请先填写 OpenAI Base URL，再拉取模型"})
+		return
+	}
+	// 与保存路径一致：SSRF 校验在发出请求前完成
+	for _, u := range []string{base, override} {
+		if err := security.ValidateUpstreamURL(u, in.AllowInternal); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	timeout := in.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = defaultTimeoutSeconds
+	}
+	draft := config.Provider{
+		OpenAIBaseURL:          base,
+		OpenAIEndpointOverride: override,
+		APIKey:                 apiKey,
+		ExtraHeaders:           in.ExtraHeaders,
+		TimeoutSeconds:         timeout,
+		AllowInternal:          in.AllowInternal,
+	}
+	if draft.ModelsEndpoint() == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "无法推导 /models 地址：请填写 OpenAI Base URL（端点覆盖模式下不支持拉取模型）",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	candidates, err := s.fetcher.Fetch(ctx, draft)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"candidate_models": candidates,
+		"fetched_at":       time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // upsertProvider 把请求体转换为供应商并写库（apiKey 为空且已存在时沿用原凭证）。
 func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey string) (store.ProviderRecord, error) {
 	id := strings.TrimSpace(in.ID)
@@ -324,11 +404,19 @@ func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey st
 		return store.ProviderRecord{}, err
 	}
 
+	website := ""
+	if in.WebsiteURL != nil {
+		website = strings.TrimSpace(*in.WebsiteURL)
+	} else if hasExisting {
+		website = existing.WebsiteURL
+	}
+
 	base := config.Provider{
 		ID:                     id,
 		Name:                   name,
 		OpenAIBaseURL:          strings.TrimSpace(in.OpenAIBaseURL),
 		OpenAIEndpointOverride: strings.TrimSpace(in.OpenAIEndpointOverride),
+		WebsiteURL:             website,
 		APIKey:                 apiKey,
 		Models:                 cleanList(in.ModelsSelected),
 		ModelAliases:           in.ModelAliases,
@@ -362,6 +450,9 @@ func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey st
 	}
 	if base.Endpoint() == "" {
 		return store.ProviderRecord{}, errors.New("请填写 OpenAI Base URL（或 OpenAI 端点覆盖）")
+	}
+	if err := base.ValidateWebsiteURL(); err != nil {
+		return store.ProviderRecord{}, err
 	}
 	if err := base.ValidateModelSelection(); err != nil {
 		return store.ProviderRecord{}, err
@@ -457,12 +548,29 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "读取网关 Key 失败", err)
 		return
 	}
+	// 明文用于控制台的「查看/复制」：库中以 AES 密文保存，明文只在同源控制台响应里出现。
+	plainKey, revealErr := s.store.RevealGatewayKey(ctx, s.master)
+	revealable := revealErr == nil
+	switch {
+	case revealErr == nil, errors.Is(revealErr, store.ErrNoGatewayKey):
+		// 正常：要么取到明文，要么尚未生成网关 Key
+	case store.IsGatewayKeyUnrevealable(revealErr):
+		// 旧记录只存哈希，或密文与当前主密钥不匹配：页面提示「重置」即可，不算接口故障
+		if errors.Is(revealErr, store.ErrGatewayKeyDecryptFailed) {
+			s.logger.Warn("网关 Key 明文无法解密：主密钥可能与数据库不匹配，控制台会提示重置", "err", revealErr)
+		}
+	default:
+		s.fail(w, http.StatusInternalServerError, "读取网关 Key 失败", revealErr)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"listen":                 gw.Listen,
 		"port":                   gw.Port,
 		"sse_idle_seconds":       gw.SSEIdleSeconds,
 		"max_body_bytes":         gw.MaxBodyBytes,
 		"gateway_key_hint":       keyInfo.KeyHint,
+		"gateway_key":            plainKey,
+		"gateway_key_revealable": revealable,
 		"gateway_key_created_at": formatOptionalTime(keyInfo.CreatedAt),
 		"gateway_key_last_used":  formatOptionalTime(keyInfo.LastUsedAt),
 		"log_success":            settings[store.SettingLogSuccess],
@@ -518,17 +626,16 @@ func (s *Server) handleResetGatewayKey(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	plain, err := s.store.ResetGatewayKey(ctx)
+	plain, err := s.store.ResetGatewayKey(ctx, s.master)
 	if err != nil {
 		s.fail(w, http.StatusInternalServerError, "重置网关 Key 失败", err)
 		return
 	}
 	s.logger.Warn("Web UI 重置了网关 Key：旧 Key 已失效", "hint", crypto.Mask(plain))
-	// 明文只在此响应中出现一次
 	writeJSON(w, http.StatusOK, map[string]any{
 		"gateway_key": plain,
 		"key_hint":    crypto.Mask(plain),
-		"warning":     "请立即保存：明文只显示这一次，旧 Key 已失效",
+		"warning":     "已生成新的网关 Key；可在本页随时查看或复制当前 Key",
 	})
 }
 

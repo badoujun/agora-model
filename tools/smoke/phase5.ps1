@@ -136,7 +136,8 @@ $artifacts = @(
 )
 if (-not (Test-Path $dist)) {
     Write-Host '  dist 不存在，先执行 build.ps1 -Target dist …'
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Target dist -Version 0.1.0 | Out-Null
+    # 传 -Version 模拟发布构建（真实发布时由最近的 semver tag 注入）
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Target dist -Version 0.2.0 | Out-Null
 }
 $missing = @()
 $badMagic = @()
@@ -150,12 +151,13 @@ Assert-That '产物格式正确（PE / ELF / Mach-O）' ($badMagic.Count -eq 0) 
 
 $winExe = Join-Path $dist 'agoramodel-windows-amd64.exe'
 $versionOutput = (& $winExe --version) -join ''
-Assert-That '版本号已注入产物' ($versionOutput.Trim() -eq '0.1.0') "输出=$versionOutput"
+# 版本号必须是可读的语义化版本号（构建脚本没有 tag 时不再注入 git hash）
+Assert-That '产物版本号为语义化版本号（不是构建哈希）' ($versionOutput.Trim() -match '^\d+\.\d+\.\d+') "输出=$versionOutput"
 Assert-That '前端已内嵌（产物体积 > 5MB）' ((Get-Item $winExe).Length -gt 5MB)
 
 $exeName = if ($env:OS -eq 'Windows_NT') { 'agoramodel-p5.exe' } else { 'agoramodel-p5' }
 $exe = Join-Path $tmp $exeName
-& go build -trimpath -ldflags '-s -w -X main.version=0.1.0' -o $exe ./cmd/agoramodel
+& go build -trimpath -ldflags '-s -w -X main.version=0.2.0' -o $exe ./cmd/agoramodel
 if ($LASTEXITCODE -ne 0) { throw 'go build 失败' }
 Assert-That '服务子命令可用（status 在未安装时给出明确错误）' (
     ((& $exe status 2>&1 | Out-String) -match 'not installed|服务操作失败')
@@ -324,7 +326,10 @@ try {
 
     Write-Host '== D) 换机迁移演练（T5.6）=='
     $export = Invoke-Http "$base/api/export" -HeaderArgs $auth
-    Assert-That '导出配置成功且不含明文凭证' ($export.Code -eq 200 -and $export.Body -notmatch 'sk-acceptance-key')
+    # 导出文件包含 API Key 明文（用户要求换机迁移可直接导入）
+    Assert-That '导出配置成功且包含明文凭证（迁移用）' ($export.Code -eq 200 -and $export.Body -match 'sk-acceptance-key')
+    $exportObj = $export.Body | ConvertFrom-Json
+    Assert-That '导出文件带格式标识' ($exportObj.format -eq 'agoramodel.providers/v1') "format=$($exportObj.format)"
 
     $gwB = Start-Gateway -DataDir $dataDirB -ConfigPath $cfgB -LogPath (Join-Path $tmp 'agora-p5-b.out') -PortValue $PortB
     [void]$procs.Add($gwB)
@@ -332,22 +337,8 @@ try {
     $keyB = Get-KeyFromLog (Join-Path $tmp 'agora-p5-b.out')
     Assert-That '迁移目标实例已就绪（独立数据目录 + 新网关 Key）' ($null -ne $keyB -and $keyB -ne $key)
 
-    $exportObj = $export.Body | ConvertFrom-Json
-    $first = $exportObj.providers[0]
-    $importPayload = @{
-        providers = @(
-            @{
-                id              = $first.id
-                name            = $first.name
-                openai_base_url = $first.openai_base_url
-                api_key         = 'sk-migrated-key'
-                models_selected = @($first.models_selected)
-                model_aliases   = @{}
-                allow_internal  = $true
-            }
-        )
-    } | ConvertTo-Json -Depth 6 -Compress
-    $imported = Invoke-Http "http://127.0.0.1:$PortB/api/import" -Method POST -HeaderArgs $json -Body $importPayload
+    # 直接把导出文件原样导入目标实例：凭证随文件迁移，导入时用目标机器的主密钥重新加密
+    $imported = Invoke-Http "http://127.0.0.1:$PortB/api/import" -Method POST -HeaderArgs $json -Body $export.Body
     Assert-That '在目标实例导入供应商成功' ($imported.Code -eq 200) "code=$($imported.Code)"
 
     $migratedChat = Invoke-Http "http://127.0.0.1:$PortB/v1/chat/completions" -Method POST `

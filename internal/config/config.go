@@ -44,7 +44,9 @@ type Provider struct {
 	Name                   string `json:"name"`
 	OpenAIBaseURL          string `json:"openai_base_url"`
 	OpenAIEndpointOverride string `json:"openai_endpoint_override"`
-	APIKey                 string `json:"api_key"`
+	// WebsiteURL 是供应商官网地址，仅用于在控制台展示与跳转，不参与转发。
+	WebsiteURL string `json:"website_url"`
+	APIKey     string `json:"api_key"`
 	// Models 是**已启用**的上游模型名（在供应商编辑页从拉取结果中勾选），顺序即展示顺序。
 	Models []string `json:"models"`
 	// ModelAliases 把上游模型名映射为对外别名；别名即 Agent 请求时使用的模型名。
@@ -241,7 +243,23 @@ func (f File) ValidateStaticAPIKey() error {
 }
 
 // Normalize 补齐默认值并校验，返回可直接构建快照的配置。
+//
+// 未配置任何启用的供应商时返回 ErrNoProviders —— 这是**校验用户提供的引导配置**时
+// 的期望行为：写了 providers 却全部停用，几乎一定是配错了。
+// 运行时快照请用 NormalizeAllowEmpty。
 func (f File) Normalize() (File, error) {
+	return f.normalize(true)
+}
+
+// NormalizeAllowEmpty 与 Normalize 相同，但允许一个启用的供应商都没有。
+//
+// 运行时快照用这个：全新安装时数据库本来就是空的，用户必须先能启动网关，
+// 才能通过 Web UI 添加第一个供应商；同理，删掉最后一个供应商也不该失败。
+func (f File) NormalizeAllowEmpty() (File, error) {
+	return f.normalize(false)
+}
+
+func (f File) normalize(requireProviders bool) (File, error) {
 	if f.Gateway.Listen == "" {
 		f.Gateway.Listen = DefaultListen
 	}
@@ -279,7 +297,7 @@ func (f File) Normalize() (File, error) {
 			enabled++
 		}
 	}
-	if enabled == 0 {
+	if enabled == 0 && requireProviders {
 		return File{}, ErrNoProviders
 	}
 	return f, nil
@@ -328,6 +346,17 @@ func (p *Provider) normalize(idx int) {
 	p.CleanSelection()
 	p.OpenAIBaseURL = strings.TrimRight(strings.TrimSpace(p.OpenAIBaseURL), "/")
 	p.OpenAIEndpointOverride = strings.TrimSpace(p.OpenAIEndpointOverride)
+	p.WebsiteURL = strings.TrimSpace(p.WebsiteURL)
+}
+
+// ValidateWebsiteURL 校验供应商官网地址：为空合法，非空必须是 http/https URL。
+//
+// 官网地址只用于控制台展示与跳转，不参与出站请求，因此不做 SSRF（内网 IP）校验。
+func (p *Provider) ValidateWebsiteURL() error {
+	if strings.TrimSpace(p.WebsiteURL) == "" {
+		return nil
+	}
+	return validateUpstreamURL(p.WebsiteURL, "providers["+p.ID+"].website_url")
 }
 
 // validate 做基础校验；SSRF 的 IP 段校验在 store 保存时补充。
@@ -342,6 +371,9 @@ func (p *Provider) validate() error {
 		if err := validateUpstreamURL(f.value, "providers["+p.ID+"]."+f.field); err != nil {
 			return err
 		}
+	}
+	if err := p.ValidateWebsiteURL(); err != nil {
+		return err
 	}
 	if p.Endpoint() == "" {
 		return fmt.Errorf("providers[%s] 必须配置 openai_base_url 或 openai_endpoint_override", p.ID)

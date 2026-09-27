@@ -234,6 +234,7 @@ try {
 
     $settings = Invoke-Http "$base/api/settings" -HeaderArgs $authHeader
     Assert-That 'GET /api/settings 返回监听与 Key 掩码' ($settings.Code -eq 200 -and $settings.Body -match '"gateway_key_hint":"gw-')
+    Assert-That 'GET /api/settings 返回可复制的明文网关 Key' ($settings.Code -eq 200 -and $settings.Body -match [regex]::Escape($key) -and $settings.Body -match '"gateway_key_revealable":true')
 
     $deleted = Invoke-Http "$base/api/providers/$newId" -Method DELETE -HeaderArgs $authHeader
     Assert-That 'DELETE /api/providers/{id} 成功' ($deleted.Code -eq 200) "code=$($deleted.Code)"

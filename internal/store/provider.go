@@ -22,8 +22,10 @@ type ProviderRecord struct {
 	Name                   string
 	OpenAIBaseURL          string
 	OpenAIEndpointOverride string
-	APIKeyCipher           []byte
-	APIKeyHint             string
+	// WebsiteURL 是供应商官网地址（仅展示用）。
+	WebsiteURL   string
+	APIKeyCipher []byte
+	APIKeyHint   string
 	// ModelsSelected 是已勾选启用的上游模型名（顺序即展示顺序）。
 	ModelsSelected []string
 	// ModelAliases 把上游模型名映射为对外别名。
@@ -44,7 +46,7 @@ type ProviderRecord struct {
 const providerColumns = `id, name, openai_base_url, openai_endpoint_override,
 	api_key_cipher, api_key_hint, models_selected_json, models_alias_json,
 	timeout_seconds, extra_headers_json, extra_body_json, allow_internal, enabled,
-	created_at, updated_at, last_fetch_at, last_fetch_error`
+	created_at, updated_at, last_fetch_at, last_fetch_error, website_url`
 
 // UpsertProvider 写入或更新一条供应商记录（不做加密，调用方负责传入密文）。
 func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
@@ -72,7 +74,7 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 	}
 
 	const q = `INSERT INTO providers (` + providerColumns + `)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			openai_base_url=excluded.openai_base_url,
@@ -86,6 +88,7 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 			extra_body_json=excluded.extra_body_json,
 			allow_internal=excluded.allow_internal,
 			enabled=excluded.enabled,
+			website_url=excluded.website_url,
 			updated_at=excluded.updated_at`
 
 	_, err = s.db.ExecContext(ctx, q,
@@ -94,7 +97,7 @@ func (s *Store) UpsertProvider(ctx context.Context, rec ProviderRecord) error {
 		rec.TimeoutSeconds, string(headers), string(body),
 		boolToInt(rec.AllowInternal), boolToInt(rec.Enabled),
 		rec.CreatedAt.UTC().Format(time.RFC3339), rec.UpdatedAt.UTC().Format(time.RFC3339),
-		formatTime(rec.LastFetchAt), rec.LastFetchError,
+		formatTime(rec.LastFetchAt), rec.LastFetchError, rec.WebsiteURL,
 	)
 	if err != nil {
 		return fmt.Errorf("写入供应商 %s 失败: %w", rec.ID, err)
@@ -197,6 +200,7 @@ func (s *Store) SaveProvider(ctx context.Context, master []byte, p config.Provid
 		Name:                   p.Name,
 		OpenAIBaseURL:          p.OpenAIBaseURL,
 		OpenAIEndpointOverride: p.OpenAIEndpointOverride,
+		WebsiteURL:             p.WebsiteURL,
 		APIKeyCipher:           cipherText,
 		APIKeyHint:             crypto.Mask(p.APIKey),
 		ModelsSelected:         p.Models,
@@ -234,6 +238,7 @@ func (s *Store) LoadProviders(ctx context.Context, master []byte) ([]config.Prov
 			Name:                   rec.Name,
 			OpenAIBaseURL:          rec.OpenAIBaseURL,
 			OpenAIEndpointOverride: rec.OpenAIEndpointOverride,
+			WebsiteURL:             rec.WebsiteURL,
 			APIKey:                 string(plain),
 			Models:                 rec.ModelsSelected,
 			ModelAliases:           rec.ModelAliases,
@@ -264,7 +269,7 @@ func scanProvider(row rowScanner) (ProviderRecord, error) {
 		&rec.ID, &rec.Name, &rec.OpenAIBaseURL, &rec.OpenAIEndpointOverride,
 		&rec.APIKeyCipher, &rec.APIKeyHint, &selected, &aliases,
 		&rec.TimeoutSeconds, &headers, &body, &allowInternal, &enabled,
-		&createdAt, &updatedAt, &lastFetchAt, &rec.LastFetchError,
+		&createdAt, &updatedAt, &lastFetchAt, &rec.LastFetchError, &rec.WebsiteURL,
 	)
 	if err != nil {
 		return ProviderRecord{}, err

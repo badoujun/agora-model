@@ -2,6 +2,8 @@
 /dist/
 /web/dist/
 /web/node_modules/
+# npm 分发包产物（npm/scripts/build.mjs 生成，内含各平台二进制）
+/npm/dist/
 # 前端构建产物内嵌到 Go 包，仅保留占位文件以支持未构建时的编译
 /internal/webui/dist/*
 !/internal/webui/dist/robots.txt

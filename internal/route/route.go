@@ -56,7 +56,15 @@ func Resolve(snap *config.Snapshot, model string) (Result, error) {
 		}
 	}
 
-	for _, p := range snap.Providers() {
+	providers := snap.Providers()
+	if len(providers) == 0 {
+		// 全新安装的常见状态：说清楚"没有供应商"而不是笼统的"模型不存在"
+		return Result{}, fmt.Errorf(
+			"%w：网关尚未配置任何供应商，无法路由模型 %q（请在 Web UI 的「供应商管理」中添加）",
+			ErrModelNotFound, model)
+	}
+
+	for _, p := range providers {
 		real, known := p.RealModel(model)
 		if !known {
 			continue

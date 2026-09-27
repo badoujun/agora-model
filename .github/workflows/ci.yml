@@ -50,7 +50,8 @@ jobs:
           mkdir -p dist
           out="dist/agoramodel-$GOOS-$GOARCH"
           if [ "$GOOS" = "windows" ]; then out="$out.exe"; fi
-          go build -trimpath -ldflags "-s -w -X main.version=ci-${GITHUB_SHA::7}" -o "$out" ./cmd/agoramodel
+          # 不注入版本号：使用 cmd/agoramodel 内置的语义化版本号（控制台左上角显示它）
+          go build -trimpath -ldflags "-s -w" -o "$out" ./cmd/agoramodel
           echo "OUT=$out" >> "$GITHUB_ENV"
 
       - name: 校验 CGO 已关闭

@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { NavLink } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { Boxes, LogOut, Radio, ScrollText, Server } from 'lucide-react'
+import { Boxes, HardDrive, LogOut, Radio, ScrollText, Server } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { to: '/models', label: '模型列表', icon: Boxes },
   { to: '/settings', label: '网关设置', icon: Radio },
   { to: '/logs', label: '请求日志', icon: ScrollText },
+  { to: '/data', label: '数据位置', icon: HardDrive },
 ]
 
 export function Layout({

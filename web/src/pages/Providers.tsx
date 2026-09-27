@@ -1,8 +1,18 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, CloudDownload, Pencil, Plug, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import {
+  Check,
+  CloudDownload,
+  Download,
+  Pencil,
+  Plug,
+  Plus,
+  RefreshCw,
+  Trash2,
+  Upload,
+} from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
-import type { ProviderDTO, ProviderInput, TestResult } from '@/lib/types'
+import type { DraftFetchInput, ProviderDTO, ProviderInput, TestResult } from '@/lib/types'
 import { formatRelative } from '@/lib/utils'
 import { useToast } from '@/components/ui/toast'
 import { Button } from '@/components/ui/button'
@@ -24,6 +34,8 @@ import {
 interface FormState {
   id?: string
   name: string
+  /** 供应商官网地址（仅展示用） */
+  website_url: string
   openai_base_url: string
   openai_endpoint_override: string
   api_key: string
@@ -42,6 +54,7 @@ interface FormState {
 
 const EMPTY_FORM: FormState = {
   name: '',
+  website_url: '',
   openai_base_url: '',
   openai_endpoint_override: '',
   api_key: '',
@@ -77,6 +90,7 @@ function toForm(p: ProviderDTO): FormState {
   return {
     id: p.id,
     name: p.name,
+    website_url: p.website_url ?? '',
     openai_base_url: p.openai_base_url ?? '',
     openai_endpoint_override: p.openai_endpoint_override ?? '',
     api_key: '',
@@ -118,6 +132,8 @@ function toInput(form: FormState): ProviderInput {
 
   const input: ProviderInput = {
     name: form.name.trim(),
+    // 始终传官网地址：空串表示清空
+    website_url: form.website_url.trim(),
     openai_base_url: form.openai_base_url.trim(),
     openai_endpoint_override: form.openai_endpoint_override.trim(),
     models_selected: modelsSelected,
@@ -138,9 +154,30 @@ function toInput(form: FormState): ProviderInput {
   return input
 }
 
+/** 未保存的供应商只能按表单里填写的信息拉取：单独组装草稿请求体。 */
+function toDraftInput(form: FormState): DraftFetchInput {
+  const headers = parseJSONField(form.extra_headers, '额外请求头') as Record<string, string> | undefined
+  return {
+    openai_base_url: form.openai_base_url.trim(),
+    openai_endpoint_override: form.openai_endpoint_override.trim(),
+    api_key: form.api_key.trim(),
+    extra_headers: headers,
+    timeout_seconds: form.timeout_seconds,
+    allow_internal: form.allow_internal,
+  }
+}
+
+/** 导出文件名里的时间戳（本地时区，便于区分多次导出）。 */
+function fileStamp(): string {
+  const now = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+}
+
 export function ProvidersPage() {
   const toast = useToast()
   const queryClient = useQueryClient()
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
   const [modelFilter, setModelFilter] = useState('')
@@ -161,15 +198,13 @@ export function ProvidersPage() {
     },
     onSuccess: async (saved, variables) => {
       await invalidateAll()
-      setForm((prev) => ({ ...toForm(saved), aliases: { ...prev.aliases } }))
-      if (variables.id) {
-        setDialogOpen(false)
-        toast.show(`已保存供应商「${saved.name || saved.id}」`, 'success')
-        return
-      }
-      // 新建成功后保持编辑状态，方便立即拉取并勾选模型
-      toast.show(`已创建「${saved.name || saved.id}」，正在拉取模型…`, 'success')
-      fetchModels.mutate(saved.id)
+      setDialogOpen(false)
+      toast.show(
+        variables.id
+          ? `已保存供应商「${saved.name || saved.id}」`
+          : `已创建「${saved.name || saved.id}」${saved.model_count === 0 ? '：还没有启用模型，可在编辑页拉取并勾选' : ''}`,
+        'success',
+      )
     },
     onError: (err: Error) => setFormError(err instanceof ApiError ? err.message : String(err)),
   })
@@ -183,21 +218,79 @@ export function ProvidersPage() {
     onError: (err: Error) => toast.show(`删除失败：${err.message}`, 'error'),
   })
 
+  // 拉取模型：已保存的供应商写候选缓存；未保存的走草稿接口，不落库
   const fetchModels = useMutation({
-    mutationFn: api.fetchModels,
-    onSuccess: async (updated) => {
+    mutationFn: async (state: FormState) => {
+      if (state.id) {
+        const updated = await api.fetchModels(state.id)
+        return { candidates: updated.candidate_models ?? [], saved: true }
+      }
+      const draft = await api.fetchDraftModels(toDraftInput(state))
+      return { candidates: draft.candidate_models ?? [], saved: false }
+    },
+    onSuccess: async ({ candidates, saved }) => {
       setForm((prev) => ({
         ...prev,
-        modelOrder: mergeModels(prev.modelOrder, updated.candidate_models ?? []),
+        modelOrder: mergeModels(prev.modelOrder, candidates),
         // 首次拉取：把候选全部勾上，用户再按需取消
-        selected: Object.keys(prev.selected).length === 0
-          ? Object.fromEntries((updated.candidate_models ?? []).map((m) => [m, true]))
-          : prev.selected,
+        selected:
+          Object.keys(prev.selected).length === 0
+            ? Object.fromEntries(candidates.map((m) => [m, true]))
+            : prev.selected,
       }))
-      await invalidateAll()
-      toast.show(`已拉取 ${updated.candidate_models?.length ?? 0} 个候选模型，请勾选要启用的模型`, 'success')
+      if (saved) {
+        await invalidateAll()
+      }
+      toast.show(
+        saved
+          ? `已拉取 ${candidates.length} 个候选模型，请勾选要启用的模型`
+          : `已拉取 ${candidates.length} 个候选模型（尚未保存，勾选后点「保存」写入）`,
+        'success',
+      )
     },
     onError: (err: Error) => toast.show(`拉取模型失败：${err.message}`, 'error'),
+  })
+
+  const exportProviders = useMutation({
+    mutationFn: api.exportProviders,
+    onSuccess: (payload) => {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `agoramodel-providers-${fileStamp()}.json`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+      toast.show(
+        `已导出 ${payload.providers.length} 个供应商；文件含 API Key 明文，请按凭证妥善保管`,
+        'success',
+      )
+    },
+    onError: (err: Error) => toast.show(`导出失败：${err.message}`, 'error'),
+  })
+
+  const importProviders = useMutation({
+    mutationFn: async (file: File) => {
+      const text = await file.text()
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        throw new Error('文件不是合法 JSON')
+      }
+      const list = (parsed as { providers?: unknown } | null)?.providers
+      if (!Array.isArray(list) || list.length === 0) {
+        throw new Error('文件里没有 providers 数组（请使用本页导出的文件）')
+      }
+      return api.importProviders({ providers: list as ProviderInput[] })
+    },
+    onSuccess: async (result) => {
+      await invalidateAll()
+      toast.show(`已导入 ${result.imported} 个供应商`, 'success')
+    },
+    onError: (err: Error) => toast.show(`导入失败：${err.message}`, 'error'),
   })
 
   const test = useMutation({
@@ -246,6 +339,20 @@ export function ProvidersPage() {
     setForm((prev) => ({ ...prev, aliases: { ...prev.aliases, [model]: value } }))
   }
 
+  /** 拉取模型与保存是两个独立动作：先做与后端一致的本地校验。 */
+  const startFetchModels = () => {
+    setFormError('')
+    if (form.openai_base_url.trim() === '' && form.openai_endpoint_override.trim() === '') {
+      setFormError('请先填写 OpenAI Base URL，再拉取模型')
+      return
+    }
+    if (!form.id && form.api_key.trim() === '') {
+      setFormError('请先填写 API Key，再拉取模型')
+      return
+    }
+    fetchModels.mutate(form)
+  }
+
   const submit = () => {
     setFormError('')
     if (form.name.trim() === '') {
@@ -283,10 +390,47 @@ export function ProvidersPage() {
             填写名称、OpenAI 兼容地址与 API Key，在编辑页拉取并勾选要启用的模型——所有 Agent 立即生效。
           </p>
         </div>
-        <Button onClick={openCreate}>
-          <Plus className="h-4 w-4" />
-          新增供应商
-        </Button>
+        <div className="flex items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              event.target.value = ''
+              if (file) importProviders.mutate(file)
+            }}
+          />
+          <Button
+            variant="outline"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importProviders.isPending}
+          >
+            <Upload className="h-4 w-4" />
+            {importProviders.isPending ? '导入中…' : '导入'}
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => {
+              if (
+                window.confirm(
+                  '导出文件包含所有供应商的 API Key 明文，请自行妥善保管。确认导出？',
+                )
+              ) {
+                exportProviders.mutate()
+              }
+            }}
+            disabled={exportProviders.isPending}
+          >
+            <Download className="h-4 w-4" />
+            {exportProviders.isPending ? '导出中…' : '导出'}
+          </Button>
+          <Button onClick={openCreate}>
+            <Plus className="h-4 w-4" />
+            新增供应商
+          </Button>
+        </div>
       </div>
 
       {testResult ? (
@@ -342,6 +486,7 @@ export function ProvidersPage() {
                 <TableRow>
                   <TableHead>名称</TableHead>
                   <TableHead>OpenAI 地址</TableHead>
+                  <TableHead>官网</TableHead>
                   <TableHead>已启用模型</TableHead>
                   <TableHead>最近拉取</TableHead>
                   <TableHead>状态</TableHead>
@@ -355,8 +500,23 @@ export function ProvidersPage() {
                       <div className="font-medium">{provider.name || provider.id}</div>
                       <div className="font-mono text-[11px] text-slate-400">{provider.id}</div>
                     </TableCell>
-                    <TableCell className="max-w-[260px] truncate font-mono text-xs">
+                    <TableCell className="max-w-[240px] truncate font-mono text-xs">
                       {provider.openai_base_url || <span className="text-slate-400">未配置</span>}
+                    </TableCell>
+                    <TableCell className="max-w-[180px] truncate text-xs">
+                      {provider.website_url ? (
+                        <a
+                          href={provider.website_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-sky-700 underline"
+                          title={provider.website_url}
+                        >
+                          {provider.website_url}
+                        </a>
+                      ) : (
+                        <span className="text-slate-400">—</span>
+                      )}
                     </TableCell>
                     <TableCell>{provider.model_count}</TableCell>
                     <TableCell className="text-xs">
@@ -422,14 +582,14 @@ export function ProvidersPage() {
         open={dialogOpen}
         onClose={() => setDialogOpen(false)}
         title={form.id ? '编辑供应商' : '新增供应商'}
-        description="上游只需提供 OpenAI 兼容接口；模型在此处拉取后勾选，未勾选的模型不会对外暴露。"
+        description="上游只需提供 OpenAI 兼容接口；模型可在保存前先拉取勾选，保存后立即对外生效。"
         footer={
           <>
             <Button variant="outline" onClick={() => setDialogOpen(false)}>
               取消
             </Button>
             <Button onClick={submit} disabled={save.isPending}>
-              {save.isPending ? '保存中…' : form.id ? '保存' : '保存并拉取模型'}
+              {save.isPending ? '保存中…' : '保存'}
             </Button>
           </>
         }
@@ -445,6 +605,19 @@ export function ProvidersPage() {
             />
             <p className="text-xs text-slate-500">
               名称即模型命名空间前缀（<code className="rounded bg-slate-100 px-1">{`${form.name || '名称'}/模型名`}</code>），需唯一。
+            </p>
+          </div>
+
+          <div className="grid gap-1.5">
+            <Label htmlFor="p-website">供应商官网地址</Label>
+            <Input
+              id="p-website"
+              value={form.website_url}
+              onChange={(event) => setForm({ ...form, website_url: event.target.value })}
+              placeholder="https://example.com"
+            />
+            <p className="text-xs text-slate-500">
+              用于记录供应商后台/定价页地址，仅在列表页展示为可点击链接，不参与转发。
             </p>
           </div>
 
@@ -489,9 +662,9 @@ export function ProvidersPage() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => form.id && fetchModels.mutate(form.id)}
-                  disabled={!form.id || fetchModels.isPending}
-                  title={form.id ? '从上游 /models 拉取候选模型' : '请先保存供应商，再拉取模型'}
+                  onClick={startFetchModels}
+                  disabled={fetchModels.isPending}
+                  title="按上方填写的 Base URL 与 API Key 拉取上游 /models"
                 >
                   {fetchModels.isPending ? (
                     <RefreshCw className="h-4 w-4 animate-spin" />
@@ -504,7 +677,9 @@ export function ProvidersPage() {
             </div>
 
             {!form.id ? (
-              <p className="text-xs text-amber-700">保存后即可拉取上游模型并勾选。</p>
+              <p className="text-xs text-amber-700">
+                无需先保存：填好 Base URL 与 API Key 即可点「拉取模型」，勾选后再点底部「保存」写入。
+              </p>
             ) : null}
 
             {form.modelOrder.length === 0 ? (

@@ -24,6 +24,7 @@ var migrations = []migration{
 	{version: 1, name: "init", statements: schemaV1},
 	{version: 2, name: "provider_fetch_status", statements: schemaV2},
 	{version: 3, name: "single_protocol_model_selection", statements: schemaV3},
+	{version: 4, name: "provider_website_and_gateway_key_cipher", statements: schemaV4},
 }
 
 type migration struct {
@@ -226,4 +227,11 @@ var schemaV3 = []string{
 	`ALTER TABLE providers DROP COLUMN models_excluded_json`,
 	`ALTER TABLE providers DROP COLUMN auto_fetch_models`,
 	`ALTER TABLE providers DROP COLUMN priority`,
+}
+
+// schemaV4 为供应商补上官网地址，并让网关 Key 也能保存明文的密文
+// （控制台可随时查看/复制当前网关 Key；哈希列仍用于校验，明文永不落库）。
+var schemaV4 = []string{
+	`ALTER TABLE providers ADD COLUMN website_url TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE gateway_keys ADD COLUMN key_cipher BLOB`,
 }
