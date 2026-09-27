@@ -28,6 +28,14 @@ Set-Location $PSScriptRoot
 . (Join-Path $PSScriptRoot 'tools\lib\toolchain.ps1')
 Add-ToolchainToPath
 
+# Go 模块代理兜底：受限网络（内网 / 大陆直连）常常连不上 proxy.golang.org，
+# 表现为 go build 拉依赖时 dial tcp 超时。仅在调用方未显式设置 GOPROXY 时给出镜像默认值，
+# 保留环境变量覆盖能力（镜像与 tools/smoke/*.ps1 保持一致）。
+if (-not $env:GOPROXY) {
+    $env:GOPROXY = 'https://goproxy.cn,direct'
+    Write-Host "[toolchain] GOPROXY=$env:GOPROXY（默认镜像；可设环境变量覆盖）" -ForegroundColor DarkGray
+}
+
 if (-not $Version) {
     $Version = (git describe --tags --always --dirty 2>$null)
     if (-not $Version) { $Version = 'dev' }
@@ -76,8 +84,27 @@ function Invoke-GoBuild {
     $env:GOOS = $Os
     $env:GOARCH = $Arch
     try {
-        & go build -trimpath -ldflags $ldflags -o $out $cmd
-        if ($LASTEXITCODE -ne 0) { throw "构建失败：$Os/$Arch" }
+        # 输出经临时文件捕获：既避免原生命令 stderr 与 $ErrorActionPreference='Stop' 相互干扰，
+        # 又能在失败时区分「依赖下载失败」和普通编译错误。
+        $log = Join-Path ([System.IO.Path]::GetTempPath()) "agoramodel-build-$Os-$Arch.log"
+        & go build -trimpath -ldflags $ldflags -o $out $cmd > $log 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $text = if (Test-Path $log) { (Get-Content $log -Raw) } else { '' }
+            if ($text) { Write-Host $text.TrimEnd() }
+            if ($text -match 'dial tcp|connectex|proxy\.golang\.org|no such host|i/o timeout|connection refused|TLS handshake|x509') {
+                throw @"
+构建失败：$Os/$Arch —— Go 依赖下载失败，连不上模块代理。
+当前 GOPROXY=$env:GOPROXY
+
+请任选其一后重试：
+  1) 临时改用镜像（仅当前终端）：`$env:GOPROXY = 'https://goproxy.cn,direct'
+  2) 持久化到本机：go env -w GOPROXY=https://goproxy.cn,direct
+  3) 依赖已在本机缓存时强制离线：`$env:GOPROXY = 'off'
+"@
+            }
+            throw "构建失败：$Os/$Arch"
+        }
+        Remove-Item $log -ErrorAction SilentlyContinue
     }
     finally {
         Remove-Item Env:GOOS, Env:GOARCH -ErrorAction SilentlyContinue

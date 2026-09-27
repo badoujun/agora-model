@@ -27,6 +27,7 @@ Thumbs.db
 
 # ---- 工具运行时目录（Reasonix 等 agent 宿主）----
 .reasonix/
+.codegraph/
 
 # ---- Go ----
 *.test
