@@ -78,11 +78,31 @@ jobs:
           fi
           chmod +x "$OUT" 2>/dev/null || true
 
-          PORT=9999 node tools/mock-upstream/server.mjs > /tmp/mock.log 2>&1 &
+          # mock 上游日志用 GitHub Actions 提供的 $RUNNER_TEMP（跨平台：windows 上
+          # 是 C:\Users\<user>\AppData\Local\Temp；unix 上是 /tmp）。避免直接用 /tmp，
+          # Windows runner 默认 bash 里 /tmp 不一定可写，会让 mock 进程 stdout 重定向失败
+          # 而静默退出（不监听 9999），后续透传报 connection refused。
+          TMP_DIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+          mock_log="$TMP_DIR/mock.log"
+          gw_log="$TMP_DIR/gw.log"
+          PORT=9999 node tools/mock-upstream/server.mjs > "$mock_log" 2>&1 &
           mock_pid=$!
 
+          # 等 mock 上游真的开始监听 9999（最多 10 秒）。这样如果 mock 进程因为
+          # 端口冲突、node 路径问题、stdout 重定向失败等原因没起来，能立刻报错。
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:9999/v1/models > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          if ! curl -fsS http://127.0.0.1:9999/v1/models > /dev/null 2>&1; then
+            echo "mock upstream 未在 9999 端口监听"
+            echo "--- mock.log ---"
+            cat "$mock_log" || true
+            exit 1
+          fi
+          echo "mock upstream ready"
+
           data_dir="$(mktemp -d)"
-          gw_log=/tmp/gw.log
           # Phase 2 起 config.example.json 里的 api_key 不参与认证：网关 Key 由数据库生成，
           # 首次启动会打印明文一次，从日志中取回。
           "$OUT" --config config.example.json --data-dir "$data_dir" \
