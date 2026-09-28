@@ -52,7 +52,11 @@ jobs:
           if [ "$GOOS" = "windows" ]; then out="$out.exe"; fi
           # 不注入版本号：使用 cmd/agoramodel 内置的语义化版本号（控制台左上角显示它）
           go build -trimpath -ldflags "-s -w" -o "$out" ./cmd/agoramodel
+          # 跨 step 共享：后续「校验 CGO 已关闭」与「冒烟」step 需要 $OUT / $GOOS / $GOARCH。
+          # 用 GitHub 官方支持的「echo >> $GITHUB_ENV」形式持久化（不会自动 export 到当前 shell，但会被注入到后续 step）。
           echo "OUT=$out" >> "$GITHUB_ENV"
+          echo "GOOS=$GOOS" >> "$GITHUB_ENV"
+          echo "GOARCH=$GOARCH" >> "$GITHUB_ENV"
 
       - name: 校验 CGO 已关闭
         shell: bash
