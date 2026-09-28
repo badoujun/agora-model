@@ -4,8 +4,12 @@
 // 用途：本地模拟 OpenAI / Anthropic 两种协议的上游，用于验证网关的透传、头改写、
 //      SSE 心跳保活、超时与错误处理；并提供 /__requests 便于自动化断言。
 //
-// 启动：node tools/mock-upstream/server.mjs            （默认端口 9999）
-//       PORT=9999 node tools/mock-upstream/server.mjs
+// 启动：node --no-deprecation tools/mock-upstream/server.mjs   （默认端口 9999）
+//       PORT=9999 node --no-deprecation tools/mock-upstream/server.mjs
+//
+// 加上 --no-deprecation 是为了抑制 Node 22+ 的 DEP0040 (punycode) 与
+// DEP0169 (url.parse) 警告：mock 用 `new URL(req.url, ...)` 解析请求时，
+// 内部 URL 实现会间接触发这两条 deprecation，但脚本本身无相关问题。
 //
 // 行为开关（URL query 参数，优先级高于环境变量）：
 //   status=401|429|500   直接返回该状态码（JSON 错误体）

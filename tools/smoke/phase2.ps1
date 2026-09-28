@@ -170,7 +170,7 @@ $logE = Join-Path $tmp 'agora-p2-e.out'
 
 $env:PORT = "$MockPort"
 $mockOut = Join-Path $tmp 'agora-p2-mock.out'
-$mock = Start-Process node -ArgumentList 'tools/mock-upstream/server.mjs' -PassThru `
+$mock = Start-Process node -ArgumentList '--no-deprecation', 'tools/mock-upstream/server.mjs' -PassThru `
     -RedirectStandardOutput $mockOut -RedirectStandardError "$mockOut.err" -WindowStyle Hidden
 Start-Sleep -Seconds 2
 

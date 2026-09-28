@@ -21,9 +21,9 @@ jobs:
           - { runner: macos-latest,   goos: darwin,  goarch: amd64 }
           - { runner: macos-latest,   goos: darwin,  goarch: arm64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           # 由 go.mod 决定（当前 1.25+，受 modernc.org/sqlite 最低版本要求约束）
           go-version-file: go.mod
@@ -85,7 +85,7 @@ jobs:
           TMP_DIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
           mock_log="$TMP_DIR/mock.log"
           gw_log="$TMP_DIR/gw.log"
-          PORT=9999 node tools/mock-upstream/server.mjs > "$mock_log" 2>&1 &
+          PORT=9999 node --no-deprecation tools/mock-upstream/server.mjs > "$mock_log" 2>&1 &
           mock_pid=$!
 
           # 等 mock 上游真的开始监听 9999（最多 10 秒）。这样如果 mock 进程因为
@@ -158,9 +158,9 @@ jobs:
     name: race detector (linux/amd64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true

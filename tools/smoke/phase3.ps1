@@ -105,7 +105,7 @@ $unknownNS = Save-Text (Join-Path $tmp 'agora-p3-unknown-ns.json') '{"model":"no
 
 $env:PORT = "$MockPort"
 $mockOut = Join-Path $tmp 'agora-p3-mock.out'
-$mock = Start-Process node -ArgumentList 'tools/mock-upstream/server.mjs' -PassThru `
+$mock = Start-Process node -ArgumentList '--no-deprecation', 'tools/mock-upstream/server.mjs' -PassThru `
     -RedirectStandardOutput $mockOut -RedirectStandardError "$mockOut.err" -WindowStyle Hidden
 Start-Sleep -Seconds 2
 

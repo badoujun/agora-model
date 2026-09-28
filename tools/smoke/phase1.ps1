@@ -114,7 +114,7 @@ $gwOut = Join-Path $tmp 'agora-gw.out'
 $dataDir = Join-Path $tmp 'agora-smoke-data'
 if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }
 $env:PORT = "$MockPort"
-$mock = Start-Process node -ArgumentList 'tools/mock-upstream/server.mjs' -PassThru `
+$mock = Start-Process node -ArgumentList '--no-deprecation', 'tools/mock-upstream/server.mjs' -PassThru `
     -RedirectStandardOutput $mockOut -RedirectStandardError "$mockOut.err" -WindowStyle Hidden
 $gw = Start-Process $exe -ArgumentList '--config', $cfgFile, '--data-dir', $dataDir, '--log-level', 'debug' -PassThru `
     -RedirectStandardOutput $gwOut -RedirectStandardError "$gwOut.err" -WindowStyle Hidden
