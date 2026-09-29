@@ -383,9 +383,14 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
     本机平台产物（`ldd` 对 Mach-O / PE 产物没有意义）；② `tools/dev/preflight.sh` 现打印 `go` 的
     绝对路径，并在其来自非标准位置时告警——本轮就真实踩到「PATH 里混入临时解压的 Go 工具链
     （`/tmp/gotk`），实际生效版本与预期不符」，删掉后系统 `/usr/bin/go` 才生效。
-  - **未实测**：Windows / macOS 上的 Node 版冒烟脚本（本机只有 Linux）；Linux 上的 systemd 服务化
-    实机注册（需 root，见 T5.7）。Windows 侧构建入口不变（`build.ps1` 照旧），仅冒烟命令由
-    `pwsh -File tools/smoke/phaseN.ps1` 换成 `node tools/smoke/phaseN.mjs`。
+  - **CI 实测（三平台）**：推送后流水线 7/7 job 全绿，`phase1–4` 在 linux / windows / macos 上
+    用 `--exe` 复用发布产物跑出完全一致的结果（20/22/20/31）。这同时证明了几件本地无法验证的事：
+    Windows 侧 bash 步骤调用 `npm --prefix web ci` 可行、`--exe` 能正确解析 `.exe` 产物、
+    「先构建前端再 embed」的新顺序成立。原先「Windows / macOS 上的 Node 版冒烟未实测」到此关闭
+    （Windows 侧构建入口不变，仅冒烟命令由 `pwsh -File tools/smoke/phaseN.ps1` 换成
+    `node tools/smoke/phaseN.mjs`）。
+  - **未实测**：Linux 上的 systemd 服务化实机注册（需 root，见 T5.7）；macOS 上的 Gatekeeper
+    拦截与 launchd 实际行为。
 
 ---
 

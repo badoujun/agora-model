@@ -31,7 +31,8 @@ jobs:
 
       # 冒烟脚本是 Node（tools/smoke/*.mjs），三平台共用同一份，
       # 因此 runner 上必须有 Node（托管 runner 自带，这里显式固定版本）。
-      - uses: actions/setup-node@v4
+      # 用 v5 而非 v4：v4 的 action 自身运行在 Node 20 runtime，已被 GitHub 弃用并强制升到 24。
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
 
