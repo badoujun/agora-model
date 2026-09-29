@@ -84,6 +84,8 @@ type harness struct {
 	upstreamURL string
 	dataDir     string
 	reloadCount int
+	// apiServer 仅在新 harnessWithPresets 中设置（用于直接调用 Server 上的私有方法做测试）
+	apiServer *Server
 }
 
 // newHarness 构造一个带真实 SQLite 的控制面测试服务（含 mock 上游）。

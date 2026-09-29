@@ -16,6 +16,7 @@ import (
 	"agora-model/internal/config"
 	"agora-model/internal/crypto"
 	"agora-model/internal/models"
+	"agora-model/internal/presets"
 	"agora-model/internal/store"
 )
 
@@ -32,6 +33,8 @@ type Options struct {
 	LocalOnly bool
 	// Paths 是「数据位置」页面展示的本地落点（由 main 按实际启动参数填充）。
 	Paths DataPaths
+	// Presets 提供「国内常用供应商」预设列表；为空时 /api/provider-presets 返回 503。
+	Presets *presets.Store
 }
 
 // DataPaths 描述本程序在磁盘上产生的数据位置。
@@ -61,6 +64,7 @@ type Server struct {
 	auth      *Authenticator
 	client    *http.Client
 	fetcher   *models.Fetcher
+	presets   *presets.Store
 }
 
 // New 创建控制面服务。
@@ -80,6 +84,7 @@ func New(opts Options) *Server {
 		paths:     opts.Paths,
 		auth:      NewAuthenticator(opts.AdminPassword),
 		fetcher:   models.NewFetcher(),
+		presets:   opts.Presets,
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
@@ -125,6 +130,19 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 	// 数据位置（本机落盘路径）
 	mux.HandleFunc("GET /api/data-locations", s.guard(s.handleDataLocations))
+
+	// 预设供应商（国内常用，编译期内置；用户可在 docs/provider-presets.json 覆盖）
+	mux.HandleFunc("GET /api/provider-presets", s.guard(s.handleListProviderPresets))
+
+	// WebDAV 同步：状态探测 / 测试连接 / 推送 / 拉取
+	mux.HandleFunc("GET /api/sync/webdav/status", s.guard(s.handleWebDAVStatus))
+	mux.HandleFunc("GET /api/sync/webdav/test", s.guard(s.handleWebDAVTest))
+	mux.HandleFunc("POST /api/sync/webdav/push", s.guard(s.handleWebDAVPush))
+	mux.HandleFunc("POST /api/sync/webdav/pull", s.guard(s.handleWebDAVPull))
+
+	// WebDAV 配置读写
+	mux.HandleFunc("GET /api/settings/webdav", s.guard(s.handleGetWebDAVConfig))
+	mux.HandleFunc("PUT /api/settings/webdav", s.guard(s.handleUpdateWebDAVConfig))
 }
 
 // guard 包装需要授权的处理器。

@@ -50,6 +50,10 @@ pwsh -File build.ps1 -Target dist   # Windows
 
 > 首次在 Linux / macOS 上开发，先跑 `./tools/dev/preflight.sh`：它按 `go.mod` 声明比对
 > Go 版本，并给出 Node / make / git 缺失时的安装命令。
+>
+> 该脚本用 bash 写（靠 `${BASH_SOURCE[0]}` 定位仓库根、并开了 `pipefail`），请**直接执行
+> 或用 `bash` 调用**：Debian / Ubuntu 上 `/bin/sh` 是 dash，`sh ./tools/dev/preflight.sh`
+> 会直接报错退出（脚本专门拦了这种情况，以免对着文件系统根目录跑完还报「环境就绪」）。
 
 > 只构建本机平台：`go build -o agoramodel ./cmd/agoramodel`（前端需先 `npm --prefix web ci && npm --prefix web run build`）。
 
@@ -93,6 +97,7 @@ export OPENAI_API_KEY=gw-你的网关Key
 | `--log-format` | — | `text` | `text` 或 `json` |
 | `--log-level` | — | `info` | `debug` / `info` / `warn` / `error` |
 | `--log-file` | — | 空（写 stdout） | 日志文件路径（追加写入，自动建目录）；**服务模式没有控制台，必须落文件**，`install` 时缺省为 `<数据目录>/logs/agoramodel.log` |
+| `--presets` | — | 编译期内置 | 国内常用供应商预设 JSON；为空时使用内置的 DeepSeek / MiniMax / SCNet / Agnes |
 | `--service-env` | — | 空 | 仅 `install`：注入服务进程的环境变量，可重复（如 `--service-env ADMIN_PASSWORD=…`）；**明文会写入服务配置** |
 | `--service-exec` | — | 空 | 仅 `install`：服务要运行的可执行文件；缺省把当前二进制复制到 `<数据目录>/bin/` 后运行该副本 |
 | — | `GW_MASTER_KEY` | 空 | 主密钥（64 位 hex）；**推荐用它替代 master.key 文件** |
@@ -215,12 +220,49 @@ npm uninstall -g @bakeroot/agoramodel  # 再卸载包
 
 | 页面 | 用途 |
 | --- | --- |
-| 供应商管理 | 列表 / 新增 / 编辑 / 删除、**导入 / 导出 JSON**、**连接测试**、**拉取模型并勾选（可设别称，保存前也能拉）**、官网地址、启用停用 |
+| 供应商管理 | 列表 / 新增 / 编辑 / 删除、**从国内常用预设填充**、**导入 / 导出 JSON**、**连接测试**、**拉取模型并勾选（可设别称，保存前也能拉）**、官网地址、启用停用 |
 | 模型列表 | 已启用模型的对外名与上游名对照、来源供应商、默认路由标注、搜索 |
-| 网关设置 | 网关 Key（明文，可一键复制 / 重置）、Agent 环境变量片段一键复制、成功日志开关 |
+| 网关设置 | 网关 Key（明文，可一键复制 / 重置）、Agent 环境变量片段一键复制、成功日志开关、**WebDAV 同步配置（推送 / 拉取 / 状态）** |
 | 请求日志 | 按状态码 / 模型（模糊匹配，忽略大小写）/ 供应商 / 仅失败筛选，分页与错误展开，可 5 秒自动刷新 |
 | 数据位置 | 按当前系统列出数据目录 / 数据库 / 主密钥 / 日志等落盘路径、占用大小，一键复制路径 |
 | 登录页 | 仅当设置了 `ADMIN_PASSWORD` 时出现 |
+
+## 国内常用供应商预设
+
+内置 4 个国内常用 OpenAI 兼容供应商模板（`internal/presets/builtin.json` 与
+`docs/provider-presets.json` 同步维护）：
+
+| ID | 名称 | Base URL |
+| --- | --- | --- |
+| `deepseek` | DeepSeek | `https://api.deepseek.com/v1` |
+| `minimax` | MiniMax | `https://api.minimaxi.com/v1`（中国站） |
+| `scnet` | 国家超算互联网 | `https://api.scnet.cn/api/llm/v1` |
+| `agnes` | Agnes AI | `https://api.agnes-ai.cn/v1`（中国站） |
+
+在「供应商管理」页右上角点 **「从预设…」**，选模板后会在 **「新增供应商」** 对话框里
+自动填入名称、官网地址与 OpenAI Base URL；接下来仍是原有流程：填入 API Key →
+拉取并勾选要启用的模型 → 保存。预设只是把固定的字段先填好，校验、保存、加密、
+拉取模型等行为与手动新增完全一致。
+
+> 自定义模板：把编辑好的 JSON 放到 `docs/provider-presets.json`，再用
+> `--presets docs/provider-presets.json` 启动二进制即可；不指定则使用编译期内置版本。
+
+## WebDAV 配置同步（多机/备份）
+
+把全部供应商配置（含 API Key 明文）同步到自有 WebDAV 服务器，便于多机部署、备份与
+回滚。在「网关设置」底部填写服务器地址、用户名、密码（与供应商 API Key、网关 Key
+同样以 AES-256-GCM 加密落库），即可使用：
+
+- **推送本地 → 远端**：在 `provider` 标签页上方新增/删除/调整供应商后推一把。
+- **拉取远端 → 本地**：在新机器上跑通后只拉一次即可拿到完整配置。
+- **状态**：每 15 秒自动刷新，显示「本地/远端」SHA256 指纹与「是否一致」徽标。
+
+冲突保护（避免误覆盖）：
+
+- 推送前会先 `GET` 远端并比对 SHA256；远端被别人改过时返回 409，控制台会弹
+  「确认覆盖远端？」二次确认。
+- 拉取同理：本地与远端不一致时先确认再覆盖。
+- 凭证密文不会出现在 `GET /api/settings/webdav` 响应里，仅配置项 `has_password` 字段。
 
 ## 反向代理（如需 HTTPS 或远程访问）
 
@@ -297,7 +339,7 @@ location / {
 ### Linux / macOS
 
 ```bash
-./tools/dev/preflight.sh   # 环境预检：Go 1.25+ / Node 20+ / make / git
+./tools/dev/preflight.sh   # 环境预检：Go 1.25+ / Node 20+ / make / git（bash 脚本，勿用 sh 调用）
 
 make lint      # go vet + gofmt（提交前跑这个）
 make test      # 单元测试（CGO_ENABLED=0，与发布基线一致）

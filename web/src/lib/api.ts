@@ -4,12 +4,17 @@ import type {
   HealthInfo,
   LogItem,
   ModelItem,
+  PresetListPayload,
   ProviderDTO,
   ProviderExportPayload,
   ProviderInput,
   SessionInfo,
   SettingsPayload,
   TestResult,
+  WebDAVConfig,
+  WebDAVStatus,
+  WebDAVSyncResult,
+  WebDAVTestResult,
 } from './types'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
@@ -128,6 +133,35 @@ export const api = {
 
   // 数据位置
   getDataLocations: () => request<DataLocationsPayload>('/api/data-locations'),
+
+  // 预设供应商（国内常用：DeepSeek / MiniMax / SCNet / Agnes）
+  listProviderPresets: () => request<PresetListPayload>('/api/provider-presets'),
+  // 注意：从预设创建不在后端独立端点上做；前端在「新增供应商」对话框里调用 listProviderPresets
+  // 拿到列表，点预设后只把 name/官网/Base URL 预填到表单，仍走 POST /api/providers。
+  // 这样能复用原有校验（SSRF、名称冲突、加密）与「拉取模型」交互。
+
+  // WebDAV 同步
+  getWebDAVConfig: () => request<WebDAVConfig>('/api/settings/webdav'),
+  updateWebDAVConfig: (body: Partial<WebDAVConfig>) =>
+    request<WebDAVConfig>('/api/settings/webdav', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  webdavStatus: () => request<WebDAVStatus>('/api/sync/webdav/status'),
+  webdavTest: () => request<WebDAVTestResult>('/api/sync/webdav/test'),
+  webdavPush: (body: { force?: boolean } = {}) =>
+    request<WebDAVSyncResult>('/api/sync/webdav/push', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  webdavPull: (body: { force?: boolean } = {}) =>
+    request<WebDAVSyncResult>('/api/sync/webdav/pull', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
 
   // 日志
   listLogs: (params: {

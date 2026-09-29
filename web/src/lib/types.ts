@@ -151,3 +151,60 @@ export interface HealthInfo {
   logs_dropped: number
   login_required: boolean
 }
+
+/** 国内常用供应商预设（DeepSeek / MiniMax / SCNet / Agnes 等）。 */
+export interface PresetDTO {
+  id: string
+  name: string
+  openai_base_url: string
+  website_url: string
+}
+
+export interface PresetListPayload {
+  items: PresetDTO[]
+  /** 当前生效的预设来源（"内置" 或用户覆盖文件绝对路径）。 */
+  source: string
+  /** 编译期内置预设的 SHA256 前 8 字节，便于和覆盖文件对比。 */
+  builtin_fingerprint: string
+}
+
+/** WebDAV 配置（GET/PUT 往返）。password 字段写入时必填，读取时永远为空。 */
+export interface WebDAVConfig {
+  configured: boolean
+  url: string
+  username: string
+  password: string
+  has_password: boolean
+  last_synced_at?: string
+}
+
+export interface WebDAVStatus {
+  configured: boolean
+  url?: string
+  username?: string
+  has_remote: boolean
+  local_fingerprint: string
+  remote_fingerprint?: string
+  match: boolean
+  last_synced_at?: string
+}
+
+export interface WebDAVSyncResult {
+  ok: boolean
+  direction: 'push' | 'pull'
+  imported?: number
+  bytes?: number
+  fingerprint: string
+  synced_at: string
+}
+
+/** GET /api/sync/webdav/test：连通性 + 凭证 + 远端可达 */
+export interface WebDAVTestResult {
+  ok: boolean
+  url: string
+  username: string
+  has_remote: boolean
+  remote_fingerprint?: string
+  remote_bytes?: number
+  error?: string
+}

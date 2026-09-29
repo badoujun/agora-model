@@ -1,0 +1,30 @@
+{
+  "_comment": "预设供应商列表：仅作为「从预设…」下拉的模板。把 name/官网/OpenAI Base URL 三个字段预填到「新增供应商」对话框，API Key 与模型由用户在原流程里继续填写。维护者修改后请同步到 internal/presets/builtin.json。",
+  "version": 1,
+  "presets": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "openai_base_url": "https://api.deepseek.com/v1",
+      "website_url": "https://platform.deepseek.com/"
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "openai_base_url": "https://api.minimaxi.com/v1",
+      "website_url": "https://platform.minimaxi.com/"
+    },
+    {
+      "id": "scnet",
+      "name": "国家超算互联网",
+      "openai_base_url": "https://api.scnet.cn/api/llm/v1",
+      "website_url": "https://www.scnet.cn/"
+    },
+    {
+      "id": "agnes",
+      "name": "Agnes AI",
+      "openai_base_url": "https://api.agnes-ai.cn/v1",
+      "website_url": "https://platform.agnes-ai.com/"
+    }
+  ]
+}

@@ -26,6 +26,7 @@ import (
 	"agora-model/internal/gateway"
 	"agora-model/internal/logging"
 	"agora-model/internal/platform"
+	"agora-model/internal/presets"
 	"agora-model/internal/store"
 	"agora-model/internal/webui"
 )
@@ -33,24 +34,25 @@ import (
 // version 是程序版本号（语义化版本）。发布构建可用
 // -ldflags "-X main.version=<tag>" 注入 git tag；未注入时用这里的内置版本号，
 // 保证控制台左上角始终显示可读的版本号而不是构建哈希。
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	var (
-		configPath = flag.String("config", "config.json", "JSON 引导配置（仅当数据库中没有供应商时用于首次导入）")
-		dataDir    = flag.String("data-dir", "", "数据目录（默认使用系统用户配置目录）")
-		dbPath     = flag.String("db", "", "SQLite 文件路径（默认 <数据目录>/agora.db）")
-		listen     = flag.String("listen", "", "监听地址（默认 127.0.0.1）")
-		port       = flag.Int("port", 0, "监听端口（默认 9090）")
-		logFormat  = flag.String("log-format", "text", "日志格式：text|json")
-		logLevel   = flag.String("log-level", "info", "日志级别：debug|info|warn|error")
-		logFile    = flag.String("log-file", "", "日志文件路径（默认写 stdout；install 缺省为 <数据目录>/logs/agoramodel.log）")
-		noColor    = flag.Bool("no-color", false, "禁用彩色输出")
-		resetKey   = flag.Bool("reset-gateway-key", false, "吊销现有网关 Key 并生成新的（明文只打印一次）")
-		adminPass  = flag.String("admin-password", "", "Web UI 管理密码（也可用环境变量 ADMIN_PASSWORD；非回环监听时必填）")
-		showVer    = flag.Bool("version", false, "打印版本并退出")
-		svcExec    = flag.String("service-exec", "", "服务要运行的可执行文件（install 用；默认复制当前二进制到 <数据目录>/bin/ 后运行该副本）")
-		svcEnv     stringList
+		configPath  = flag.String("config", "config.json", "JSON 引导配置（仅当数据库中没有供应商时用于首次导入）")
+		presetsPath = flag.String("presets", "", "国内常用供应商预设 JSON（默认使用编译期内置版本）")
+		dataDir     = flag.String("data-dir", "", "数据目录（默认使用系统用户配置目录）")
+		dbPath      = flag.String("db", "", "SQLite 文件路径（默认 <数据目录>/agora.db）")
+		listen      = flag.String("listen", "", "监听地址（默认 127.0.0.1）")
+		port        = flag.Int("port", 0, "监听端口（默认 9090）")
+		logFormat   = flag.String("log-format", "text", "日志格式：text|json")
+		logLevel    = flag.String("log-level", "info", "日志级别：debug|info|warn|error")
+		logFile     = flag.String("log-file", "", "日志文件路径（默认写 stdout；install 缺省为 <数据目录>/logs/agoramodel.log）")
+		noColor     = flag.Bool("no-color", false, "禁用彩色输出")
+		resetKey    = flag.Bool("reset-gateway-key", false, "吊销现有网关 Key 并生成新的（明文只打印一次）")
+		adminPass   = flag.String("admin-password", "", "Web UI 管理密码（也可用环境变量 ADMIN_PASSWORD；非回环监听时必填）")
+		showVer     = flag.Bool("version", false, "打印版本并退出")
+		svcExec     = flag.String("service-exec", "", "服务要运行的可执行文件（install 用；默认复制当前二进制到 <数据目录>/bin/ 后运行该副本）")
+		svcEnv      stringList
 	)
 	flag.Var(&svcEnv, "service-env", "注入服务进程的环境变量，可重复：--service-env ADMIN_PASSWORD=xxx（明文会写入服务配置）")
 	flag.Parse()
@@ -115,6 +117,7 @@ func main() {
 
 	opts := options{
 		ConfigPath:      *configPath,
+		PresetsPath:     *presetsPath,
 		DataDir:         *dataDir,
 		DBPath:          *dbPath,
 		Listen:          *listen,
@@ -156,6 +159,7 @@ func (s *stringList) Set(value string) error {
 
 type options struct {
 	ConfigPath      string
+	PresetsPath     string
 	DataDir         string
 	DBPath          string
 	Listen          string
@@ -289,6 +293,12 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 	recorder.Start(ctx)
 
 	// 7) HTTP 服务
+	presetStore := presets.New(presets.Options{
+		OverridePath: opts.PresetsPath,
+		Logger: func(msg string, args ...any) {
+			logger.Warn(msg, args...)
+		},
+	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	api.SetLogStatsFunc(recorder.Stats)
@@ -296,7 +306,8 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 		Store: st, Master: master, Holder: holder,
 		Reload: loadSnapshot, Logger: logger, Version: version,
 		AdminPassword: adminPassword, LocalOnly: localOnly,
-		Paths: dataPaths(dir, dbFile, opts.LogFile),
+		Paths:   dataPaths(dir, dbFile, opts.LogFile),
+		Presets: presetStore,
 	}).Register(mux)
 
 	// 8) 内嵌前端（构建后自动可用；未构建时只提供 API）

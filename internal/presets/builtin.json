@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "openai_base_url": "https://api.deepseek.com/v1",
+      "website_url": "https://platform.deepseek.com/"
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "openai_base_url": "https://api.minimaxi.com/v1",
+      "website_url": "https://platform.minimaxi.com/"
+    },
+    {
+      "id": "scnet",
+      "name": "SCNet",
+      "openai_base_url": "https://api.scnet.cn/api/llm/v1",
+      "website_url": "https://www.scnet.cn/ui/console/index.html#/llm/token-plan"
+    },
+    {
+      "id": "agnes",
+      "name": "Agnes",
+      "openai_base_url": "https://api.agnes-ai.cn/v1",
+      "website_url": "https://platform.agnes-ai.cn/"
+    }
+  ]
+}

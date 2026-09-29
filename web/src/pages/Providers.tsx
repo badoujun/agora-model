@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Check,
@@ -8,11 +8,18 @@ import {
   Plug,
   Plus,
   RefreshCw,
+  Sparkles,
   Trash2,
   Upload,
 } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
-import type { DraftFetchInput, ProviderDTO, ProviderInput, TestResult } from '@/lib/types'
+import type {
+  DraftFetchInput,
+  PresetDTO,
+  ProviderDTO,
+  ProviderInput,
+  TestResult,
+} from '@/lib/types'
 import { formatRelative } from '@/lib/utils'
 import { useToast } from '@/components/ui/toast'
 import { Button } from '@/components/ui/button'
@@ -183,8 +190,15 @@ export function ProvidersPage() {
   const [modelFilter, setModelFilter] = useState('')
   const [formError, setFormError] = useState('')
   const [testResult, setTestResult] = useState<{ provider: ProviderDTO; result: TestResult } | null>(null)
+  // 当前 dialog 是「从预设点开的」：影响标题文案与「拉取模型」按钮的启用条件（提示而非强制）
+  const [openedFromPreset, setOpenedFromPreset] = useState(false)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.listProviders })
+  const presets = useQuery({
+    queryKey: ['provider-presets'],
+    queryFn: api.listProviderPresets,
+    retry: false,
+  })
 
   const invalidateAll = async () => {
     await queryClient.invalidateQueries({ queryKey: ['providers'] })
@@ -310,6 +324,23 @@ export function ProvidersPage() {
     setForm(EMPTY_FORM)
     setModelFilter('')
     setFormError('')
+    setOpenedFromPreset(false)
+    setDialogOpen(true)
+  }
+
+  // 从「国内常用预设」进入：把 name/官网/Base URL 预填进表单，仍走原有「新增供应商」流程。
+  // API Key 与模型由用户继续填写（点「拉取模型」）：与手动新增完全一致的校验、保存、拉取流程。
+  const openCreateFromPreset = (preset: PresetDTO) => {
+    const seeded: FormState = {
+      ...EMPTY_FORM,
+      name: preset.name,
+      website_url: preset.website_url ?? '',
+      openai_base_url: preset.openai_base_url,
+    }
+    setForm(seeded)
+    setModelFilter('')
+    setFormError('')
+    setOpenedFromPreset(true)
     setDialogOpen(true)
   }
 
@@ -317,6 +348,7 @@ export function ProvidersPage() {
     setForm(toForm(provider))
     setModelFilter('')
     setFormError('')
+    setOpenedFromPreset(false)
     setDialogOpen(true)
   }
 
@@ -426,6 +458,11 @@ export function ProvidersPage() {
             <Download className="h-4 w-4" />
             {exportProviders.isPending ? '导出中…' : '导出'}
           </Button>
+          <PresetDropdown
+            presets={presets.data?.items ?? []}
+            disabled={presets.isLoading || (presets.data?.items ?? []).length === 0}
+            onPick={(p) => openCreateFromPreset(p)}
+          />
           <Button onClick={openCreate}>
             <Plus className="h-4 w-4" />
             新增供应商
@@ -580,12 +617,21 @@ export function ProvidersPage() {
 
       <Dialog
         open={dialogOpen}
-        onClose={() => setDialogOpen(false)}
+        onClose={() => {
+          setDialogOpen(false)
+          setOpenedFromPreset(false)
+        }}
         title={form.id ? '编辑供应商' : '新增供应商'}
         description="上游只需提供 OpenAI 兼容接口；模型可在保存前先拉取勾选，保存后立即对外生效。"
         footer={
           <>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setDialogOpen(false)
+                setOpenedFromPreset(false)
+              }}
+            >
               取消
             </Button>
             <Button onClick={submit} disabled={save.isPending}>
@@ -595,6 +641,12 @@ export function ProvidersPage() {
         }
       >
         <div className="grid gap-4">
+          {openedFromPreset ? (
+            <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
+              已按预设填入名称、官网与 OpenAI Base URL。请继续填写 API Key，
+              在「模型」区域点「拉取模型」勾选要启用的模型，再点底部「保存」。
+            </p>
+          ) : null}
           <div className="grid gap-1.5">
             <Label htmlFor="p-name">名称 *</Label>
             <Input
@@ -832,6 +884,71 @@ export function ProvidersPage() {
           {formError ? <p className="text-sm text-red-600">{formError}</p> : null}
         </div>
       </Dialog>
+    </div>
+  )
+}
+
+// PresetDropdown 是工具栏上的「从预设…」按钮：展开后列出预设，点击即把字段预填进主 dialog。
+// 设计取舍：不做成独立的对话框，直接复用主 dialog 的创建流程，让用户继续走原有的「填 API Key / 拉取模型 / 保存」。
+interface PresetDropdownProps {
+  presets: PresetDTO[]
+  disabled: boolean
+  onPick: (preset: PresetDTO) => void
+}
+
+function PresetDropdown({ presets, disabled, onPick }: PresetDropdownProps) {
+  const [open, setOpen] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // 点击外部关闭：原生 click 事件不会冒泡到 backdrop，简单捕获 document.click
+  useEffect(() => {
+    if (!open) return
+    const handler = (event: MouseEvent) => {
+      if (!containerRef.current) return
+      if (!containerRef.current.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  return (
+    <div ref={containerRef} className="relative">
+      <Button
+        variant="outline"
+        disabled={disabled}
+        onClick={() => setOpen((value) => !value)}
+        title="按国内常用供应商预填名称、官网、OpenAI Base URL"
+      >
+        <Sparkles className="h-4 w-4" />
+        从预设…
+      </Button>
+      {open ? (
+        <div className="absolute right-0 z-40 mt-1 w-80 rounded-md border border-slate-200 bg-white p-1 shadow-lg">
+          {presets.length === 0 ? (
+            <p className="px-2 py-2 text-xs text-slate-500">暂无预设</p>
+          ) : (
+            presets.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                className="flex w-full flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left text-sm hover:bg-slate-100"
+                onClick={() => {
+                  onPick(preset)
+                  setOpen(false)
+                }}
+              >
+                <span className="flex w-full items-center justify-between">
+                  <span className="font-medium">{preset.name}</span>
+                  <code className="truncate font-mono text-[10px] text-slate-400">{preset.id}</code>
+                </span>
+                <code className="w-full truncate font-mono text-[11px] text-slate-500">{preset.openai_base_url}</code>
+              </button>
+            ))
+          )}
+        </div>
+      ) : null}
     </div>
   )
 }

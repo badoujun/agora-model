@@ -1,0 +1,192 @@
+# Release workflow — 仅在推送 semver tag (v*) 时触发。
+#
+# 触发后做两件事：
+#   1. 对比「上一次 release tag」与「本次 tag」在 cmd/agoramodel/main.go 中
+#      `var version = "..."` 的字面值；未变化则视为「非版本号更新」并跳过发版。
+#      （tag 本身只是发布动作的触发器，应用版本号必须在 main.go 里手动改，
+#       这一道闸是防止「tag 重复推送 / 误打 tag / 只改了文档」时也去发包。）
+#   2. 版本号确实变了才执行：构建三平台六份产物 → 打 7 个 npm tarball → 发布。
+#
+# 凭据：secrets.NPM_TOKEN，写到 runner 用户级 npm config（不落盘到仓库 .npmrc）。
+# 仓库默认值固定为官方 registry（与 npm/scripts/publish.mjs 的 DEFAULT_REGISTRY 一致），
+# 不沿用 `npm config get registry`：内网常把它换成只读镜像，发布必然 403。
+#
+# 失败策略：任何一步失败立即中断，不允许「半发版」（已发布的包 npm 不允许再覆盖）。
+# 想本地复跑：`node npm/scripts/publish.mjs --dry-run` 看产物清单。
+
+name: release
+
+on:
+  push:
+    tags:
+      # 严格三段式 semver：v1.2.3；带预发布后缀（v1.2.3-rc.1）也算。
+      # 不接受 v1 / v1.2 这种简写——和 build.mjs / publish.mjs 的 normalizeVersion 一致。
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+# release 不需要并发：同 tag 不应二次发（npm 会拒绝同一版本号重复发）。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: 发布 ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    # 仓库托管环境变量与 secrets 详情见 https://docs.github.com/zh/actions
+    env:
+      # 与 npm/scripts/publish.mjs 的 DEFAULT_REGISTRY 对齐：固定官方源，
+      # 不读 runner 上的 `npm config get registry`，避免内网镜像干扰。
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 关键：必须 fetch tags，否则 git describe 拿不到历史 tag，
+          # 上一次 release tag 的比对就退化为「找不到上次 → 误判为版本号变了」。
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
+      # ---------------------------------------------------------------- 版本号比对
+      #
+      # 用 git show 直接取两个 tag 指向的 main.go 里 `var version = "..."` 的字面值。
+      # 第一次发版（仓库里没有上一个 release tag）视为「版本号更新」，
+      # 避免新仓库永远发不出第一个包。
+      #
+      # set -e：任何 git / grep 失败立即终止整个 release；这正是我们想要的失败模式。
+      - name: 比对版本号是否变化
+        id: version-check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 形如 v1.2.3 或 v1.2.3-rc.1 的 release tag；按创建时间倒序取。
+          # `git tag` 默认只列本地可见 tag，已能覆盖「同一次 push 触发的 workflow」所需范围。
+          mapfile -t TAGS < <(
+            git tag --sort=-creatordate --format='%(refname:short)' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$' \
+              || true
+          )
+
+          if [ "${#TAGS[@]}" -eq 0 ]; then
+            echo "未找到任何 release tag，无法进行比对"
+            exit 1
+          fi
+
+          CURRENT="${TAGS[0]}"
+          PREV=""
+          if [ "${#TAGS[@]}" -ge 2 ]; then
+            PREV="${TAGS[1]}"
+          fi
+
+          if [ "$CURRENT" != "${{ github.ref_name }}" ]; then
+            # 理论上不会发生（workflow 触发条件已限定 tag 名），但显式校验更稳妥。
+            echo "最新本地 tag ($CURRENT) 与本次推送 tag (${{ github.ref_name }}) 不一致"
+            exit 1
+          fi
+
+          # 提取 `var version = "x.y.z"`：取该行第一个 `"…"` 区间（防行内出现第二个引号对被误抓）。
+          extract_version() {
+            git show "$1":cmd/agoramodel/main.go \
+              | grep -E '^[[:space:]]*var[[:space:]]+version[[:space:]]*=' \
+              | head -n1 \
+              | sed -nE 's/.*"([^"]+)".*/\1/p' \
+              | head -n1
+          }
+
+          CUR_VER="$(extract_version "$CURRENT")"
+          if [ -z "$CUR_VER" ]; then
+            echo "无法从 $CURRENT:cmd/agoramodel/main.go 提取版本号"
+            exit 1
+          fi
+
+          echo "current_tag=$CURRENT"
+          echo "current_version=$CUR_VER"
+
+          if [ -z "$PREV" ]; then
+            echo "prev_tag=(none)"
+            echo "prev_version=(none)"
+            echo "reason=首次发布，无历史 tag"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "OK：首次发布，直接进入发版流程（version=$CUR_VER）"
+            exit 0
+          fi
+
+          PREV_VER="$(extract_version "$PREV")"
+          if [ -z "$PREV_VER" ]; then
+            echo "无法从 $PREV:cmd/agoramodel/main.go 提取版本号"
+            exit 1
+          fi
+
+          echo "prev_tag=$PREV"
+          echo "prev_version=$PREV_VER"
+
+          if [ "$CUR_VER" = "$PREV_VER" ]; then
+            echo "reason=版本号未变化（$CUR_VER == $PREV_VER）"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "跳过发版：本次推送未更新 cmd/agoramodel/main.go 中的 version"
+          else
+            echo "reason=版本号已更新（$PREV_VER → $CUR_VER）"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "OK：版本号已更新 ($PREV_VER → $CUR_VER)，进入发版流程"
+          fi
+
+      # ---------------------------------------------------------------- 构建产物
+      # 仅在版本号真的变了时执行；用 steps.version-check.outputs.changed 控制跳过。
+      - name: 构建三平台六份产物
+        if: steps.version-check.outputs.changed == 'true'
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          # Makefile 已自带 GOPROXY 镜像兜底；直接调它即可，行为与本地一致。
+          make dist
+
+      # ---------------------------------------------------------------- 打 npm 包
+      # 复用 npm/scripts/build.mjs：版本号取自 git describe（已被 checkout 拉全 tag），
+      # 与 main.go 里的 version 一致（version-check 已经验证）。
+      - name: 打包 7 个 npm tarball
+        if: steps.version-check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          node npm/scripts/build.mjs
+
+      # ---------------------------------------------------------------- 注入 npm 凭据
+      # 写到 runner 用户级 npm config（~/.npmrc）；不落盘到仓库 .npmrc，避免 token 入库。
+      # `npm publish` 在该位置找到 _authToken 后会替换掉命令行的 username/password。
+      - name: 配置 npm 凭据
+        if: steps.version-check.outputs.changed == 'true'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::secrets.NPM_TOKEN 未配置；请在仓库 Settings → Secrets 中添加"
+            exit 1
+          fi
+          # 必须显式 --registry，否则 npm 会用本地 npm config get registry 的值
+          # （内网常见为只读镜像），写入会被静默落到错误位置。
+          npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN" --registry="$NPM_CONFIG_REGISTRY"
+          npm config set registry "$NPM_CONFIG_REGISTRY"
+          # 验证凭据：whoami 失败立刻终止，避免发布到一半才发现没登录。
+          npm whoami --registry "$NPM_CONFIG_REGISTRY"
+
+      # ---------------------------------------------------------------- 发布
+      # publish.mjs 会先发 6 个平台包、再发主包；该顺序由 npm install 时
+      # optionalDependencies 的解析方式决定，不能调换。
+      # 故意不传 --tag：发到 latest（与初次发版约定一致；想预发请手动传 --tag=next）。
+      - name: 发布 7 个 npm 包
+        if: steps.version-check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # --registry 显式覆盖：与 publish.mjs 默认值一致，但显式传入更稳妥。
+          node npm/scripts/publish.mjs --registry="$NPM_CONFIG_REGISTRY"
