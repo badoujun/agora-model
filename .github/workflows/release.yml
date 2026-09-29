@@ -80,8 +80,12 @@ jobs:
       # OIDC 要求 npm CLI ≥ 11.5.1；不显式升级的话，某些 Node 24 小版本自带的
       # npm 仍低于该线，症状同样是晦涩的 ENEEDAUTH。
       # 这里顺带打印版本，日志里能直接确认「会说 OIDC 的那个 npm」确实生效了。
+      #
+      # 别给这一步加 `if: steps.version-check.outputs.changed == 'true'`：version-check
+      # 在它下面，引用尚未运行的步骤输出会让条件恒为假、整步被静默跳过（v0.3.0 首发就是
+      # 这样——只是恰好 runner 自带的 npm 已够新才没出事）。它是环境准备而非发版动作，
+      # 几秒钟的代价不值得用条件去省。
       - name: 升级 npm（trusted publishing 需要 ≥ 11.5.1）
-        if: steps.version-check.outputs.changed == 'true'
         run: |
           set -euo pipefail
           npm install -g 'npm@^11.5.1' --no-fund --no-audit
