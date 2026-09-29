@@ -29,6 +29,34 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # 冒烟脚本是 Node（tools/smoke/*.mjs），三平台共用同一份，
+      # 因此 runner 上必须有 Node（托管 runner 自带，这里显式固定版本）。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 前端必须先构建：Go 用 embed 把 internal/webui/dist 打进二进制，
+      # 若此时目录里只有占位文件（internal/webui/dist/robots.txt），产物就不含 Web UI，
+      # phase4 的断言会直接失败——「单文件交付」要验证的正是这份内嵌结果。
+      - name: 构建前端（供 embed 内嵌）
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix web ci
+          npm --prefix web run build
+
+      - name: gofmt（与 make fmt 同一判据）
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(gofmt -l cmd internal)"
+          if [ -n "$out" ]; then
+            echo "以下文件未按 gofmt 格式化（本地执行 make fmt-fix）："
+            echo "$out"
+            exit 1
+          fi
+          echo "gofmt OK"
+
       - name: go vet
         run: go vet ./...
         env:
@@ -65,8 +93,17 @@ jobs:
           go version -m "$OUT" | grep -q 'CGO_ENABLED=0' && echo "CGO_ENABLED=0 OK"
 
       # 冒烟只在本机架构上执行（交叉架构产物无法直接运行）。
-      # 覆盖：healthz、无凭证 401、OpenAI 透传、凭证加密（Phase 2：网关 Key 来自数据库）。
-      - name: 冒烟（本机架构）
+      #
+      # 用 --exe 复用上面刚构建的**发布产物**：验证的是将要交付的那份二进制，
+      # 而不是另起一次 go build 的开发二进制。冒烟脚本是 Node，三平台共用同一份实现
+      # （tools/smoke/*.mjs），因此不再需要为每个 runner 维护内联的 bash 断言。
+      #
+      # 覆盖范围：
+      #   phase1  协议透传、SSE 心跳保活、上游超时/不可达、错误码、请求体上限、断连取消
+      #   phase2  SQLite 持久化、凭证加密落库、网关 Key 生命周期、SSRF、主密钥丢失
+      #   phase3  模型聚合（/v1/models）、按需拉取与勾选、供应商名命名空间路由、模型别名
+      #   phase4  Web UI 静态资源与 SPA 回退、控制面 API 全流程、登录模式（ADMIN_PASSWORD）
+      - name: 冒烟（本机架构，复用发布产物）
         shell: bash
         run: |
           set -euo pipefail
@@ -77,81 +114,10 @@ jobs:
             exit 0
           fi
           chmod +x "$OUT" 2>/dev/null || true
-
-          # mock 上游日志用 GitHub Actions 提供的 $RUNNER_TEMP（跨平台：windows 上
-          # 是 C:\Users\<user>\AppData\Local\Temp；unix 上是 /tmp）。避免直接用 /tmp，
-          # Windows runner 默认 bash 里 /tmp 不一定可写，会让 mock 进程 stdout 重定向失败
-          # 而静默退出（不监听 9999），后续透传报 connection refused。
-          TMP_DIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
-          mock_log="$TMP_DIR/mock.log"
-          gw_log="$TMP_DIR/gw.log"
-          PORT=9999 node --no-deprecation tools/mock-upstream/server.mjs > "$mock_log" 2>&1 &
-          mock_pid=$!
-
-          # 等 mock 上游真的开始监听 9999（最多 10 秒）。这样如果 mock 进程因为
-          # 端口冲突、node 路径问题、stdout 重定向失败等原因没起来，能立刻报错。
-          for i in $(seq 1 10); do
-            if curl -fsS http://127.0.0.1:9999/v1/models > /dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          if ! curl -fsS http://127.0.0.1:9999/v1/models > /dev/null 2>&1; then
-            echo "mock upstream 未在 9999 端口监听"
-            echo "--- mock.log ---"
-            cat "$mock_log" || true
-            exit 1
-          fi
-          echo "mock upstream ready"
-
-          data_dir="$(mktemp -d)"
-          # Phase 2 起 config.example.json 里的 api_key 不参与认证：网关 Key 由数据库生成，
-          # 首次启动会打印明文一次，从日志中取回。
-          "$OUT" --config config.example.json --data-dir "$data_dir" \
-            --listen 127.0.0.1 --port 19090 > "$gw_log" 2>&1 &
-          gw_pid=$!
-          trap 'kill $gw_pid $mock_pid 2>/dev/null || true' EXIT
-
-          for i in $(seq 1 30); do
-            grep -q 'gateway_key=' "$gw_log" 2>/dev/null && break || sleep 1
-          done
-          gw_key=$(grep -o 'gateway_key=gw-[0-9a-f]*' "$gw_log" | head -1 | cut -d= -f2 || true)
-          if [ -z "$gw_key" ]; then echo "未能从启动日志取得网关 Key"; cat "$gw_log"; exit 1; fi
-          echo "gateway key 已取得"
-
-          for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:19090/healthz > /dev/null 2>&1 && break || sleep 1
-          done
-          curl -fsS http://127.0.0.1:19090/healthz | grep -q '"status":"ok"'
-          echo "healthz OK"
-
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:19090/v1/chat/completions \
-            -H 'content-type: application/json' -d '{"model":"mock-gpt-4o"}')
-          [ "$code" = "401" ] || { echo "期望无凭证 401，实际 $code"; exit 1; }
-          echo "鉴权 OK"
-
-          out=$(curl -s -X POST http://127.0.0.1:19090/v1/chat/completions \
-            -H 'content-type: application/json' -H "authorization: Bearer $gw_key" \
-            -d '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}')
-          echo "$out" | grep -q 'mock' || { echo "OpenAI 透传失败: $out"; exit 1; }
-          echo "OpenAI 透传 OK"
-
-          acode=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:19090/v1/messages \
-            -H 'content-type: application/json' -H "x-api-key: $gw_key" \
-            -d '{"model":"mock-claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}')
-          [ "$acode" = "404" ] || { echo "Anthropic 路径应已下线（404），实际 $acode"; exit 1; }
-          echo "Anthropic 路径已下线 OK"
-
-          sleep 1
-          if grep -a -q 'sk-mock-provider-key' "$data_dir/agora.db" "$data_dir/agora.db-wal" 2>/dev/null; then
-            echo "数据库中出现供应商凭证明文"; exit 1
-          fi
-          echo "凭证加密 OK"
-
-          # Phase 3：模型选择与 /v1/models（config.example.json 已勾选 mock 上游的 3 个模型）
-          mout=$(curl -s http://127.0.0.1:19090/v1/models -H "authorization: Bearer $gw_key")
-          echo "$mout" | grep -q '"object":"list"' || { echo "/v1/models 返回异常: $mout"; exit 1; }
-          echo "$mout" | grep -q '"id":"mock-gpt-4o"' || { echo "已勾选模型未出现在 /v1/models: $mout"; exit 1; }
-          echo "$mout" | grep -q '"owned_by":"本地 Mock 上游"' || { echo "owned_by 应为供应商名称: $mout"; exit 1; }
-          echo "模型选择 OK"
+          node tools/smoke/phase1.mjs --exe="$OUT"
+          node tools/smoke/phase2.mjs --exe="$OUT"
+          node tools/smoke/phase3.mjs --exe="$OUT"
+          node tools/smoke/phase4.mjs --exe="$OUT"
 
   # race detector 需要 cgo，因此单独一个 job（发布产物一律 CGO_ENABLED=0）
   race:

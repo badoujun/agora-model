@@ -345,6 +345,47 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 - [x] **T5.9｜许可证** ｜ 0.5h
   - 新增 `LICENSE`（MIT，参考 cc-switch 的许可证文本，逐字一致，仅版权行不同：`Copyright (c) 2026 badoujun`）。
   - npm 包的 `license` / `author` 字段由 `build.mjs` **从 LICENSE 解析**，避免元数据与许可证文本漂移；`LICENSE` 随每个 tarball 一起分发。
+- [x] **T5.11｜跨平台开发对齐（Windows-only → Windows + Linux）** ｜ 1 天
+  - **动机**：项目此前完全在 Windows 上开发。Go 代码本身已跨平台（`kardianos/service` + 纯 Go 的
+    `modernc.org/sqlite`，全仓库无 build tag），缺口全部集中在**开发脚本层**：冒烟脚本是 PowerShell，
+    且用了 `curl.exe`、`Start-Process -WindowStyle Hidden` 等 Windows 专属调用，Linux 上装了 pwsh 也跑不起来。
+  - **冒烟脚本统一为 Node（三平台一份实现）**：`tools/smoke/phase1–5.ps1`（约 1300 行）→
+    `tools/smoke/phaseN.mjs` + 共享库 `tools/smoke/lib/harness.mjs`（断言收集、HTTP 请求、进程托管、
+    日志落盘、DB 明文检索、跨平台取进程内存）。断言逐条对齐，无增删：
+    phase1 20 项、phase2 22 项、phase3 20 项、phase4 31 项、phase5 29 项。
+    - `--exe=<产物>` 跳过 `go build`，直接对一份已构建产物跑断言（CI 用它验证发布产物本身）。
+    - 各阶段自建 `mkdtemp` 临时数据目录并探测 mock / 网关就绪，替代原先的 `Start-Sleep 2`（后者在
+      慢机器上是 flaky 来源）。
+    - phase5 原先用 `agoramodel-windows-amd64.exe` 执行 `--version`，在 Linux 上必然失败，改为执行
+      **本机平台**那份产物；内存断言由 `WorkingSet64` 改为跨平台实现（Linux `/proc/<pid>/statm`、macOS `ps -o rss=`）。
+  - **Makefile 补齐 Linux / macOS 统一入口**：`test` / `vet` / `fmt` / `fmt-fix` / `lint` / `smoke` / `smoke-phaseN`；
+    并补上 **`GOPROXY` 兜底**——原先只有 `build.ps1` 有，受限网络下 `make dist` 交叉编译到 windows 时
+    会因 `go-isatty` / `go-strftime` 拉取失败而中断（`dial tcp ...: i/o timeout`，本次实测复现）。
+  - **新增 `tools/dev/preflight.sh`**：按 `go.mod` 声明比对 Go 版本（发行版仓库自带的常常偏旧）、
+    检查 Node 20+ / npm / make / git，并在缺项时打印各平台安装命令、以非零码退出；
+    另新增 `.editorconfig` 统一编辑器行为（LF、缩进、`*.ps1` 保持 UTF-8 BOM + CRLF）。
+  - **CI 增强**：新增 `gofmt` 检查步骤（与 `make fmt` 同一判据）；冒烟从「每个 runner 内联一段 bash」
+    改为调用同一份 Node 脚本（`node tools/smoke/phaseN.mjs --exe="$OUT"`），验证的是**本次构建的发布产物**；
+    新增 `actions/setup-node`。
+  - **顺带修掉一个 Windows 遗留缺陷**：`web/package-lock.json` 的 165 条 `resolved` 全部指向
+    `registry.npmmirror.com`（当初在 Windows 上用淘宝镜像生成）。换到非镜像环境后 `npm ci` 被
+    npm 12 的 `allow-remote=none` 直接拒绝（`EALLOWREMOTE`），phase4 / `make dist` 全部卡死。
+    改为官方 `registry.npmjs.org` 后任意环境都能装：npm 会按当前配置的 registry 重写 tarball 的 host，
+    反过来（lock 锁镜像、环境用官方）不成立。
+  - **实测（Linux / amd64，系统 Go 1.26.8 + Node 24.21）**：`make dist` 产出六份产物、`go version -m`
+    逐份确认 `CGO_ENABLED=0`、本机产物静态链接校验通过；`make lint`、`make test`（12 个包全绿）；
+    `make smoke` 串联跑完五个阶段 **20/22/20/31/29 全通过**；`--exe=dist/agoramodel-linux-amd64` 复用模式
+    与现场构建模式结果一致；npm 分发链路 `node --test npm/test/*.mjs` 22 项通过、`build.mjs` 产出 7 个包，
+    tgz 内二进制权限位为 `0755`，在 Linux 上安装主包 + `linux-x64` 平台包后转发器可运行（补上了
+    DESIGN §12 长期标注的「未实测：在 Linux / macOS 上安装并运行」中的 Linux 部分）。
+  - **复测时又修掉两个 Linux 侧缺陷**：① `make verify` 的静态链接检查只匹配英文 `ldd` 输出，
+    中文 locale 下把「不是动态可执行文件」误报成「可能动态链接」——现固定 `LC_ALL=C`，并且只检查
+    本机平台产物（`ldd` 对 Mach-O / PE 产物没有意义）；② `tools/dev/preflight.sh` 现打印 `go` 的
+    绝对路径，并在其来自非标准位置时告警——本轮就真实踩到「PATH 里混入临时解压的 Go 工具链
+    （`/tmp/gotk`），实际生效版本与预期不符」，删掉后系统 `/usr/bin/go` 才生效。
+  - **未实测**：Windows / macOS 上的 Node 版冒烟脚本（本机只有 Linux）；Linux 上的 systemd 服务化
+    实机注册（需 root，见 T5.7）。Windows 侧构建入口不变（`build.ps1` 照旧），仅冒烟命令由
+    `pwsh -File tools/smoke/phaseN.ps1` 换成 `node tools/smoke/phaseN.mjs`。
 
 ---
 

@@ -41,12 +41,15 @@ Agent（Codex / Cursor / 任意支持自定义 Base URL 的工具）
 ### 1. 构建
 
 ```bash
-# 需要 Go 1.25+ 与 Node 20+（前者见 go.mod，后者仅用于构建前端）
+# 需要 Go 1.25+ 与 Node 20+（前者见 go.mod，后者仅用于构建前端与跑冒烟脚本）
 make dist                     # Linux / macOS
 pwsh -File build.ps1 -Target dist   # Windows
 ```
 
 产物在 `dist/`：`agoramodel-{windows,linux,darwin}-{amd64,arm64}`（共 6 份）。
+
+> 首次在 Linux / macOS 上开发，先跑 `./tools/dev/preflight.sh`：它按 `go.mod` 声明比对
+> Go 版本，并给出 Node / make / git 缺失时的安装命令。
 
 > 只构建本机平台：`go build -o agoramodel ./cmd/agoramodel`（前端需先 `npm --prefix web ci && npm --prefix web run build`）。
 
@@ -153,6 +156,15 @@ sudo ./agoramodel install --data-dir /var/lib/agoramodel \
 
 参数两种写法都支持（`install --data-dir X` 与 `--data-dir X install`）。
 
+在 Linux 上服务由 systemd 托管（Windows 为 SCM、macOS 为 launchd），排查时的常用命令：
+
+```bash
+systemctl status agoramodel                        # 等价于 ./agoramodel status
+systemctl cat agoramodel                           # 看 install 写入的 unit（含 --log-file 与 Environment=）
+tail -f <数据目录>/logs/agoramodel.log              # install 缺省注入的日志文件
+sudo journalctl -u agoramodel -f                   # unit 尚未配置 --log-file 时的输出
+```
+
 <details>
 <summary>手工托管（systemd 示例）</summary>
 
@@ -258,25 +270,76 @@ location / {
 `%LOCALAPPDATA%\Programs\Go\bin`、winget 包目录等）。原因是通过 winget 等方式安装工具时，
 只修改了系统 PATH，而**已经打开的终端仍持有旧 PATH**。
 若仍报错则说明 Go 确实未安装：`winget install GoLang.Go` 后重试（无需重开终端）。
-同样的探测也已接入 `tools/smoke/*.ps1`。
+同类 PATH 探测保留在 `build.ps1` 内部；Linux / macOS 侧对应的预检是 `./tools/dev/preflight.sh`
+（多一项版本比对：发行版仓库自带的 Go 常常低于 `go.mod` 要求）。
+端到端冒烟脚本已改为 Node（`tools/smoke/*.mjs`），不再依赖 shell 的 PATH 探测机制。
 
 **Q：构建时 npm 提示 `allow-scripts ... esbuild`？**
 这是 npm 11+ 的安全策略（默认不执行依赖的安装脚本）。esbuild 的平台二进制由可选依赖提供，
 **不影响构建**；如需消除提示可执行 `npm approve-scripts esbuild`。
 
+**Q：`npm ci` 报 `EALLOWREMOTE: Fetching packages of type "remote" have been disabled`？**
+`web/package-lock.json` 里记录的 tarball 地址若与你当前配置的 registry 不同源，npm 12+
+会按 `allow-remote` 策略拒绝（默认 `none`）。本仓库的 lock 统一指向官方
+`registry.npmjs.org`——npm 会按你配置的 registry（含国内镜像）重写 tarball 的 host，
+所以正常情况下不会触发。若你本地改过 lock 或用了自定义源，可临时放开：
+`npm --prefix web ci --allow-remote=all`。
+
+**Q：`make dist` 报 `dial tcp ...: i/o timeout`（拉不到 Go 依赖）？**
+受限网络（内网 / 大陆直连）连不上 `proxy.golang.org`。`Makefile` 与 `build.ps1` 都已在
+未显式设置时回落到 `GOPROXY=https://goproxy.cn,direct`；也可以用环境变量覆盖，或依赖
+已在本机缓存时用 `GOPROXY=off make dist` 完全离线构建。
+
 ## 开发
 
+三个平台共用同一套源码与脚本，差别只在入口命令：Windows 用 PowerShell，Linux / macOS 用 Makefile。
+
+### Linux / macOS
+
 ```bash
-go test ./... -count=1                    # 单元测试
-go vet ./... && gofmt -l cmd internal      # 静态检查
+./tools/dev/preflight.sh   # 环境预检：Go 1.25+ / Node 20+ / make / git
 
-# 端到端冒烟（会自行构建前端与二进制）
-pwsh -File tools/smoke/phase1.ps1   # OpenAI 协议透传、SSE 心跳、取消、错误码
-pwsh -File tools/smoke/phase2.ps1   # 持久化、加密、网关 Key 生命周期、SSRF
-pwsh -File tools/smoke/phase3.ps1   # 模型拉取与勾选、供应商名命名空间路由、模型别名
-pwsh -File tools/smoke/phase4.ps1   # Web UI 与 API 全流程、登录模式
-pwsh -File tools/smoke/phase5.ps1   # PRD 八条验收、性能冒烟、迁移演练
+make lint      # go vet + gofmt（提交前跑这个）
+make test      # 单元测试（CGO_ENABLED=0，与发布基线一致）
+make dist      # 三平台六份产物 + CGO / 静态链接校验
+make smoke     # 端到端冒烟 phase1–5
+make smoke-phase3   # 只跑某一阶段
+```
 
+### Windows
+
+```powershell
+pwsh -File build.ps1 -Target dist
+go test ./... -count=1
+node tools/smoke/phase1.mjs     # 冒烟脚本是 Node，两个平台跑的是同一份
+```
+
+### 端到端冒烟（Node，Windows / Linux / macOS 共用）
+
+```bash
+node tools/smoke/phase1.mjs   # OpenAI 协议透传、SSE 心跳、取消、错误码
+node tools/smoke/phase2.mjs   # 持久化、加密、网关 Key 生命周期、SSRF
+node tools/smoke/phase3.mjs   # 模型拉取与勾选、供应商名命名空间路由、模型别名
+node tools/smoke/phase4.mjs   # Web UI 与 API 全流程、登录模式
+node tools/smoke/phase5.mjs   # PRD 八条验收、性能冒烟、迁移演练
+```
+
+每个阶段自建临时数据目录、自动拉起 mock 上游，结束时打印 `N/N 通过`，失败返回非零退出码。
+默认端口从 19090 起（phase1 → 19090、phase2 → 19091、…、mock 统一 9999），
+可用 `--port=` / `--mock-port=` 覆盖。
+
+`--exe=<路径>` 可跳过 `go build`，直接对一份已构建产物跑全部断言——CI 就是这样验证**发布产物本身**
+（而不是另起一次 go build 的开发二进制）：
+
+```bash
+node tools/smoke/phase1.mjs --exe=dist/agoramodel-linux-amd64
+```
+
+> 冒烟脚本原先只有 PowerShell 版本（`tools/smoke/*.ps1`），只能在 Windows 上跑，且用了
+> `curl.exe`、`Start-Process -WindowStyle` 等 Windows 专属调用。现已统一改写成
+> `tools/smoke/*.mjs` + 共享库 `tools/smoke/lib/harness.mjs`，三个平台一份实现。
+
+```bash
 # 本地 mock 上游（冒烟脚本会自动启动；也可单独用于调试）
 node tools/mock-upstream/server.mjs
 
@@ -327,6 +390,9 @@ internal/store      SQLite 持久化与迁移
 internal/webui      内嵌前端与 SPA 路由
 npm                 npm 分发：主包转发器 + 平台包构建/发布脚本
 web                 前端工程（Vite + React）
+tools/mock-upstream 双协议 mock 上游（Node）
+tools/smoke         端到端冒烟 phase1–5（Node，Windows / Linux / macOS 共用同一份）
+tools/dev           Linux / macOS 开发环境预检
 docs                PRD / 功能明细设计说明书 / 待办清单
 ```
 

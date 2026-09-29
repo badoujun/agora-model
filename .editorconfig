@@ -1,0 +1,35 @@
+# 统一跨平台开发者的编辑器行为。
+#
+# 为什么需要它：仓库同时有 Windows 与 Linux/macOS 开发者，行尾、缩进、编码
+# 任一项不一致都会在 diff 里产生噪音，或在 CI 上表现为「本地能过、CI 报错」。
+# 这里与 .gitattributes（* text=auto eol=lf、*.ps1 eol=crlf）保持同一套约定。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Go 源码与 Makefile 一律用 tab（gofmt 的硬性要求）
+[*.go]
+indent_style = tab
+
+[Makefile]
+indent_style = tab
+
+# 前端与 npm 脚本已有各自约定（web/ 用 2 空格，与 prettier 默认一致）
+[*.{ts,tsx,js,mjs,cjs,json,yml,yaml,css,html}]
+indent_size = 2
+
+# 文档保留行尾空格（Markdown 用两个空格换行的写法）
+[*.{md,markdown}]
+trim_trailing_whitespace = false
+
+# Windows 专用脚本：必须 UTF-8 with BOM + CRLF，
+# 否则 Windows PowerShell 5.1 会按 ANSI 解码中文并报解析错误
+[*.{ps1,bat,cmd}]
+charset = utf-8-bom
+end_of_line = crlf

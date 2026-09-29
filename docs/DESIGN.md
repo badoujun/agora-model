@@ -103,11 +103,17 @@ agora-model/
 │  ├─ logging/                     # 请求日志与进程日志
 │  └─ api/                         # 管理 REST API + 会话认证
 ├─ web/                            # React + Vite 前端（构建产物 embed）
+├─ tools/
+│  ├─ mock-upstream/               # 双协议 mock 上游（Node）
+│  ├─ smoke/                       # 端到端冒烟 phase1–5（Node，三平台共用一份）
+│  ├─ lib/toolchain.ps1            # Windows：Go/Node PATH 探测
+│  └─ dev/preflight.sh             # Linux / macOS：环境预检（按 go.mod 比对版本）
 ├─ docs/
 │  ├─ PRD.md
 │  ├─ DESIGN.md
 │  └─ TODO.md
-└─ Makefile / Taskfile / build.ps1
+├─ Makefile                        # Linux / macOS 入口
+└─ build.ps1                       # Windows 入口
 ```
 
 ---
@@ -913,6 +919,8 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 ## 12. 部署与运维
 
 - **构建**：`make build`（或 `build.ps1`）：`npm --prefix web ci && npm --prefix web run build` → 按 ADR-001 的矩阵执行 `CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -ldflags="-s -w -X main.version=<ver>"`，产出 `dist/agoramodel-<os>-<arch>[.exe]`。构建脚本必须一次产出 Windows 与 Linux 两套产物（跨平台兼容性见下文）。
+  - **入口命令按平台二选一，产出完全一致**：Windows 用 `build.ps1 -Target build|dist|web|verify|clean`；Linux / macOS 用 `Makefile`（`make build|dist|web|verify|test|vet|fmt|lint|smoke|clean`）。新增目标见「跨平台开发」约定。
+  - **`web/package-lock.json` 的 `resolved` 必须指向官方 registry**：该文件曾是在 Windows 上用淘宝镜像生成的，165 条 `resolved` 全部锁死 `registry.npmmirror.com`，导致换环境后 `npm ci` 直接失败（npm 12 的 `allow-remote=none` 默认拒绝从 lock 中的非 registry 来源取包）。改为官方 registry 后，任何镜像环境都能安装——npm 会按当前配置的 registry 重写 tarball 的 host，而反向不成立。
 - **npm 分发（可选通道）**：`npm/` 目录提供「1 个主包 + 6 个平台包」的构建与发布脚本。
   - **包结构**：主包 `@bakeroot/agoramodel` 只含 Node 转发器（`bin/agoramodel.js`）；二进制由平台包 `@bakeroot/agoramodel-<os>-<cpu>` 提供。
   - **必须用 scope**：无 scope 的 `agoramodel-<os>-<cpu>` 被 npm 服务端的**包名反垃圾 / 防抢注筛查**拒绝（`403 Forbidden - Package name triggered spam detection`，已实测）。该筛查对 `<名字>-<平台>-<架构>` 这种模式特别敏感（`do-harness-win32-x64`、`archons-win32-x64-msvc` 都有公开记录），且**只在服务端发布时执行，`--dry-run` 预检不到**。scope 是账号独占的命名空间，包名不参与相似度判定。
@@ -927,7 +935,8 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
   - **自写 tar**：`npm/scripts/tarball.mjs` 直接按 tar 格式打包而不调用 `npm pack`。原因有二：① Windows 文件系统无法表达 Unix 权限位（`fs.chmod()` 是空操作，实测 mode 恒为 666），npm pack 出来的 Linux / macOS 平台包里二进制是 644，装到 Linux 上无法执行；② Windows 上调 npm CLI 必须经 shell，Node 24 会给出 DEP0190 警告。自写后在 tar 头里直接写入 0755，任何平台打包的结果都正确，也不必依赖运行期 chmod 兜底。
   - **与服务的配合**：转发器只服务交互式调用；`install` 注册的服务指向 `<数据目录>/bin/` 下的二进制副本，因此 `npm install -g @bakeroot/agoramodel@新版本` 不影响正在运行的服务。
   - **实测（Windows）**：`node --test` 20 项通过（含用系统 tar 独立校验 tar 头 checksum 与权限位）；`npm install <tgz>` 能正确解包；经 npm 生成的 `node_modules/.bin/agoramodel` 运行正常，退出码（0 / 1 / 2）与 stdout/stderr 均正确转发；`npm publish --dry-run` 被 npm 接受。
-  - **未实测**：在 Linux / macOS 上安装并运行（本地无对应环境）。
+  - **实测（Linux / amd64）**：`node npm/scripts/build.mjs --version=0.2.0` 产出 7 个包；tgz 内二进制权限位为 `0755`；用本地 tgz 安装主包 + `linux-x64` 平台包后，`node_modules/.bin/agoramodel --version` 正常输出 `0.2.0`（转发器链路在 Linux 上可用，补上了此前「本地无对应环境」的空白）。
+  - **未实测**：macOS 上的安装与运行；对真实 registry 的 `npm publish`（仅用 `--dry-run` 预检）。
 - **运行**：`./agoramodel --listen 127.0.0.1 --port 9090 --db ./data/agora.db`。
 - **零供应商启动**：数据库中没有（或全部停用了）供应商是**合法初始状态**——网关照常启动并挂载 Web UI，只是 `/v1` 暂时无法路由（`/v1/models` 返回空列表，`/v1/chat/completions` 返回 `model_not_found` 并说明需先添加供应商）；启动日志会直接给出 Web UI 地址。这也是「删掉最后一个供应商能成功」与「运行时新增供应商无需重启」的前提。
   - 实现上区分两条路径：`File.Normalize`（校验**用户提供的**引导配置，零供应商即报错）与 `File.NormalizeAllowEmpty` / `NewSnapshot`（运行时快照，允许为空）。两者曾复用同一校验，导致首次启动死锁——提示「等待 Web UI 添加供应商」，而 Web UI 恰恰需要网关先跑起来（见 TODO T5.10）。
@@ -1001,9 +1010,11 @@ WantedBy=multi-user.target
 - 时间统一以 UTC 存储（RFC3339），仅展示层本地化。
 - 临时文件与测试目录使用 `os.MkdirTemp` / `t.TempDir()`，禁止硬编码 `/tmp`。
 - 仓库加 `.gitattributes`（`* text=auto eol=lf`、`*.ps1 eol=crlf`），避免脚本行尾在两端表现不一。
+- **开发脚本本身也必须跨平台**：构建入口按平台二选一（Windows `build.ps1` / Linux·macOS `Makefile`），但**测试与冒烟只有一份实现**。PowerShell 版冒烟（`tools/smoke/*.ps1`）已删除：它用了 `curl.exe`、`Start-Process -WindowStyle Hidden` 等 Windows 专属调用，Linux 上装了 pwsh 也跑不起来；现统一为 `tools/smoke/phaseN.mjs` + 共享库 `tools/smoke/lib/harness.mjs`（Node 20+），`--exe=<产物>` 可跳过 `go build` 直接验证发布产物。环境预检同理：Windows 侧 `tools/lib/toolchain.ps1` 合并注册表 PATH 并探测安装目录，Linux / macOS 侧 `tools/dev/preflight.sh` 与 `go.mod` 声明的版本比对（发行版仓库自带的 Go 常常偏旧）。
+- 编辑器行为由 `.editorconfig` 统一（LF 行尾、缩进、`*.ps1` 保持 UTF-8 BOM + CRLF），与 `.gitattributes` 同一套约定。
 - SQLite 并发：单写协程 + `busy_timeout=5000`；WAL 下读连接可多开。modernc 在**极端并发写**（100+ 同时写）下可能出现 `database is locked`，本设计的单写协程正好规避。
 - 平台版本下限（已确认）：**Windows 10 / Windows 11** 与 Linux；Go 1.22+ 直接覆盖，不需要任何旧系统兼容分支（见 ADR-001）。
-- CI / 本地脚本矩阵：`{windows-latest, ubuntu-latest, macos-latest}` × `{amd64, arm64}` 编译 + 冒烟（`/healthz` + 一次 mock 上游透传）；macOS 侧额外确认未签名二进制的启动方式（见上表第 11 项）。
+- CI / 本地脚本矩阵：`{windows-latest, ubuntu-latest, macos-latest}` × `{amd64, arm64}` 编译 + 冒烟；**冒烟脚本是 Node（`tools/smoke/*.mjs`），三个平台共用同一份**，用 `--exe=<本次构建的产物>` 验证发布产物本身（phase1–3：协议透传 / 持久化与凭证加密 / 模型聚合与命名空间路由），另有独立的 `gofmt` 检查步骤与 linux 上的 `-race` job。macOS 侧额外确认未签名二进制的启动方式（见上表第 11 项）。
 
 ---
 
