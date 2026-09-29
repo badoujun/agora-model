@@ -410,6 +410,9 @@ node npm/scripts/publish.mjs
   （国内环境常把它设成只读镜像如 `registry.npmmirror.com`，发布必然失败且报错晦涩）；
   需要私有源时显式传 `--registry=`。
 - 发布前先 `npm login`；账号开了 2FA 时传 `--otp=123456`。
+- CI 发布（`.github/workflows/release.yml`）走 GitHub Actions OIDC（npm trusted publishing），
+  **不需要任何 token**：需在 npmjs.com 上为 7 个包分别配置 Trusted Publisher（workflow 填
+  `release.yml`）。OIDC 下 `npm whoami` 必然失败，`publish.mjs` 会自动跳过这道预检。
 - `build.mjs` **自己写 tar** 而不调用 `npm pack`：Windows 文件系统无法表达 Unix 权限位
   （`chmod` 是空操作，实测 mode 恒为 666），npm pack 出来的 Linux / macOS 平台包里
   二进制会是 644，装到 Linux 上无法执行。

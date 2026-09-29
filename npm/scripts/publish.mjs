@@ -15,6 +15,9 @@
  *   node npm/scripts/publish.mjs --otp=123456         # 账号开了 2FA 时
  *   node npm/scripts/publish.mjs --registry=https://...  # 发布到私有源
  *
+ * CI：在 GitHub Actions 的 OIDC 环境（npm trusted publishing）下无需任何 token，
+ * 凭据由 npm CLI 在 publish 那一刻自行换取；此时不做登录预检（见 usingTrustedPublishing）。
+ *
  * 前置：node npm/scripts/build.mjs
  */
 
@@ -92,6 +95,24 @@ function runNpm(args, options = {}) {
   execSync(['npm', ...args.map(shellQuote)].join(' '), { stdio: 'inherit', ...options });
 }
 
+/**
+ * 是否处于 CI 的 OIDC 环境（npm trusted publishing）。
+ *
+ * 判定条件与 npm CLI 自身一致：GitHub Actions 上同时存在
+ * ACTIONS_ID_TOKEN_REQUEST_URL 与 ACTIONS_ID_TOKEN_REQUEST_TOKEN
+ * （后者来自 workflow 的 `permissions: id-token: write`）。
+ *
+ * 该环境下 runner 上没有任何长期凭据：npm 只在 `npm publish` 那一刻用 OIDC token
+ * 换短期 token，所以 `npm whoami` 必然失败，不能拿它当发布前的登录检查。
+ */
+function usingTrustedPublishing() {
+  return Boolean(
+    process.env.GITHUB_ACTIONS &&
+      process.env.ACTIONS_ID_TOKEN_REQUEST_URL &&
+      process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN,
+  );
+}
+
 function readVersion(pkgJsonPath) {
   return JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8')).version;
 }
@@ -145,12 +166,17 @@ function main() {
   }
 
   if (!dryRun) {
-    try {
-      execSync(`npm whoami --registry ${shellQuote(registry)}`, {
-        stdio: ['ignore', 'pipe', 'ignore'],
-      });
-    } catch {
-      fail(`未登录 ${registry}，请先执行：npm login --registry=${registry}`);
+    if (usingTrustedPublishing()) {
+      // OIDC 下没有可查询的登录身份，跳过 whoami：npm 会在下面 publish 时自己换 token。
+      log('凭据：GitHub Actions OIDC（trusted publishing），跳过 whoami 预检');
+    } else {
+      try {
+        execSync(`npm whoami --registry ${shellQuote(registry)}`, {
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+      } catch {
+        fail(`未登录 ${registry}，请先执行：npm login --registry=${registry}`);
+      }
     }
   }
 

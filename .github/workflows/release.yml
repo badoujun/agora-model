@@ -7,9 +7,20 @@
 #       这一道闸是防止「tag 重复推送 / 误打 tag / 只改了文档」时也去发包。）
 #   2. 版本号确实变了才执行：构建三平台六份产物 → 打 7 个 npm tarball → 发布。
 #
-# 凭据：secrets.NPM_TOKEN，写到 runner 用户级 npm config（不落盘到仓库 .npmrc）。
+# 凭据：GitHub Actions OIDC（npm trusted publishing），全程不使用任何长期 token。
+#   1. npmjs.com 上必须为「每一个包」配置 Trusted Publisher（6 个平台包 + 1 个主包
+#      = 7 条），workflow 文件名填 `release.yml`，仓库填 `badoujun/agora-model`。
+#      这些字段是精确匹配的，任一处不符只会得到一个晦涩的 404 / ENEEDAUTH。
+#   2. 必须有 `permissions: id-token: write`（见 jobs.release.permissions）：
+#      runner 靠它换取 OIDC token，缺了就没法向 npm 证明「我是这个 workflow」。
+#   3. npm CLI 必须 ≥ 11.5.1，Node 必须 ≥ 22.14：Node 20 自带 npm 10.x，
+#      压根不认识 OIDC，会一路退化成「无凭据发布」。故这里用 Node 24 并显式升级 npm。
+#   4. 发布步骤上绝不能出现 NODE_AUTH_TOKEN / NPM_TOKEN 一类的凭据变量（哪怕空串）：
+#      npm 会先走 token 认证路径，并且不再回落到 OIDC。
+#
 # 仓库默认值固定为官方 registry（与 npm/scripts/publish.mjs 的 DEFAULT_REGISTRY 一致），
-# 不沿用 `npm config get registry`：内网常把它换成只读镜像，发布必然 403。
+# 不沿用 `npm config get registry`：内网常把它换成只读镜像，发布必然 403；
+# 且 OIDC 只对 https://registry.npmjs.org 生效，换源同样会 404。
 #
 # 失败策略：任何一步失败立即中断，不允许「半发版」（已发布的包 npm 不允许再覆盖）。
 # 想本地复跑：`node npm/scripts/publish.mjs --dry-run` 看产物清单。
@@ -35,7 +46,13 @@ jobs:
   release:
     name: 发布 ${{ github.ref_name }}
     runs-on: ubuntu-latest
-    # 仓库托管环境变量与 secrets 详情见 https://docs.github.com/zh/actions
+    permissions:
+      # checkout 只需要读代码。
+      contents: read
+      # OIDC trusted publishing 的必要条件：允许 runner 申请 OIDC token，
+      # npm 据此换取「仅本次 workflow 有效」的短期发布凭据。
+      id-token: write
+    # 环境变量与 Actions 语法见 https://docs.github.com/zh/actions
     env:
       # 与 npm/scripts/publish.mjs 的 DEFAULT_REGISTRY 对齐：固定官方源，
       # 不读 runner 上的 `npm config get registry`，避免内网镜像干扰。
@@ -54,7 +71,21 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          # 不能用 Node 20：它自带 npm 10.x，完全不支持 OIDC，
+          # 发布时会退化成「无凭据」并报 ENEEDAUTH。
+          node-version: '24'
+          # 刻意不设 registry-url：该选项会往 ~/.npmrc 写一行
+          # `_authToken=${NODE_AUTH_TOKEN}`，OIDC 发布时会因此不走 OIDC 路径。
+
+      # OIDC 要求 npm CLI ≥ 11.5.1；不显式升级的话，某些 Node 24 小版本自带的
+      # npm 仍低于该线，症状同样是晦涩的 ENEEDAUTH。
+      # 这里顺带打印版本，日志里能直接确认「会说 OIDC 的那个 npm」确实生效了。
+      - name: 升级 npm（trusted publishing 需要 ≥ 11.5.1）
+        if: steps.version-check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          npm install -g 'npm@^11.5.1' --no-fund --no-audit
+          npm --version
 
       # ---------------------------------------------------------------- 版本号比对
       #
@@ -160,25 +191,17 @@ jobs:
           set -euo pipefail
           node npm/scripts/build.mjs
 
-      # ---------------------------------------------------------------- 注入 npm 凭据
-      # 写到 runner 用户级 npm config（~/.npmrc）；不落盘到仓库 .npmrc，避免 token 入库。
-      # `npm publish` 在该位置找到 _authToken 后会替换掉命令行的 username/password。
-      - name: 配置 npm 凭据
-        if: steps.version-check.outputs.changed == 'true'
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "$NPM_TOKEN" ]; then
-            echo "::error::secrets.NPM_TOKEN 未配置；请在仓库 Settings → Secrets 中添加"
-            exit 1
-          fi
-          # 必须显式 --registry，否则 npm 会用本地 npm config get registry 的值
-          # （内网常见为只读镜像），写入会被静默落到错误位置。
-          npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN" --registry="$NPM_CONFIG_REGISTRY"
-          npm config set registry "$NPM_CONFIG_REGISTRY"
-          # 验证凭据：whoami 失败立刻终止，避免发布到一半才发现没登录。
-          npm whoami --registry "$NPM_CONFIG_REGISTRY"
+      # ---------------------------------------------------------------- 凭据（OIDC）
+      # 这里没有任何凭据注入步骤，这是刻意的：npm CLI 会在 OIDC 环境里自行用
+      # ACTIONS_ID_TOKEN_REQUEST_URL 换取「仅本次 workflow 有效」的短期 token，
+      # 并自动附带 provenance（不再需要 --provenance）。
+      # 一旦在此处设置 NODE_AUTH_TOKEN / NPM_TOKEN（哪怕空串），npm 就会先走
+      # token 认证路径，且不再回落到 OIDC——这是迁到 trusted publishing 后最常见的坑。
+      #
+      # 另外：OIDC 下没有可预检的登录态，`npm whoami` 必然失败（身份交换只发生在
+      # publish 那一刻）。因此发布脚本在 OIDC 环境下会跳过 whoami 预检，
+      # 凭据是否配对要到真正 publish 时才见分晓——出错请回看 npm 的 404 / ENEEDAUTH
+      # 报错，并逐项核对上面的 4 条要求。
 
       # ---------------------------------------------------------------- 发布
       # publish.mjs 会先发 6 个平台包、再发主包；该顺序由 npm install 时
@@ -188,5 +211,6 @@ jobs:
         if: steps.version-check.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          # --registry 显式覆盖：与 publish.mjs 默认值一致，但显式传入更稳妥。
+          # --registry 显式覆盖：与 publish.mjs 默认值一致，但显式传入更稳妥；
+          # OIDC 也认不出别的源（镜像源只会 404）。
           node npm/scripts/publish.mjs --registry="$NPM_CONFIG_REGISTRY"
