@@ -208,3 +208,69 @@ export interface WebDAVTestResult {
   remote_bytes?: number
   error?: string
 }
+
+/* -------------------------- 使用统计 -------------------------- */
+
+export interface UsageKPI {
+  /** 今日 token 总数 */
+  today_total: number
+  /** 最近 7 天 token 总数 */
+  week7_total: number
+  /** 最近 30 天 token 总数 */
+  month30_total: number
+}
+
+export interface UsageModelShare {
+  name: string
+  provider: string
+  total: number
+  percent: number
+  input_cached: number
+  input_uncached: number
+  output: number
+  requests: number
+}
+
+export interface UsageProviderShare {
+  id: string
+  name: string
+  total: number
+  percent: number
+  model_count: number
+}
+
+export interface UsageDailyRow {
+  /** YYYY-MM-DD */
+  date: string
+  total: number
+  input_cached: number
+  input_uncached: number
+  output: number
+  requests: number
+}
+
+export interface UsageHeatmapCell {
+  /** YYYY-MM-DD */
+  date: string
+  total: number
+}
+
+export interface UsageTrendPoint {
+  /** YYYY-MM-DD */
+  date: string
+  total: number
+}
+
+export type UsageGranularity = 'daily' | 'weekly' | 'monthly'
+
+export interface UsagePayload {
+  first_used_at: string
+  active_days: number
+  granularity: UsageGranularity
+  kpi: UsageKPI
+  models: UsageModelShare[]
+  providers: UsageProviderShare[]
+  daily: UsageDailyRow[]
+  heatmap: UsageHeatmapCell[]
+  trend: UsageTrendPoint[]
+}

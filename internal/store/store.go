@@ -25,6 +25,7 @@ var migrations = []migration{
 	{version: 2, name: "provider_fetch_status", statements: schemaV2},
 	{version: 3, name: "single_protocol_model_selection", statements: schemaV3},
 	{version: 4, name: "provider_website_and_gateway_key_cipher", statements: schemaV4},
+	{version: 5, name: "model_usage_daily_and_minute", statements: schemaV5},
 }
 
 type migration struct {
@@ -234,4 +235,36 @@ var schemaV3 = []string{
 var schemaV4 = []string{
 	`ALTER TABLE providers ADD COLUMN website_url TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE gateway_keys ADD COLUMN key_cipher BLOB`,
+}
+
+// schemaV5 为「使用统计」页面落地持久化：
+//   - model_usage_minute：分钟级明细，仅保留当日；写入按 provider+model+minute 主键合并；
+//     启动 + 每小时一次清理早于 now-24h 的行。
+//   - model_usage_daily：按日聚合，永久保留；周/月汇总与累计窗口都从这张表派生。
+//
+// 所有数值列都用 INTEGER 而非 BIGINT：模型最大输出 token 数（数十万）在 INTEGER
+// 范围内绰绰有余，写入更快；后续如需更大范围再 ALTER。
+var schemaV5 = []string{
+	`CREATE TABLE IF NOT EXISTS model_usage_minute (
+		minute             TEXT    NOT NULL,
+		provider_id        TEXT    NOT NULL,
+		model              TEXT    NOT NULL,
+		requests           INTEGER NOT NULL DEFAULT 0,
+		input_tokens       INTEGER NOT NULL DEFAULT 0,
+		cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens      INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (minute, provider_id, model)
+	)`,
+	`CREATE TABLE IF NOT EXISTS model_usage_daily (
+		date               TEXT    NOT NULL,
+		provider_id        TEXT    NOT NULL,
+		model              TEXT    NOT NULL,
+		requests           INTEGER NOT NULL DEFAULT 0,
+		input_tokens       INTEGER NOT NULL DEFAULT 0,
+		cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens      INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (date, provider_id, model)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_minute_date ON model_usage_minute(minute)`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_daily_date  ON model_usage_daily(date)`,
 }

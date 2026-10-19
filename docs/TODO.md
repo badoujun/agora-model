@@ -403,7 +403,6 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 - [ ] 日志保留策略：按天数/条数清理，防止 SQLite 无限增长（FR-7.5）。
 - [ ] `/v1/models` 的 Anthropic 格式内容协商（DESIGN §13 已论证低优先级）。
 - [ ] 协议适配插件接口：Gemini `/v1beta`、OpenAI Responses API（预留 `protocol adapter` 抽象）。
-- [ ] 用量统计与计费（用户已明确暂不考虑）。
 - [ ] WebDAV 导出（用户已明确暂不考虑；当前靠 `/api/export` + 服务端集中配置）。
 - [ ] MCP 服务器代理。
 - [ ] 多用户/多租户与 RBAC。
@@ -411,6 +410,33 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 - [ ] macOS 代码签名与公证（notarize），消除 Gatekeeper 拦截提示。
 
 ---
+
+## Phase 6 · 使用统计（已完成 · 2026-10）
+
+> **进度**：已完成（前端 mock 阶段 → 真实后端实现）
+> 实测证据：
+> - `go test ./... -count=1` 全部通过（cmd/agoramodel + 9 个 internal 包，无 FAIL）；含新写测试 `internal/gateway/usage_test.go` / `internal/store/usage_test.go` / `internal/api/usage_test.go`。
+> - `npm --prefix web run build` 通过（tsc --noEmit + vite build）。
+> - `make dist` 通过（6 份三平台产物，linux/amd64 静态链接）。
+
+- [x] **T6.1｜Gateway 侧用量解析** ｜ 4h ｜ 依赖 Phase 0~3
+  - 抽出 `internal/logging/usage.go`（Usage + UsageSink 接口），避免 gateway / store 循环依赖；
+  - `internal/gateway/usage.go`：Usage 结构 + 4 个解析器（OpenAI / Anthropic × 流式 / 非流式）+ `teeNonStreamBody` 透传缓冲 + `recordUsage`；
+  - `gateway.WithUsageSink(...)` 注入；handler 流式 / 非流式两个分支都接 recordUsage；
+  - `stream.go` 新增 `streamUsageParser` 接口 + OpenAI chunked JSON 与 Anthropic SSE event 两种实现 + `splitSSEEvent`。
+  - **验收**：4 个解析器 / 聚合器单测覆盖，gateway 包 vet 通过。
+- [x] **T6.2｜Store 层落库 + 异步 Recorder** ｜ 3h ｜ 依赖 T6.1
+  - 迁移 v5：`model_usage_minute`（当日明细，按 (minute, provider, model) 主键合并）+ `model_usage_daily`（永久聚合）；
+  - `internal/store/usage.go`：`UpsertUsageMinute` / `UpsertUsageDaily` / `PruneUsageMinute`（SQLite UPSERT 原子合并）；
+  - `internal/store/usage_recorder.go`：`UsageRecorder` 实现 `logging.UsageSink`，异步 channel + 30s flush + 启动时 + 每小时 prune；
+  - 失败请求（statusCode≥400）由 `recordUsage` 跳过，Recorder 内 zero usage 也跳过。
+  - **验收**：3 个 store 测试覆盖 UPSERT / Prune；go test ./... 通过。
+- [x] **T6.3｜API 端点 + 前端切换** ｜ 3h ｜ 依赖 T6.2
+  - `internal/api/usage.go`：`GET /api/usage?from=&to=&granularity=`；聚合窗口内 `model_usage_daily` 输出 daily / models / providers / heatmap / trend + KPI + first_used_at / active_days；
+  - `cmd/agoramodel/main.go`：`slogToRecorderLogger` adapter + `store.UsageRecorder` 构造 + `gateway.WithUsageSink` 接入 + 关闭时 `Wait(5s)` + 打印 stats；
+  - 前端 `web/src/lib/api.ts`：`usage()` 从 mock 切到真实 `request<UsagePayload>('/api/usage${query(...)}')`，params 扩展为 `{ granularity?, from?, to? }`；
+  - `tools/mock-upstream/server.mjs`：新增 `usageFromQuery(req)` helper，4 个调用点（OpenAI 非流式 / 流式尾 chunk / Anthropic 流式 message_start + message_delta / Anthropic 非流式）注入 usage / input / output / cached query 参数。
+  - **验收**：5 个 api 纯函数测试覆盖；go test ./... 通过；前端构建通过。
 
 ## 风险跟踪表（随进度更新）
 

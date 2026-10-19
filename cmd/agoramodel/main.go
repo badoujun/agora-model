@@ -36,6 +36,16 @@ import (
 // 保证控制台左上角始终显示可读的版本号而不是构建哈希。
 var version = "0.3.0"
 
+// slogToRecorderLogger 把 *slog.Logger 适配到 store.UsageRecorder 期望的 slogLogger 接口。
+//
+// UsageRecorder 只需要 Info/Warn/Error 三个方法，且不传键值对以外的结构化字段；
+// 我们直接透传 args（slog 原生支持 key-value 交替的 args 列表）。
+type slogToRecorderLogger struct{ inner *slog.Logger }
+
+func (l slogToRecorderLogger) Info(msg string, args ...any)  { l.inner.Info(msg, args...) }
+func (l slogToRecorderLogger) Warn(msg string, args ...any)  { l.inner.Warn(msg, args...) }
+func (l slogToRecorderLogger) Error(msg string, args ...any) { l.inner.Error(msg, args...) }
+
 func main() {
 	var (
 		configPath  = flag.String("config", "config.json", "JSON 引导配置（仅当数据库中没有供应商时用于首次导入）")
@@ -292,6 +302,11 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 	recorder := logging.NewRecorder(st, logger, logging.RecorderOptions{})
 	recorder.Start(ctx)
 
+	// 6.5) token 用量记录器（异步批量写入 model_usage_daily / model_usage_minute）
+	// gateway.WithUsageSink 直接接入；recorder 自己负责 prune 旧分钟明细。
+	usageRecorder := store.NewUsageRecorder(st, slogToRecorderLogger{inner: logger}, store.DefaultUsageRecorderOptions())
+	usageRecorder.Start(ctx)
+
 	// 7) HTTP 服务
 	presetStore := presets.New(presets.Options{
 		OverridePath: opts.PresetsPath,
@@ -326,6 +341,7 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 	gateway.New(holder, logger).
 		WithKeyStore(st).
 		WithRecorder(recorder).
+		WithUsageSink(usageRecorder).
 		Register(mux)
 
 	srv := &http.Server{
@@ -366,6 +382,14 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 	}
 	written, dropped := recorder.Stats()
 	logger.Info("已停止", "logs_written", written, "logs_dropped", dropped)
+
+	// 等待 token 用量记录器刷完
+	if !usageRecorder.Wait(5 * time.Second) {
+		logger.Warn("token 用量刷新超时，可能有少量分钟桶未落库")
+	}
+	uWritten, uDropped, uPruned := usageRecorder.Stats()
+	logger.Info("usage 写入",
+		"usage_written", uWritten, "usage_dropped", uDropped, "usage_pruned", uPruned)
 	return nil
 }
 

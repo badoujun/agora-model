@@ -9,6 +9,7 @@ import { SettingsPage } from '@/pages/Settings'
 import { LogsPage } from '@/pages/Logs'
 import { DataLocationPage } from '@/pages/DataLocation'
 import { LoginPage } from '@/pages/Login'
+import { UsagePage } from '@/pages/Usage'
 
 export default function App() {
   const session = useQuery({ queryKey: ['session'], queryFn: api.session, retry: 0 })
@@ -47,6 +48,7 @@ export default function App() {
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/logs" element={<LogsPage />} />
+          <Route path="/usage" element={<UsagePage />} />
           <Route path="/data" element={<DataLocationPage />} />
           <Route path="*" element={<Navigate to="/providers" replace />} />
         </Routes>

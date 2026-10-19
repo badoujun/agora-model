@@ -40,6 +40,7 @@ type Gateway struct {
 	logger    *slog.Logger
 	keys      KeyStore
 	recorder  *logging.Recorder
+	usageSink UsageSink
 	lastTouch atomic.Int64 // 网关 Key 使用时间的节流（Unix 秒）
 }
 
@@ -79,6 +80,17 @@ func (g *Gateway) WithKeyStore(ks KeyStore) *Gateway {
 // WithRecorder 注入请求日志记录器。
 func (g *Gateway) WithRecorder(r *logging.Recorder) *Gateway {
 	g.recorder = r
+	return g
+}
+
+// WithUsageSink 注入 token 用量接收器（前端「使用统计」页面读取）。
+//
+// 不传时使用 noop sink（丢弃记录），保持现有调用代码不 nil 检查。
+func (g *Gateway) WithUsageSink(s UsageSink) *Gateway {
+	if s == nil {
+		s = noopUsageSink{}
+	}
+	g.usageSink = s
 	return g
 }
 
@@ -269,12 +281,22 @@ func (g *Gateway) handler() http.HandlerFunc {
 
 		if isEventStream(resp) {
 			streamServed = true
-			stats, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle(), started)
+			stats, usage, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle(), started)
 			g.logCompletion(requestID, model, decision, resp.StatusCode, started, stats, serr)
+			if u, ok := usage.Result(); ok {
+				recordUsage(g.usageSink, decision.Provider.ID, decision.Model, resp.StatusCode, u, started)
+			}
 			return
 		}
 
-		written, cerr := copyResponse(w, resp)
+		// 非流式：用 TeeReader 把字节同时给客户端和副本缓冲，解析后 recordUsage。
+		var bodyBuf bytes.Buffer
+		written, cerr := copyResponse(w, resp, &bodyBuf)
+		if cerr == nil && bodyBuf.Len() > 0 {
+			if u, ok := parseUsageNonStream(resp.Header.Get("Content-Type"), bodyBuf.Bytes()); ok {
+				recordUsage(g.usageSink, decision.Provider.ID, decision.Model, resp.StatusCode, u, started)
+			}
+		}
 		g.logger.Info("请求完成",
 			"request_id", requestID, "model", model,
 			"provider", decision.Provider.Name, "status", resp.StatusCode,
@@ -385,13 +407,19 @@ func (s *statusWriter) noteError(msg string) { s.errMsg = msg }
 func (s *statusWriter) errorMessage() string { return s.errMsg }
 
 // prepareBody 按需重写 JSON body：
-//   - 无 extra_body 且无需改写 model → 原样返回（零改写，保真度最高）
-//   - 否则用 map[string]json.RawMessage 做最小改写：只替换 model 键、合并 extra_body 键，
-//     其余字段的原始字节完全保留
+//   - 无 extra_body、无需改写 model、且不需要注入 stream_options → 原样返回（零改写）；
+//   - 否则用 map[string]json.RawMessage 做最小改写：替换 model 键 / 合并 extra_body 键 /
+//     必要时追加 stream_options；其余字段的原始字节完全保留。
+//
+// stream_options.include_usage=true 注入：OpenAI 兼容的厂商（DeepSeek / MiniMax /
+// Agnes 等）在流式响应里默认不发 usage 块——必须请求里显式带此开关才会发。
+// 网关层负责 token 用量统计，没有 usage 就写不进 model_usage_daily，因此仅在
+// 缺失时追加，且不覆盖调用方已有的 stream_options 键。
 func prepareBody(raw []byte, decision route.Result, originalModel string) ([]byte, error) {
 	extra := decision.Provider.ExtraBody
 	needModelRewrite := decision.Model != originalModel
-	if len(extra) == 0 && !needModelRewrite {
+	needStreamOption := needsStreamUsageOption(raw)
+	if len(extra) == 0 && !needModelRewrite && !needStreamOption {
 		return raw, nil
 	}
 
@@ -413,7 +441,26 @@ func prepareBody(raw []byte, decision route.Result, originalModel string) ([]byt
 		}
 		obj[key] = encoded
 	}
+	if needStreamOption {
+		obj["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+	}
 	return json.Marshal(obj)
+}
+
+// needsStreamUsageOption 报告 body 是否需要在出站时追加 stream_options.include_usage=true。
+//
+// 判定同时看三个条件：请求是流式、body 是合法 JSON 对象、对象里没有 stream_options 键。
+// 任一不满足则不注入（用户/上游兼容性优先；非流式响应本就回完整 usage 也不需要）。
+func needsStreamUsageOption(raw []byte) bool {
+	if !isStreamRequest(raw) {
+		return false
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	_, has := probe["stream_options"]
+	return !has
 }
 
 // isStreamRequest 报告请求体是否要求流式响应（仅用于日志）。

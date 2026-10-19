@@ -581,3 +581,128 @@ func TestSlashModelNameIsNotTreatedAsNamespace(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// ---------------------------------------------------------------------------
+// stream_options.include_usage=true 自动注入
+// ---------------------------------------------------------------------------
+
+// captureUpstream 启动一个 mock 上游，回 200 + 空 JSON 响应；测试断言上游收到的 body。
+func captureUpstream(t *testing.T) (*httptest.Server, func() []byte) {
+	t.Helper()
+	var mu sync.Mutex
+	var last []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		last = body
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(up.Close)
+	return up, func() []byte {
+		mu.Lock()
+		defer mu.Unlock()
+		return last
+	}
+}
+
+func TestPrepareBodyInjectsStreamOptionsOnStream(t *testing.T) {
+	up, last := captureUpstream(t)
+	srv := buildGateway(t, config.Gateway{}, providerFor("p", up.URL, "m"))
+
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"m","stream":true,"messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
+	}
+
+	got := last()
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("上游请求体不是 JSON: %v\n%s", err, got)
+	}
+	so, ok := payload["stream_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("流式请求应自动注入 stream_options，得到 %v\n完整 body: %s", payload["stream_options"], got)
+	}
+	if so["include_usage"] != true {
+		t.Errorf("include_usage = %v, 期望 true", so["include_usage"])
+	}
+	if payload["model"] != "m" {
+		t.Errorf("model 字段应保留，得到 %v", payload["model"])
+	}
+	if payload["stream"] != true {
+		t.Errorf("stream 字段应保留，得到 %v", payload["stream"])
+	}
+}
+
+func TestPrepareBodyNoInjectOnNonStream(t *testing.T) {
+	up, last := captureUpstream(t)
+	srv := buildGateway(t, config.Gateway{}, providerFor("p", up.URL, "m"))
+
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"m","stream":false,"messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
+	}
+
+	got := last()
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("上游请求体不是 JSON: %v\n%s", err, got)
+	}
+	if _, has := payload["stream_options"]; has {
+		t.Errorf("非流式请求不应注入 stream_options，得到 %s", got)
+	}
+}
+
+func TestPrepareBodyDoesNotOverrideExistingStreamOptions(t *testing.T) {
+	up, last := captureUpstream(t)
+	srv := buildGateway(t, config.Gateway{}, providerFor("p", up.URL, "m"))
+
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
+	}
+
+	got := last()
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("上游请求体不是 JSON: %v\n%s", err, got)
+	}
+	so, ok := payload["stream_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("调用方已有的 stream_options 应保留，得到 %v", payload["stream_options"])
+	}
+	if so["include_usage"] != false {
+		t.Errorf("调用方显式传 false 时不应被覆盖，得到 %v", so["include_usage"])
+	}
+}
+
+func TestPrepareBodyStreamOptionAndExtraBodyCoexist(t *testing.T) {
+	up, last := captureUpstream(t)
+	provider := providerFor("p", up.URL, "m")
+	provider.ExtraBody = map[string]any{"temperature": 0.1}
+	srv := buildGateway(t, config.Gateway{}, provider)
+
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"m","stream":true,"messages":[]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
+	}
+
+	got := last()
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("上游请求体不是 JSON: %v\n%s", err, got)
+	}
+	if payload["temperature"] != 0.1 {
+		t.Errorf("extra_body 应仍生效，temperature = %v", payload["temperature"])
+	}
+	so, ok := payload["stream_options"].(map[string]any)
+	if !ok || so["include_usage"] != true {
+		t.Errorf("stream_options 应一并被注入，得到 %v", payload["stream_options"])
+	}
+}

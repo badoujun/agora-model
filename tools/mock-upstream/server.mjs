@@ -49,6 +49,32 @@ function num(req, key, def) {
   return v === null || v === undefined ? def : Number(v);
 }
 
+/**
+ * usageFromQuery 从 query 参数解析注入的 token 用量。
+ *
+ * 支持：
+ *   - usage=N       同时设置 input/output = N（便捷参数）
+ *   - input=N       input_tokens = N
+ *   - output=N      output_tokens = N
+ *   - cached=N      cached_input_tokens = N（仅 OpenAI prompt_tokens_details.cached_tokens；
+ *                    Anthropic 视为 cache_read_input_tokens）
+ *
+ * 没注入任何参数时返回 null——调用方回退到 mock 默认值（OpenAI 12/8，Anthropic 12/8）。
+ */
+function usageFromQuery(req) {
+  const inputRaw = param(req, 'input');
+  const outputRaw = param(req, 'output');
+  const cachedRaw = param(req, 'cached');
+  const usageRaw = param(req, 'usage');
+  if (inputRaw === null && outputRaw === null && cachedRaw === null && usageRaw === null) {
+    return null
+  }
+  const input = inputRaw !== null ? Number(inputRaw) : usageRaw !== null ? Number(usageRaw) : 0
+  const output = outputRaw !== null ? Number(outputRaw) : usageRaw !== null ? Number(usageRaw) : 0
+  const cached = cachedRaw !== null ? Number(cachedRaw) : 0
+  return { input, output, cached }
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -146,6 +172,17 @@ async function openaiStream(req, res, model) {
       object: 'chat.completion.chunk',
       model,
       choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      // 尾部 chunk 携带 usage 块（OpenAI 流式协议约定），让网关能在流结束时聚合 token。
+      // 不注入时使用与 openaiJSON 一致的默认值 12/8。
+      usage: (() => {
+        const u = usageFromQuery(req) ?? { input: 12, output: 8, cached: 0 }
+        return {
+          prompt_tokens: u.input,
+          completion_tokens: u.output,
+          total_tokens: u.input + u.output,
+          prompt_tokens_details: u.cached > 0 ? { cached_tokens: u.cached } : undefined,
+        }
+      })(),
     })}\n\n`,
   );
   res.write('data: [DONE]\n\n');
@@ -161,13 +198,19 @@ function openaiJSON(req, res, model) {
       choices: [{ index: 0, message: { role: 'assistant', content: 'x'.repeat(2 * 1024 * 1024) }, finish_reason: 'stop' }],
     });
   }
+  const injected = usageFromQuery(req) ?? { input: 12, output: 8, cached: 0 }
   sendJSON(res, 200, {
     id: 'chatcmpl-mock',
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, message: { role: 'assistant', content: 'mock 非流式回复' }, finish_reason: 'stop' }],
-    usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
+    usage: {
+      prompt_tokens: injected.input,
+      completion_tokens: injected.output,
+      total_tokens: injected.input + injected.output,
+      prompt_tokens_details: injected.cached > 0 ? { cached_tokens: injected.cached } : undefined,
+    },
   });
 }
 
@@ -179,6 +222,9 @@ async function anthropicStream(req, res, model) {
   const silence = num(req, 'silence', 0);
   sseHeaders(res);
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const aInjected = usageFromQuery(req) ?? { input: 12, output: 8, cached: 0 }
+  // Anthropic 流式协议：usage 分布在 message_start（input_tokens + cache_read）
+  // 与 message_delta（output_tokens 最终累计）两个事件里。
   send('message_start', {
     type: 'message_start',
     message: {
@@ -188,7 +234,11 @@ async function anthropicStream(req, res, model) {
       model,
       content: [],
       stop_reason: null,
-      usage: { input_tokens: 12, output_tokens: 0 },
+      usage: {
+        input_tokens: aInjected.input - aInjected.cached,
+        output_tokens: 0,
+        cache_read_input_tokens: aInjected.cached,
+      },
     },
   });
   send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
@@ -209,12 +259,18 @@ async function anthropicStream(req, res, model) {
     await sleep(gap);
   }
   send('content_block_stop', { type: 'content_block_stop', index: 0 });
-  send('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: chunks * 3 } });
+  send('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn' },
+    // output_tokens 用注入值；不注入时回退到 chunks*3（与原 mock 一致）。
+    usage: { output_tokens: aInjected.output > 0 ? aInjected.output : chunks * 3 },
+  });
   send('message_stop', { type: 'message_stop' });
   res.end();
 }
 
 function anthropicJSON(req, res, model) {
+  const aInjected = usageFromQuery(req) ?? { input: 12, output: 8, cached: 0 }
   sendJSON(res, 200, {
     id: 'msg_mock',
     type: 'message',
@@ -222,7 +278,11 @@ function anthropicJSON(req, res, model) {
     model,
     content: [{ type: 'text', text: 'mock 非流式回复' }],
     stop_reason: 'end_turn',
-    usage: { input_tokens: 12, output_tokens: 8 },
+    usage: {
+      input_tokens: aInjected.input - aInjected.cached,
+      output_tokens: aInjected.output,
+      cache_read_input_tokens: aInjected.cached,
+    },
   });
 }
 

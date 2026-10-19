@@ -131,6 +131,9 @@ func (s *Server) Register(mux *http.ServeMux) {
 	// 数据位置（本机落盘路径）
 	mux.HandleFunc("GET /api/data-locations", s.guard(s.handleDataLocations))
 
+	// 使用统计（前端「使用统计」页面读取）
+	mux.HandleFunc("GET /api/usage", s.guard(s.handleUsage))
+
 	// 预设供应商（国内常用，编译期内置；用户可在 docs/provider-presets.json 覆盖）
 	mux.HandleFunc("GET /api/provider-presets", s.guard(s.handleListProviderPresets))
 

@@ -11,6 +11,7 @@ import type {
   SessionInfo,
   SettingsPayload,
   TestResult,
+  UsagePayload,
   WebDAVConfig,
   WebDAVStatus,
   WebDAVSyncResult,
@@ -172,4 +173,8 @@ export const api = {
     limit?: number
     offset?: number
   }) => request<{ items: LogItem[]; total: number; limit: number; offset: number }>(`/api/logs${query(params)}`),
+
+  // 使用统计（前端「使用统计」页面读取）
+  usage: (params: { granularity?: 'daily' | 'weekly' | 'monthly'; from?: string; to?: string } = {}) =>
+    request<UsagePayload>(`/api/usage${query(params)}`),
 }
