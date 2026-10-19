@@ -13,10 +13,10 @@ import (
 // TestParseOpenAIUsageNonStream 覆盖 OpenAI 协议的非流式 usage 解析。
 func TestParseOpenAIUsageNonStream(t *testing.T) {
 	cases := []struct {
-		name    string
-		body    string
-		want    Usage
-		wantOK  bool
+		name   string
+		body   string
+		want   Usage
+		wantOK bool
 	}{
 		{
 			name: "完整 usage 块 + cached",
@@ -65,10 +65,10 @@ func TestParseOpenAIUsageNonStream(t *testing.T) {
 // TestParseAnthropicUsageNonStream 覆盖 Anthropic 协议的非流式 usage 解析。
 func TestParseAnthropicUsageNonStream(t *testing.T) {
 	cases := []struct {
-		name    string
-		body    string
-		want    Usage
-		wantOK  bool
+		name   string
+		body   string
+		want   Usage
+		wantOK bool
 	}{
 		{
 			name: "完整 usage 块 + cache_read",
@@ -81,8 +81,8 @@ func TestParseAnthropicUsageNonStream(t *testing.T) {
 			want: Usage{InputTokens: 50, CachedInputTokens: 0, OutputTokens: 10}, wantOK: true,
 		},
 		{
-			name: "全 0",
-			body: `{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}`,
+			name:   "全 0",
+			body:   `{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}`,
 			wantOK: false,
 		},
 		{

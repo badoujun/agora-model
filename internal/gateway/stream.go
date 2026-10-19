@@ -145,7 +145,7 @@ type openAIStreamParser struct {
 	acc *openAIUsageAccumulator
 }
 
-func (p *openAIStreamParser) Feed(chunk []byte) { p.acc.Feed(chunk) }
+func (p *openAIStreamParser) Feed(chunk []byte)     { p.acc.Feed(chunk) }
 func (p *openAIStreamParser) Result() (Usage, bool) { return p.acc.Result() }
 
 // anthropicStreamParser 解析 SSE event 流（`event: <name>\ndata: <json>\n\n`）。

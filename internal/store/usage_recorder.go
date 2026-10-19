@@ -41,11 +41,11 @@ func DefaultUsageRecorderOptions() UsageRecorderOptions {
 // UsageRecorder 同时实现 logging.UsageSink 接口（main 把 gateway.WithUsageSink
 // 直接注入本 recorder），因此 gateway 与 store 之间不需要相互 import。
 type UsageRecorder struct {
-	writer *Store
-	logger slogLogger
-	opts   UsageRecorderOptions
-	ch     chan usageEvent
-	done   chan struct{}
+	writer  *Store
+	logger  slogLogger
+	opts    UsageRecorderOptions
+	ch      chan usageEvent
+	done    chan struct{}
 	written atomic.Int64
 	dropped atomic.Int64
 	pruned  atomic.Int64

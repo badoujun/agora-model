@@ -80,11 +80,11 @@ func TestPruneUsageMinute(t *testing.T) {
 	ctx := context.Background()
 
 	old := MinuteBucket{
-		Minute: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+		Minute:     time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
 		ProviderID: "p1", Model: "m1", Requests: 1, InputTokens: 10, OutputTokens: 5,
 	}
 	newer := MinuteBucket{
-		Minute: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
+		Minute:     time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
 		ProviderID: "p1", Model: "m1", Requests: 1, InputTokens: 10, OutputTokens: 5,
 	}
 	if err := st.UpsertUsageMinute(ctx, []MinuteBucket{old, newer}); err != nil {

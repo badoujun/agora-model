@@ -140,10 +140,10 @@ func (a *openAIUsageAccumulator) Result() (Usage, bool) {
 func parseAnthropicUsageNonStream(body []byte) (Usage, bool) {
 	var envelope struct {
 		Usage struct {
-			InputTokens            int `json:"input_tokens"`
-			OutputTokens           int `json:"output_tokens"`
-			CacheReadInputTokens   int `json:"cache_read_input_tokens"`
-			CacheCreationTokens    int `json:"cache_creation_input_tokens"`
+			InputTokens          int `json:"input_tokens"`
+			OutputTokens         int `json:"output_tokens"`
+			CacheReadInputTokens int `json:"cache_read_input_tokens"`
+			CacheCreationTokens  int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
@@ -262,9 +262,10 @@ func parseUsageNonStream(contentType string, body []byte) (Usage, bool) {
 // splitOpenAISSEChunks 把一段字节按 SSE 协议切成多个 data 负载。
 //
 // pumpUpstream 一次 Read 可能拿到"多个 SSE 事件拼一起"的字节：
-//   data: {...choices...}\n\n
-//   data: {...usage...}\n\n
-//   data: [DONE]\n\n
+//
+//	data: {...choices...}\n\n
+//	data: {...usage...}\n\n
+//	data: [DONE]\n\n
 //
 // 用 encoding/json 一次解整块会因为非空白后缀字符（如 [DONE] 或 data:）而失败，
 // 整个 chunk 内的 usage 事件被一并丢弃。本函数按 \n\n 分块并去掉 data: 前缀，

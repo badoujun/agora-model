@@ -11,26 +11,26 @@ import (
 // 由 UsageRecorder 在内存里按分钟聚合，每 30 秒 flush 一次；同事务
 // UPSERT 到 model_usage_daily 后再 replace model_usage_minute 同主键行。
 type MinuteBucket struct {
-	Minute             time.Time // 按 .Format("2006-01-02T15:04") 截到分钟
-	ProviderID         string
-	Model              string
-	Requests           int
-	InputTokens        int
-	CachedInputTokens  int
-	OutputTokens       int
+	Minute            time.Time // 按 .Format("2006-01-02T15:04") 截到分钟
+	ProviderID        string
+	Model             string
+	Requests          int
+	InputTokens       int
+	CachedInputTokens int
+	OutputTokens      int
 }
 
 // DailyBucket 是一天内一个 (provider, model) 的 token 累计。
 //
 // 与 MinuteBucket 同样的字段，区别仅在聚合键（按天 vs 按分钟）。
 type DailyBucket struct {
-	Date               string // YYYY-MM-DD
-	ProviderID         string
-	Model              string
-	Requests           int
-	InputTokens        int
-	CachedInputTokens  int
-	OutputTokens       int
+	Date              string // YYYY-MM-DD
+	ProviderID        string
+	Model             string
+	Requests          int
+	InputTokens       int
+	CachedInputTokens int
+	OutputTokens      int
 }
 
 // minuteBucketKey 返回 model_usage_minute 主键的列值。
