@@ -105,14 +105,60 @@ function resolveVersion() {
   return DEFAULT_VERSION;
 }
 
+/**
+ * 从 git remote 推出 GitHub 的 owner / repo；不是 GitHub 地址时返回 null。
+ *
+ * 需要覆盖的 remote 形式：
+ *   https://github.com/owner/repo.git
+ *   git@github.com:owner/repo.git              （scp 风格，冒号是分隔符）
+ *   ssh://git@ssh.github.com:443/owner/repo.git（URL 风格，冒号后面是端口）
+ *
+ * 端口是最容易踩的一处：`ssh.github.com:443/owner/repo` 里的 443 是端口而不是
+ * owner。早先直接对整串 remote 用 `/github\.com[/:]([^/]+)\//` 取 owner，会把
+ * `443` 抓进去，于是发出去的包 homepage 变成 github.com/443/owner/repo。
+ */
+function parseGitHubRemote(raw) {
+  if (!raw) {
+    return null;
+  }
+
+  // 1. 去掉 scheme://（https:// / ssh:// / git:// …）
+  let value = String(raw).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  // 2. 去掉 userinfo（git@ / x-access-token@）
+  value = value.replace(/^[^@/]+@/, '');
+
+  // 3. 切出 host 与剩余部分；host 与路径之间可能是 '/' 也可能是 ':'。
+  const hostMatch = value.match(/^([^/:]+)(.*)$/);
+  if (!hostMatch) {
+    return null;
+  }
+  const host = hostMatch[1].toLowerCase();
+  // 白名单而不是 endsWith：只有 github.com 与 SSH over 443 的 ssh.github.com 会出现在本仓库。
+  if (host !== 'github.com' && host !== 'ssh.github.com') {
+    return null;
+  }
+
+  // 4. 去掉端口（`:443/...`）或 scp 分隔冒号（`:owner/...`），再吃掉开头的 '/'
+  const rest = hostMatch[2]
+    .replace(/^:\d+(?=\/)/, '')
+    .replace(/^:/, '')
+    .replace(/^\//, '');
+
+  const parts = rest.replace(/\.git$/i, '').split('/');
+  // GitHub 仓库固定是 owner/repo 两级；多出来的路径段说明不是仓库地址。
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return null;
+  }
+  return { owner: parts[0], repo: parts[1] };
+}
+
 /** 从 git remote 推导仓库元信息；推不出来就不写这些字段（不编造）。 */
 function repositoryInfo() {
-  const raw = git(['remote', 'get-url', 'origin']);
-  const matched = raw.match(/github\.com[/:]([^/]+)\/(.+?)(?:\.git)?$/i);
-  if (!matched) {
+  const parsed = parseGitHubRemote(git(['remote', 'get-url', 'origin']));
+  if (!parsed) {
     return {};
   }
-  const url = `https://github.com/${matched[1]}/${matched[2]}`;
+  const url = `https://github.com/${parsed.owner}/${parsed.repo}`;
   return {
     homepage: url,
     repository: { type: 'git', url: `${url}.git` },
@@ -250,7 +296,7 @@ function main() {
 }
 
 // 导出纯函数供测试使用；只有直接执行本文件时才真正构建。
-export { cliManifest, normalizeVersion, platformManifest, repositoryInfo };
+export { cliManifest, normalizeVersion, parseGitHubRemote, platformManifest, repositoryInfo };
 
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;

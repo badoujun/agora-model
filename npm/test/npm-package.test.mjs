@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { test } from 'node:test';
 
-import { cliManifest, normalizeVersion, platformManifest } from '../scripts/build.mjs';
+import { cliManifest, normalizeVersion, parseGitHubRemote, platformManifest } from '../scripts/build.mjs';
 import {
   CLI_NAME,
   CLI_PACKAGE,
@@ -175,4 +175,39 @@ test('版本规范化只接受合法 semver', () => {
   assert.equal(normalizeVersion('fdba91b-dirty'), '');
   assert.equal(normalizeVersion(''), '');
   assert.equal(normalizeVersion('not-a-version'), '');
+});
+
+test('remote 解析：各种 GitHub 地址形式', () => {
+  const expected = { owner: 'badoujun', repo: 'agora-model' };
+
+  // URL 风格，带端口：443 是端口，绝不能当成 owner
+  assert.deepEqual(
+    parseGitHubRemote('ssh://git@ssh.github.com:443/badoujun/agora-model.git'),
+    expected
+  );
+  assert.deepEqual(
+    parseGitHubRemote('ssh://git@github.com:22/badoujun/agora-model.git'),
+    expected
+  );
+  // scp 风格：冒号是 host 与路径的分隔符，不是端口
+  assert.deepEqual(parseGitHubRemote('git@github.com:badoujun/agora-model.git'), expected);
+  // https，带不带 .git 都要能认
+  assert.deepEqual(parseGitHubRemote('https://github.com/badoujun/agora-model.git'), expected);
+  assert.deepEqual(parseGitHubRemote('https://github.com/badoujun/agora-model'), expected);
+  // 带 userinfo 的 https（CI 里常见 x-access-token 形式）
+  assert.deepEqual(
+    parseGitHubRemote('https://x-access-token:ghs_xxx@github.com/badoujun/agora-model.git'),
+    expected
+  );
+});
+
+test('remote 解析：非 GitHub 或非仓库地址返回 null（不编造元信息）', () => {
+  assert.equal(parseGitHubRemote('git@gitlab.com:badoujun/agora-model.git'), null);
+  assert.equal(parseGitHubRemote('https://gitlab.com/badoujun/agora-model.git'), null);
+  assert.equal(parseGitHubRemote('ssh://git@example.com:443/badoujun/agora-model.git'), null);
+  // 多一级路径不是仓库地址（避免把子路径当成 repo 名）
+  assert.equal(parseGitHubRemote('https://github.com/owner/repo/extra'), null);
+  // 缺少 repo
+  assert.equal(parseGitHubRemote('https://github.com/owner'), null);
+  assert.equal(parseGitHubRemote(''), null);
 });
