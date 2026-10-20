@@ -121,6 +121,33 @@ func TestOpenIsIdempotentAndMigrates(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsNewerSchema 校验「库比程序新」时的报错路径：
+// 库里存在大于本程序已知最高版本的迁移记录时，Open 必须给出可读的升级提示，
+// 而不是等到读表时抛 `no such column`。
+func TestOpenRejectsNewerSchema(t *testing.T) {
+	path := tempDBPath(t)
+	ctx := context.Background()
+
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	future := latestSchemaVersion() + 1
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)`,
+		future, "future", time.Now().UTC().Format(time.RFC3339),
+	); err != nil {
+		t.Fatalf("写入未来迁移记录: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(ctx, path); !errors.Is(err, ErrSchemaNewerThanBinary) {
+		t.Fatalf("库比程序新时应返回 ErrSchemaNewerThanBinary，实际 err = %v", err)
+	}
+}
+
 func TestMigrationV3MigratesLegacyProviders(t *testing.T) {
 	path := tempDBPath(t)
 	ctx := context.Background()

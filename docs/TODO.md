@@ -431,6 +431,24 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 ---
 
+## Phase 8 · 版本兼容与降级保护 · 已完成（2026-10）
+
+> **背景**：Phase 7 的迁移 v6 删除了 `providers.api_key_cipher/api_key_hint`。
+> 若用源码构建的版本迁移过库，之后又安装了更早发布的 npm 包，旧二进制会在启动时抛出
+> 晦涩的 `SQL logic error: no such column: api_key_cipher (1)`——版本号没变（都是 0.4.0），
+> 用户无从判断是「库比程序新」。
+
+- [x] **T8.1｜启动期 schema 版本校验** ｜ 1h
+  - `store.Open` 在执行迁移前比对：库中最高版本 > 本程序已知最高版本时返回 `ErrSchemaNewerThanBinary`
+  - 错误信息明确给出「库中 schema 版本 / 当前程序最高支持版本 / 请升级 agoramodel」
+  - **验收**：`TestOpenRejectsNewerSchema` 通过；对 v6 库（程序同级）不误报
+- [x] **T8.2｜版本号补齐与文档** ｜ 1h
+  - `cmd/agoramodel/main.go` 与 `web/package.json` 升到 `0.5.0`，把 Phase 7 的多凭证能力真正发布出去
+  - README「数据、安全与备份」+「常见问题」、DESIGN §4.1/§4.2、本 TODO
+  - **验收**：`go test ./...`、`go vet ./...` 通过；升级到 0.5.0 后 `agoramodel` 可正常打开 v6 库
+
+---
+
 ## Backlog（P2 / 后续迭代）
 
 > 以下项已在 DESIGN 中明确"本期不做"，此处登记以备后续排期。

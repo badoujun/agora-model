@@ -189,6 +189,9 @@ agora-model/
 
 ### 4.1 DDL
 
+> 以下为各版本累积后的逻辑形态；代码里的 `schemaV1..V6` 是「按版本增量执行」的语句序列
+> （`internal/store/store.go`），其中的建表语句保留了历史列，再由后续迁移删改。
+
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -314,6 +317,7 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | 至少一个协议 URL | 保存时校验：`openai_base_url`、`anthropic_base_url` 至少有一个非空（含 override） |
 | 默认不启用内网 | `allow_internal = 0` 时拒绝解析到 loopback/private/link-local 的 URL |
 | 迁移 | 使用 `schema_migrations(version, applied_at)` 表管理；启动时自动执行缺失迁移 |
+| 版本校验（不支持降级） | 迁移只增不减，旧列会被删改。`Open` 会在执行迁移前比对：库中最高版本 > 本程序已知最高版本（即 `ErrSchemaNewerThanBinary`）时拒绝启动，提示「数据库由更新版本的 agoramodel 创建」，而不是等到读表时抛出 `no such column` |
 
 ### 4.3 加密方案（AES-256-GCM）
 

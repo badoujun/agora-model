@@ -136,6 +136,9 @@ macOS `~/Library/Application Support/AgoraModel`。
   供应商列表只回显掩码与失败次数，网关 Key 仅同源控制台可查看。
 - **主密钥丢失 = 凭证不可解密**：此时启动会直接失败并提示，**不会静默降级为明文**。
   若不想依赖文件，用 `GW_MASTER_KEY` 环境变量（例如放在 systemd 的 `Environment=`）。
+- **库比程序新 = 拒绝启动**：`agora.db` 的 schema 版本高于当前程序已知的最高版本时，
+  启动会明确提示「数据库由更新版本的 agoramodel 创建」并退出，而不是在半途抛出缺列错误。
+  迁移只增不减，**降级运行不受支持**：请把程序升级到与库同级或更新的版本。
 - **网关 Key**：以 sha256 校验，重置后旧 Key 立即失效；「网关设置」页可随时查看/复制当前 Key
   （旧版本只存哈希的 Key 无法还原，页面会提示重置）。
 - **访问控制**：默认只监听 `127.0.0.1`（本机免登录）；一旦监听非回环地址，
@@ -356,6 +359,21 @@ location / {
 受限网络（内网 / 大陆直连）连不上 `proxy.golang.org`。`Makefile` 与 `build.ps1` 都已在
 未显式设置时回落到 `GOPROXY=https://goproxy.cn,direct`；也可以用环境变量覆盖，或依赖
 已在本机缓存时用 `GOPROXY=off make dist` 完全离线构建。
+
+**Q：启动报 `no such column: api_key_cipher`，或者提示「数据库由更新版本的 agoramodel 创建」？**
+数据库文件比你正在跑的二进制**新**。典型场景：本地用源码构建的版本已经把库迁移到更高 schema
+（例如 v6 删掉了 `providers.api_key_cipher`），随后又执行了 `npm install -g @bakeroot/agoramodel`，
+装到的却是更早发布的版本，于是它拿旧 SQL 去查已被删掉的列。
+
+迁移只增不减，**新版库不能回退给旧版程序使用**。按提示升级程序即可：
+
+```bash
+npm install -g @bakeroot/agoramodel@latest   # 或用与库同级/更新的源码重新 make dist
+agoramodel --version                          # 确认版本号
+```
+
+> `agora.db` + `master.key` 是唯一数据，升级只涉及这两个文件之外的二进制；
+> 库本身不会被降级，也不需要手工改表。
 
 ## 开发
 

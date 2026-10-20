@@ -19,6 +19,10 @@ type Store struct {
 	db *sql.DB
 }
 
+// ErrSchemaNewerThanBinary 表示数据库由更新版本的 agoramodel 创建：
+// 库里的 schema 版本高于当前程序认识的最高版本，继续运行只会读到缺列/缺表的报错。
+var ErrSchemaNewerThanBinary = errors.New("数据库 schema 版本高于当前程序")
+
 // 迁移定义。新增迁移时追加到切片末尾，切勿修改已发布的条目。
 var migrations = []migration{
 	{version: 1, name: "init", statements: schemaV1},
@@ -33,6 +37,14 @@ type migration struct {
 	version    int
 	name       string
 	statements []string
+}
+
+// latestSchemaVersion 返回本程序已知的最高 schema 版本（= 最后一个迁移的版本号）。
+func latestSchemaVersion() int {
+	if len(migrations) == 0 {
+		return 0
+	}
+	return migrations[len(migrations)-1].version
 }
 
 // Open 打开（必要时创建）数据库、设置 pragma 并应用迁移。
@@ -114,6 +126,22 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	_ = rows.Close()
+
+	// 库由更新版本创建（降级了二进制 / 装了比数据库旧的 npm 包）：
+	// 这类库的列可能已被后续迁移删改，继续跑只会得到晦涩的
+	// 「no such column」并在启动阶段失败。这里提前给出可读的升级提示。
+	known := latestSchemaVersion()
+	highest := 0
+	for v := range applied {
+		if v > highest {
+			highest = v
+		}
+	}
+	if highest > known {
+		return fmt.Errorf("%w：数据库由更新版本的 agoramodel 创建（库中 schema 版本 %d，"+
+			"当前程序最高支持 %d）。请升级 agoramodel 后重试；降级运行不保证兼容。",
+			ErrSchemaNewerThanBinary, highest, known)
+	}
 
 	for _, m := range migrations {
 		if applied[m.version] {
