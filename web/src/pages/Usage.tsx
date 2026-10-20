@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { BarChart3, CalendarRange } from 'lucide-react'
 import { api } from '@/lib/api'
-import type { UsageDailyRow } from '@/lib/types'
+import type { UsageDailyRow, UsageModelShare } from '@/lib/types'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import { formatToken } from '@/lib/usage-format'
@@ -304,12 +304,30 @@ function UsageTooltip({ hover }: { hover: HoverState | null }) {
 /* ------------------------------------------------------------------ 组件：热力图 */
 
 /**
+ * 热力图色阶：下标 = 档位，0 为"无用量"，1~5 对应 less → more。
+ * 分级按当日消耗的总 token 数：0–5M / 5–10M / 10–50M / 50–100M / >100M。
+ */
+const HEATMAP_COLORS = ['#ebedf0', '#c6f6d5', '#9ae6b4', '#68d391', '#38a169', '#276749']
+const HEATMAP_HINTS = ['无用量', '≤ 5M', '≤ 10M', '≤ 50M', '≤ 100M', '> 100M']
+
+/** 当日总 token → 热力图档位（0 表示无用量，1~5 依次对应 less → more）。 */
+function heatLevel(total: number): number {
+  if (total <= 0) return 0
+  if (total <= 5_000_000) return 1
+  if (total <= 10_000_000) return 2
+  if (total <= 50_000_000) return 3
+  if (total <= 100_000_000) return 4
+  return 5
+}
+
+/**
  * 活跃热力图（GitHub 风格贡献图）：
  * - 数据范围：今天往前推半年（约 26 周）
  * - 横轴：每个 ISO 周（周一为首）一列，列数 = 半年内 ISO 周数
  * - 纵轴：周一~周日共 7 行
  * - 每格固定 w-4 h-4；超出窗口的格子显示浅灰占位 + 不显示 tooltip
  * - 顶部月份标签横跨该月首个 ISO 周所在的列
+ * - 颜色分 5 档（less → more），按当日消耗的 token 总数落入上面的分级区间
  * - 悬浮显示明细弹窗（供应商/模型 + 输入命中缓存/未命中/输出）
  */
 function HeatmapByMonth({
@@ -329,8 +347,6 @@ function HeatmapByMonth({
     dayMap.set(row.date, row)
   }
 
-  const max = Math.max(1, ...daily.map((c) => c.total))
-  const logMax = Math.log2(max + 1)
   const weekdayLabels = ['一', '二', '三', '四', '五', '六', '日']
 
   // 数据范围：今天往前半年（≈ 26 周 = 182 天）
@@ -412,31 +428,33 @@ function HeatmapByMonth({
                     <div key={dIdx} className="aspect-square w-full rounded-sm bg-slate-50" />
                   )
                 }
-                if (row.total === 0) {
-                  return (
-                    <div
-                      key={dIdx}
-                      onMouseEnter={(e) => onHover({ x: e.clientX, y: e.clientY, row })}
-                      onMouseLeave={onLeave}
-                      className="aspect-square w-full rounded-sm border border-slate-100"
-                      style={{ backgroundColor: 'rgba(16, 185, 129, 0.05)' }}
-                    />
-                  )
-                }
-                const alpha = Math.max(0.15, Math.log2(row.total + 1) / logMax)
+                const level = heatLevel(row.total)
                 return (
                   <div
                     key={dIdx}
                     onMouseEnter={(e) => onHover({ x: e.clientX, y: e.clientY, row })}
                     onMouseLeave={onLeave}
                     className="aspect-square w-full rounded-sm border border-slate-100"
-                    style={{ backgroundColor: `rgba(16, 185, 129, ${alpha})` }}
+                    style={{ backgroundColor: HEATMAP_COLORS[level] }}
                   />
                 )
               })}
             </div>
           ))}
         </div>
+      </div>
+      {/* 图例：less → more 五档 */}
+      <div className="flex items-center justify-end gap-1 pt-0.5 text-[10px] text-slate-400">
+        <span>少</span>
+        {HEATMAP_COLORS.slice(1).map((color, i) => (
+          <span
+            key={color}
+            className="h-2.5 w-2.5 rounded-sm border border-slate-100"
+            style={{ backgroundColor: color }}
+            title={HEATMAP_HINTS[i + 1]}
+          />
+        ))}
+        <span>多</span>
       </div>
     </div>
   )
@@ -542,18 +560,47 @@ export function UsagePage() {
   // 趋势：按所选窗口逐日展开，没有请求的日期补 0（仍占据 x 轴点位）
   const trend = useMemo(() => (data ? buildSeries(data.daily, trendRange) : []), [data, trendRange])
 
-  // 模型占比：按窗口 daily 的总 token 等比缩放基线数字，
-  // 这样累计窗口看到的是基线全量，30 天窗口看到的是基线 × (30 天 / 全量)。
-  const models = useMemo(() => {
-    if (!data) return []
-    const baselineTotal = data.models.reduce((s, m) => s + m.total, 0)
-    const windowTotal = buildSeries(data.daily, modelsRange).reduce((s, d) => s + d.total, 0)
-    if (baselineTotal === 0 || windowTotal === 0) return []
-    const ratio = windowTotal / baselineTotal
-    return data.models.map((m) => ({
-      ...m,
-      total: Math.round(m.total * ratio),
-    }))
+  // 模型占比：只统计所选窗口内的真实用量 —— 把窗口内每天明细里的
+  // (供应商, 模型) 逐条累加（token = 输入 + 输出），占比按窗口内总量计算。
+  // 不再拿全量基线做等比缩放，避免出现"看起来是真实数字"的估算值。
+  const { models, windowTotal } = useMemo(() => {
+    if (!data || !modelsRange) return { models: [] as UsageModelShare[], windowTotal: 0 }
+
+    const acc = new Map<string, UsageModelShare>()
+    let total = 0
+
+    for (const row of data.daily) {
+      if (row.date < modelsRange.from || row.date > modelsRange.to) continue
+      for (const item of row.breakdown ?? []) {
+        const tokens = item.input_cached + item.input_uncached + item.output
+        if (tokens === 0) continue
+        const key = `${item.provider}\u0000${item.model}`
+        const cur =
+          acc.get(key) ??
+          ({
+            name: item.model,
+            provider: item.provider,
+            total: 0,
+            percent: 0,
+            input_cached: 0,
+            input_uncached: 0,
+            output: 0,
+            requests: 0,
+          } satisfies UsageModelShare)
+        cur.total += tokens
+        cur.input_cached += item.input_cached
+        cur.input_uncached += item.input_uncached
+        cur.output += item.output
+        acc.set(key, cur)
+        total += tokens
+      }
+    }
+
+    const list = [...acc.values()].sort((a, b) => b.total - a.total)
+    for (const m of list) {
+      m.percent = total > 0 ? (m.total / total) * 100 : 0
+    }
+    return { models: list, windowTotal: total }
   }, [data, modelsRange])
 
   if (usage.isLoading || !data) {
@@ -580,7 +627,11 @@ export function UsagePage() {
             <CardHeader className="flex-row items-center justify-between space-y-0">
               <div>
                 <CardTitle>模型使用占比</CardTitle>
-                <CardDescription>汇总占比中的 token 总数</CardDescription>
+                <CardDescription>
+                  {models.length === 0
+                    ? '所选窗口内暂无 token 用量'
+                    : `窗口内 token 总数 ${formatToken(windowTotal)}`}
+                </CardDescription>
               </div>
               <WindowPicker state={modelsWindow} onChange={setModelsWindow} />
             </CardHeader>
