@@ -52,12 +52,26 @@ type usageProviderShare struct {
 }
 
 type usageDailyRow struct {
-	Date          string `json:"date"`
-	Total         int64  `json:"total"`
+	Date          string               `json:"date"`
+	Total         int64                `json:"total"`
+	InputCached   int64                `json:"input_cached"`
+	InputUncached int64                `json:"input_uncached"`
+	Output        int64                `json:"output"`
+	Requests      int64                `json:"requests"`
+	Breakdown     []usageBreakdownItem `json:"breakdown,omitempty"`
+}
+
+// usageBreakdownItem 是某一天内一个 (provider, model) 的用量明细。
+//
+// 前端热力图 / 使用趋势的悬浮弹窗按"供应商/模型 + 输入(命中缓存) +
+// 输入(未命中缓存) + 输出"四列展示，数据来自这里。没有明细的日子
+// （补齐出来的空行）该字段缺省，前端按"无数据"渲染。
+type usageBreakdownItem struct {
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
 	InputCached   int64  `json:"input_cached"`
 	InputUncached int64  `json:"input_uncached"`
 	Output        int64  `json:"output"`
-	Requests      int64  `json:"requests"`
 }
 
 type usageHeatmapCell struct {
@@ -160,15 +174,17 @@ func (s *Server) aggregateUsageRange(ctx context.Context, from, to string, provi
 	}
 	defer rows.Close()
 
-	// 按 date 聚合 daily 行（输入 + 输出 = total）
-	type dayAccum struct {
-		requests, input, cached, output int64
-	}
-	byDay := map[string]*dayAccum{}
 	// 按 (provider, model) 聚合
 	type modelKey struct {
 		providerID, model string
 	}
+	// 按 date 聚合 daily 行（输入 + 输出 = total）；同时按 (provider, model)
+	// 收集当天明细，供前端悬浮弹窗展开。
+	type dayAccum struct {
+		requests, input, cached, output int64
+		breakdown                       map[modelKey]*usageBreakdownItem
+	}
+	byDay := map[string]*dayAccum{}
 	modelAcc := map[modelKey]*usageModelShare{}
 	// 按 provider 聚合
 	type provAccum struct {
@@ -190,16 +206,29 @@ func (s *Server) aggregateUsageRange(ctx context.Context, from, to string, provi
 		}
 		rowTotal := input + output
 
-		// daily 聚合
+		// daily 聚合（并按 (provider, model) 收集当天明细）
 		da, ok := byDay[date]
 		if !ok {
-			da = &dayAccum{}
+			da = &dayAccum{breakdown: map[modelKey]*usageBreakdownItem{}}
 			byDay[date] = da
 		}
 		da.requests += requests
 		da.input += input
 		da.cached += cached
 		da.output += output
+
+		bk := modelKey{providerID, model}
+		item, ok := da.breakdown[bk]
+		if !ok {
+			item = &usageBreakdownItem{
+				Provider: usageProviderName(providerNames, providerID),
+				Model:    model,
+			}
+			da.breakdown[bk] = item
+		}
+		item.InputCached += cached
+		item.InputUncached += input - cached
+		item.Output += output
 
 		// model 聚合
 		mk := modelKey{providerID, model}
@@ -233,9 +262,27 @@ func (s *Server) aggregateUsageRange(ctx context.Context, from, to string, provi
 		return nil, nil, nil, err
 	}
 
-	// daily 行（按日期升序）
+	// daily 行（按日期升序；每天附上按 (provider, model) 的明细）
 	dailyOut = make([]usageDailyRow, 0, len(byDay))
 	for date, acc := range byDay {
+		breakdown := make([]usageBreakdownItem, 0, len(acc.breakdown))
+		for _, item := range acc.breakdown {
+			breakdown = append(breakdown, *item)
+		}
+		// 无用量 / 全 0 的行不返回明细，前端按"当天无数据"渲染
+		if len(breakdown) > 0 {
+			sort.Slice(breakdown, func(i, j int) bool {
+				left := breakdown[i].InputCached + breakdown[i].InputUncached + breakdown[i].Output
+				right := breakdown[j].InputCached + breakdown[j].InputUncached + breakdown[j].Output
+				if left != right {
+					return left > right
+				}
+				if breakdown[i].Provider != breakdown[j].Provider {
+					return breakdown[i].Provider < breakdown[j].Provider
+				}
+				return breakdown[i].Model < breakdown[j].Model
+			})
+		}
 		dailyOut = append(dailyOut, usageDailyRow{
 			Date:          date,
 			Total:         acc.input + acc.output,
@@ -243,6 +290,7 @@ func (s *Server) aggregateUsageRange(ctx context.Context, from, to string, provi
 			InputUncached: acc.input - acc.cached,
 			Output:        acc.output,
 			Requests:      acc.requests,
+			Breakdown:     breakdown,
 		})
 	}
 	sort.Slice(dailyOut, func(i, j int) bool { return dailyOut[i].Date < dailyOut[j].Date })

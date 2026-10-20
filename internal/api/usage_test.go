@@ -277,3 +277,74 @@ func TestUsageEndpoint(t *testing.T) {
 		t.Fatalf("trend 长度 = %d, want 4", len(trend))
 	}
 }
+
+// TestUsageEndpointBreakdown 验证 daily 行内的 (供应商, 模型) 明细：
+// 四个字段齐全、按总量降序、供应商展示名、补齐的空日子不带明细。
+func TestUsageEndpointBreakdown(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+
+	if _, err := h.store.SaveProvider(ctx, h.master, config.Provider{
+		ID:            "p_named",
+		Name:          "DeepSeek H",
+		OpenAIBaseURL: h.upstreamURL + "/v1",
+		APIKey:        "sk-named",
+		Models:        []string{"named-model"},
+		AllowInternal: true,
+	}); err != nil {
+		t.Fatalf("seed named provider: %v", err)
+	}
+
+	if err := h.store.UpsertUsageDaily(ctx, []store.DailyBucket{
+		{Date: "2026-10-05", ProviderID: "seed", Model: "seed-model", Requests: 1, InputTokens: 100, CachedInputTokens: 60, OutputTokens: 50},
+		{Date: "2026-10-05", ProviderID: "p_named", Model: "named-model", Requests: 2, InputTokens: 200, CachedInputTokens: 20, OutputTokens: 80},
+	}); err != nil {
+		t.Fatalf("写入 usage: %v", err)
+	}
+
+	client := newClient(t)
+	code, body, raw := h.do(client, http.MethodGet, "/api/usage?from=2026-10-04&to=2026-10-05", nil)
+	if code != http.StatusOK {
+		t.Fatalf("状态码 = %d: %s", code, raw)
+	}
+
+	daily, _ := body["daily"].([]any)
+	if len(daily) != 2 {
+		t.Fatalf("daily 长度 = %d, want 2: %v", len(daily), daily)
+	}
+
+	// 补齐出来的 10-04 没有明细
+	empty := daily[0].(map[string]any)
+	if _, ok := empty["breakdown"]; ok {
+		t.Errorf("空日子的 breakdown 不应返回：%v", empty["breakdown"])
+	}
+
+	// 10-05 有两条明细，按总量降序：named-model(280) > seed-model(150)
+	row := daily[1].(map[string]any)
+	items, _ := row["breakdown"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("breakdown 长度 = %d, want 2: %v", len(items), items)
+	}
+	first := items[0].(map[string]any)
+	if first["provider"] != "DeepSeek H" || first["model"] != "named-model" {
+		t.Errorf("breakdown[0] = %v", first)
+	}
+	if first["input_cached"].(float64) != 20 || first["input_uncached"].(float64) != 180 || first["output"].(float64) != 80 {
+		t.Errorf("breakdown[0] 字段 = %v", first)
+	}
+	second := items[1].(map[string]any)
+	if second["provider"] != "seed" || second["model"] != "seed-model" {
+		t.Errorf("breakdown[1] = %v", second)
+	}
+	if second["input_cached"].(float64) != 60 || second["input_uncached"].(float64) != 40 || second["output"].(float64) != 50 {
+		t.Errorf("breakdown[1] 字段 = %v", second)
+	}
+
+	// 明细之和 = 当天汇总，避免弹窗数字与热力图色块对不上
+	if got := first["input_cached"].(float64) + second["input_cached"].(float64); got != row["input_cached"].(float64) {
+		t.Errorf("明细命中缓存之和 = %v, daily.input_cached = %v", got, row["input_cached"])
+	}
+	if got := first["output"].(float64) + second["output"].(float64); got != row["output"].(float64) {
+		t.Errorf("明细输出之和 = %v, daily.output = %v", got, row["output"])
+	}
+}

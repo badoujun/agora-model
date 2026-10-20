@@ -247,6 +247,17 @@ export interface UsageDailyRow {
   input_uncached: number
   output: number
   requests: number
+  /** 当天各（供应商, 模型）的用量明细；补齐出来的空日子缺省。 */
+  breakdown?: UsageBreakdownItem[]
+}
+
+/** 某一天内一个供应商/模型的用量明细，用于悬浮弹窗展开。 */
+export interface UsageBreakdownItem {
+  provider: string
+  model: string
+  input_cached: number
+  input_uncached: number
+  output: number
 }
 
 export interface UsageHeatmapCell {

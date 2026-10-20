@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { BarChart3, CalendarRange } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -66,17 +66,24 @@ function resolveWindow(window: WindowState, anchor: string, earliest: string): D
   return { from: addDays(anchor, -(days - 1)), to: anchor }
 }
 
-/** 把每日行按日期索引，并按区间补齐缺失日期（total=0）。 */
-function buildSeries(
-  daily: UsageDailyRow[],
-  range: DateRange | null,
-): { date: string; total: number }[] {
+/**
+ * 把每日行按日期索引，并按区间补齐缺失日期（零值行）。
+ * 补齐的行只有 date（breakdown 缺省），悬浮弹窗按"当天无请求"渲染。
+ */
+function buildSeries(daily: UsageDailyRow[], range: DateRange | null): UsageDailyRow[] {
   if (!range) return []
   const byDate = new Map(daily.map((d) => [d.date, d]))
-  return enumerateDates(range.from, range.to).map((date) => ({
-    date,
-    total: byDate.get(date)?.total ?? 0,
-  }))
+  return enumerateDates(range.from, range.to).map(
+    (date): UsageDailyRow =>
+      byDate.get(date) ?? {
+        date,
+        total: 0,
+        input_cached: 0,
+        input_uncached: 0,
+        output: 0,
+        requests: 0,
+      },
+  )
 }
 
 /* ------------------------------------------------------------------ 组件：窗口选择 */
@@ -193,6 +200,107 @@ function WindowPicker({
   )
 }
 
+/* ------------------------------------------------------------------ 组件：悬浮弹窗 */
+
+/** 悬浮弹窗的锚点（客户区坐标）与该日数据。 */
+interface HoverState {
+  x: number
+  y: number
+  row: UsageDailyRow
+}
+
+const TOOLTIP_WIDTH = 432
+
+/**
+ * 热力图 / 趋势图共用的悬浮弹窗：
+ * - 顶部：日期 + 当天 token 合计
+ * - 表格：供应商/模型、输入(命中缓存)、输入(未命中缓存)、输出
+ * - 明细按当天总量降序（服务端已排序），底部给一行合计
+ *
+ * 用 fixed + 鼠标坐标定位；靠近视口底部时向上翻转，右侧空间不足时左移。
+ * pointer-events-none 保证弹窗不会挡住鼠标、引发闪烁。
+ */
+function UsageTooltip({ hover }: { hover: HoverState | null }) {
+  if (!hover) return null
+  const { row } = hover
+  const flipUp = hover.y > window.innerHeight * 0.6
+  const left = Math.max(8, Math.min(hover.x + 14, window.innerWidth - TOOLTIP_WIDTH - 8))
+  const style = flipUp
+    ? { left, top: hover.y - 14, transform: 'translateY(-100%)' }
+    : { left, top: hover.y + 14 }
+
+  const items = row.breakdown ?? []
+
+  return (
+    <div
+      className="pointer-events-none fixed z-50 max-h-[70vh] overflow-hidden rounded-md border border-slate-200 bg-white px-2.5 py-2 text-slate-700 shadow-lg"
+      style={{ width: TOOLTIP_WIDTH, ...style }}
+    >
+      <div className="mb-1.5 flex items-baseline justify-between gap-2 border-b border-slate-100 pb-1.5">
+        <span className="text-xs font-medium text-slate-900">{row.date}</span>
+        <span className="text-[11px] text-slate-500 tabular-nums">
+          合计 {formatToken(row.total)}
+        </span>
+      </div>
+      {items.length === 0 ? (
+        <p className="text-[11px] text-slate-400">当天无请求</p>
+      ) : (
+        <div className="max-h-[calc(70vh-3rem)] overflow-y-auto">
+          <table className="w-full table-fixed text-[11px]">
+            <colgroup>
+              <col />
+              <col className="w-[5.2rem]" />
+              <col className="w-[5.8rem]" />
+              <col className="w-[3.6rem]" />
+            </colgroup>
+            <thead>
+              <tr className="whitespace-nowrap text-[10px] leading-tight text-slate-400">
+                <th className="pb-1 text-left font-normal">供应商 / 模型</th>
+                <th className="pb-1 pl-1 text-right font-normal">输入(命中缓存)</th>
+                <th className="pb-1 pl-1 text-right font-normal">输入(未命中缓存)</th>
+                <th className="pb-1 pl-1 text-right font-normal">输出</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => (
+                <tr key={`${item.provider}/${item.model}`} className="align-top">
+                  <td className="py-0.5 pr-1">
+                    <div className="break-all text-[10px] text-slate-400">{item.provider}</div>
+                    <div className="break-all font-mono text-[11px] text-slate-700">
+                      {item.model}
+                    </div>
+                  </td>
+                  <td className="py-0.5 pl-1 text-right tabular-nums">
+                    {formatToken(item.input_cached)}
+                  </td>
+                  <td className="py-0.5 pl-1 text-right tabular-nums">
+                    {formatToken(item.input_uncached)}
+                  </td>
+                  <td className="py-0.5 pl-1 text-right tabular-nums">
+                    {formatToken(item.output)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="border-t border-slate-100 font-medium text-slate-900">
+                <td className="pt-1 text-[10px] text-slate-500">合计</td>
+                <td className="pt-1 pl-1 text-right tabular-nums">
+                  {formatToken(row.input_cached)}
+                </td>
+                <td className="pt-1 pl-1 text-right tabular-nums">
+                  {formatToken(row.input_uncached)}
+                </td>
+                <td className="pt-1 pl-1 text-right tabular-nums">{formatToken(row.output)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 /* ------------------------------------------------------------------ 组件：热力图 */
 
 /**
@@ -202,12 +310,23 @@ function WindowPicker({
  * - 纵轴：周一~周日共 7 行
  * - 每格固定 w-4 h-4；超出窗口的格子显示浅灰占位 + 不显示 tooltip
  * - 顶部月份标签横跨该月首个 ISO 周所在的列
+ * - 悬浮显示明细弹窗（供应商/模型 + 输入命中缓存/未命中/输出）
  */
-function HeatmapByMonth({ daily, endDate }: { daily: { date: string; total: number }[]; endDate: string }) {
+function HeatmapByMonth({
+  daily,
+  endDate,
+  onHover,
+  onLeave,
+}: {
+  daily: UsageDailyRow[]
+  endDate: string
+  onHover: (hover: HoverState) => void
+  onLeave: () => void
+}) {
   // 把 daily 索引到 date 上
-  const dayMap = new Map<string, number>()
+  const dayMap = new Map<string, UsageDailyRow>()
   for (const row of daily) {
-    dayMap.set(row.date, row.total)
+    dayMap.set(row.date, row)
   }
 
   const max = Math.max(1, ...daily.map((c) => c.total))
@@ -287,27 +406,29 @@ function HeatmapByMonth({ daily, endDate }: { daily: { date: string; total: numb
           {weeks.map((w) => (
             <div key={w.mondayISO} className="flex min-w-0 flex-1 flex-col gap-1">
               {w.days.map((dateISO, dIdx) => {
-                const total = dayMap.get(dateISO)
-                if (total === undefined) {
+                const row = dayMap.get(dateISO)
+                if (row === undefined) {
                   return (
                     <div key={dIdx} className="aspect-square w-full rounded-sm bg-slate-50" />
                   )
                 }
-                if (total === 0) {
+                if (row.total === 0) {
                   return (
                     <div
                       key={dIdx}
-                      title={`${dateISO} · 0`}
+                      onMouseEnter={(e) => onHover({ x: e.clientX, y: e.clientY, row })}
+                      onMouseLeave={onLeave}
                       className="aspect-square w-full rounded-sm border border-slate-100"
                       style={{ backgroundColor: 'rgba(16, 185, 129, 0.05)' }}
                     />
                   )
                 }
-                const alpha = Math.max(0.15, Math.log2(total + 1) / logMax)
+                const alpha = Math.max(0.15, Math.log2(row.total + 1) / logMax)
                 return (
                   <div
                     key={dIdx}
-                    title={`${dateISO} · ${formatToken(total)}`}
+                    onMouseEnter={(e) => onHover({ x: e.clientX, y: e.clientY, row })}
+                    onMouseLeave={onLeave}
                     className="aspect-square w-full rounded-sm border border-slate-100"
                     style={{ backgroundColor: `rgba(16, 185, 129, ${alpha})` }}
                   />
@@ -332,7 +453,16 @@ function formatAxisDate(date: string): string {
   return `${Number(m)}/${Number(d)}`
 }
 
-function TrendBars({ trend }: { trend: { date: string; total: number }[] }) {
+function TrendBars({
+  rows,
+  onHover,
+  onLeave,
+}: {
+  rows: UsageDailyRow[]
+  onHover: (hover: HoverState) => void
+  onLeave: () => void
+}) {
+  const trend = rows
   if (trend.length === 0) {
     return <p className="text-xs text-slate-400">所选窗口内暂无数据。</p>
   }
@@ -352,7 +482,8 @@ function TrendBars({ trend }: { trend: { date: string; total: number }[] }) {
           return (
             <div
               key={t.date}
-              title={`${t.date} · ${formatToken(t.total)}`}
+              onMouseEnter={(e) => onHover({ x: e.clientX, y: e.clientY, row: t })}
+              onMouseLeave={onLeave}
               className="min-w-0 flex-1 rounded-t"
               style={{
                 height: `${pct}%`,
@@ -384,6 +515,9 @@ export function UsagePage() {
   // 每个模块自己管窗口状态，互不影响
   const [modelsWindow, setModelsWindow] = useState<WindowState>({ preset: '30d' })
   const [trendWindow, setTrendWindow] = useState<WindowState>({ preset: '30d' })
+  // 热力图 / 趋势图共用的悬浮弹窗（悬停时写坐标与当天数据，移出清空）
+  const [hover, setHover] = useState<HoverState | null>(null)
+  const clearHover = useCallback(() => setHover(null), [])
 
   const usage = useQuery({
     queryKey: ['usage'],
@@ -491,8 +625,10 @@ export function UsagePage() {
             </CardHeader>
             <CardContent className="min-h-0 flex-1">
               <HeatmapByMonth
-                daily={data.daily.map((d) => ({ date: d.date, total: d.total }))}
+                daily={data.daily}
                 endDate={anchor}
+                onHover={setHover}
+                onLeave={clearHover}
               />
             </CardContent>
           </Card>
@@ -513,10 +649,13 @@ export function UsagePage() {
           />
         </CardHeader>
         <CardContent className="min-h-0 flex-1">
-          <TrendBars trend={trend} />
+          <TrendBars rows={trend} onHover={setHover} onLeave={clearHover} />
         </CardContent>
       </Card>
       </div>
+
+      {/* 悬浮弹窗：渲染在最外层，避免被 Card 的 overflow-hidden 裁掉 */}
+      <UsageTooltip hover={hover} />
     </div>
   )
 }
