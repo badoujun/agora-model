@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"agora-model/internal/config"
@@ -111,8 +110,11 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/providers/{id}", s.guard(s.handleDeleteProvider))
 	mux.HandleFunc("POST /api/providers/{id}/test", s.guard(s.handleTestProvider))
 	mux.HandleFunc("POST /api/providers/{id}/fetch-models", s.guard(s.handleFetchModels))
-	// 尚未保存的供应商（草稿）也可以直接拉取模型候选
+	// 单个凭证的连接测试（含已停用的 Key，便于判断能否重新启用）
+	mux.HandleFunc("POST /api/providers/{id}/keys/{key_id}/test", s.guard(s.handleTestProviderKey))
+	// 尚未保存的供应商（草稿）也可以直接拉取模型候选 / 测试凭证
 	mux.HandleFunc("POST /api/providers/fetch-models", s.guard(s.handleFetchDraftModels))
+	mux.HandleFunc("POST /api/providers/test-key", s.guard(s.handleTestDraftKey))
 
 	// 模型
 	mux.HandleFunc("GET /api/models", s.guard(s.handleListModels))
@@ -262,44 +264,104 @@ type exportPayload struct {
 	Notes      map[string]string  `json:"notes,omitempty"`
 }
 
-// exportedProvider 在普通 DTO 之上附带明文凭证，仅用于导出与导入。
+// exportedProviderKey 是导出文件里的单个凭证（明文）。
+type exportedProviderKey struct {
+	Label   string `json:"label"`
+	APIKey  string `json:"api_key"`
+	Enabled bool   `json:"enabled"`
+}
+
+// exportedProvider 是导出/迁移用的稳定结构。
+//
+//   - 只含配置字段（不含 Key id、用量与失败统计），保证 WebDAV 指纹只随配置变化；
+//   - keys 携带明文凭证；api_key 是兼容字段（首个启用 Key 的明文），
+//     供旧版本导入（旧版本只知道单凭证格式）。
 type exportedProvider struct {
-	providerDTO
-	APIKey string `json:"api_key"`
+	ID                     string                `json:"id"`
+	Name                   string                `json:"name"`
+	WebsiteURL             string                `json:"website_url"`
+	OpenAIBaseURL          string                `json:"openai_base_url"`
+	OpenAIEndpointOverride string                `json:"openai_endpoint_override"`
+	TimeoutSeconds         int                   `json:"timeout_seconds"`
+	ExtraHeaders           map[string]string     `json:"extra_headers,omitempty"`
+	ExtraBody              map[string]any        `json:"extra_body,omitempty"`
+	AllowInternal          bool                  `json:"allow_internal"`
+	Enabled                bool                  `json:"enabled"`
+	ModelsSelected         []string              `json:"models_selected"`
+	ModelAliases           map[string]string     `json:"model_aliases"`
+	Keys                   []exportedProviderKey `json:"keys"`
+	APIKey                 string                `json:"api_key"`
 }
 
 // exportFormat 标识导出文件格式，便于导入时判断与后续演进。
 const exportFormat = "agoramodel.providers/v1"
 
+// exportNotes 是导出文件里的固定提示（不含时间，保持指纹稳定）。
+func exportNotes() map[string]string {
+	return map[string]string{
+		"api_key": "导出文件包含所有供应商的 API Key 明文（keys[] 与兼容字段 api_key），请按凭证同等对待；导入时会用目标机器的密钥重新加密",
+	}
+}
+
+// buildExportPayload 生成导出载荷（/api/export、WebDAV 推送与指纹共用）。
+//
+// 顺序完全由数据库决定（供应商按名称、Key 按创建时间），因此同一份配置
+// 每次导出的字节一致；只有 exported_at 需要调用方抹平后才能用作指纹。
+func (s *Server) buildExportPayload(ctx context.Context, exportedAt string) (exportPayload, error) {
+	records, err := s.store.ListProviders(ctx)
+	if err != nil {
+		return exportPayload{}, err
+	}
+	out := exportPayload{
+		Format:     exportFormat,
+		ExportedAt: exportedAt,
+		Gateway:    s.holder.Get().Gateway(),
+		Providers:  make([]exportedProvider, 0, len(records)),
+		Notes:      exportNotes(),
+	}
+	for _, rec := range records {
+		ep := exportedProvider{
+			ID:                     rec.ID,
+			Name:                   rec.Name,
+			WebsiteURL:             rec.WebsiteURL,
+			OpenAIBaseURL:          rec.OpenAIBaseURL,
+			OpenAIEndpointOverride: rec.OpenAIEndpointOverride,
+			TimeoutSeconds:         rec.TimeoutSeconds,
+			ExtraHeaders:           rec.ExtraHeaders,
+			ExtraBody:              rec.ExtraBody,
+			AllowInternal:          rec.AllowInternal,
+			Enabled:                rec.Enabled,
+			ModelsSelected:         rec.ModelsSelected,
+			ModelAliases:           rec.ModelAliases,
+			Keys:                   make([]exportedProviderKey, 0, len(rec.Keys)),
+		}
+		for _, k := range rec.Keys {
+			plain, derr := crypto.Decrypt(s.master, k.KeyCipher, rec.ID)
+			if derr != nil {
+				return exportPayload{}, fmt.Errorf("解密供应商 %q 的凭证失败: %w", rec.Name, derr)
+			}
+			text := string(plain)
+			ep.Keys = append(ep.Keys, exportedProviderKey{Label: k.Label, APIKey: text, Enabled: k.Enabled})
+			if ep.APIKey == "" && k.Enabled {
+				ep.APIKey = text
+			}
+		}
+		if ep.APIKey == "" && len(ep.Keys) > 0 {
+			ep.APIKey = ep.Keys[0].APIKey
+		}
+		out.Providers = append(out.Providers, ep)
+	}
+	return out, nil
+}
+
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	records, err := s.store.ListProviders(ctx)
+	out, err := s.buildExportPayload(ctx, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
-		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
+		s.fail(w, http.StatusInternalServerError, "导出供应商配置失败", err)
 		return
-	}
-
-	out := exportPayload{
-		Format:     exportFormat,
-		ExportedAt: time.Now().UTC().Format(time.RFC3339),
-		Gateway:    s.holder.Get().Gateway(),
-		Providers:  make([]exportedProvider, 0, len(records)),
-		Notes: map[string]string{
-			"api_key": "导出文件包含供应商 API Key 明文，请按凭证同等对待；导入时会用目标机器的密钥重新加密",
-		},
-	}
-	for _, rec := range records {
-		plain, derr := crypto.Decrypt(s.master, rec.APIKeyCipher, rec.ID)
-		if derr != nil {
-			s.fail(w, http.StatusInternalServerError, "解密供应商凭证失败", derr)
-			return
-		}
-		out.Providers = append(out.Providers, exportedProvider{
-			providerDTO: toDTO(rec, nil),
-			APIKey:      string(plain),
-		})
 	}
 	s.logger.Info("已导出供应商配置（含明文凭证）", "count", len(out.Providers))
 	writeJSON(w, http.StatusOK, out)
@@ -323,19 +385,10 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 	imported := 0
 	for _, in := range payload.Providers {
-		in := in
-		apiKey := ""
-		if in.APIKey != nil {
-			apiKey = strings.TrimSpace(*in.APIKey)
-		}
-		if apiKey == "" {
+		if _, err := s.upsertProvider(ctx, in); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": fmt.Sprintf("供应商 %q 缺少 api_key：请使用含明文凭证的导出文件（或手工补齐）", in.displayName()),
+				"error": fmt.Sprintf("导入供应商 %q 失败：%v", in.displayName(), err),
 			})
-			return
-		}
-		if _, err := s.upsertProvider(ctx, in, apiKey); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
 		imported++

@@ -157,6 +157,7 @@ export function LogsPage() {
                   <TableHead>协议</TableHead>
                   <TableHead>模型</TableHead>
                   <TableHead>供应商</TableHead>
+                  <TableHead>凭证</TableHead>
                   <TableHead>状态</TableHead>
                   <TableHead>延迟</TableHead>
                   <TableHead>首字节</TableHead>
@@ -176,6 +177,7 @@ export function LogsPage() {
                     <TableCell className="text-xs">
                       {providerNames.get(item.provider_id) || item.provider_id || '—'}
                     </TableCell>
+                    <TableCell className="font-mono text-xs text-slate-500">{item.key_hint || '—'}</TableCell>
                     <TableCell>{statusBadge(item.status_code)}</TableCell>
                     <TableCell className="text-xs">{item.latency_ms} ms</TableCell>
                     <TableCell className="text-xs">

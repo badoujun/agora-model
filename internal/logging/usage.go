@@ -32,17 +32,18 @@ func (u Usage) IsZero() bool {
 //
 // gateway 在请求完成后调用 Record 把 usage 投递出去；
 // 生产实现是 store.UsageRecorder（异步批量写 SQLite）。
+// keyID 是实际服务该请求的供应商 Key（可能为空：例如历史数据或未注入 Key 统计）。
 type UsageSink interface {
-	Record(providerID, model string, statusCode int, usage Usage, ts time.Time)
+	Record(providerID, keyID, model string, statusCode int, usage Usage, ts time.Time)
 }
 
 // UsageSinkFunc 让普通函数实现 UsageSink 接口，避免写 adapter 类型。
-type UsageSinkFunc func(providerID, model string, statusCode int, usage Usage, ts time.Time)
+type UsageSinkFunc func(providerID, keyID, model string, statusCode int, usage Usage, ts time.Time)
 
 // Record 让 UsageSinkFunc 满足 UsageSink 接口。
-func (f UsageSinkFunc) Record(providerID, model string, statusCode int, usage Usage, ts time.Time) {
+func (f UsageSinkFunc) Record(providerID, keyID, model string, statusCode int, usage Usage, ts time.Time) {
 	if f == nil {
 		return
 	}
-	f(providerID, model, statusCode, usage, ts)
+	f(providerID, keyID, model, statusCode, usage, ts)
 }

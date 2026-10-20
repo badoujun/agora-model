@@ -189,10 +189,13 @@ func TestProviderRoundTripStoresCiphertext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SaveProvider: %v", err)
 	}
-	if saved.APIKeyHint != crypto.Mask("sk-secret-p1") {
-		t.Errorf("hint = %q", saved.APIKeyHint)
+	if len(saved.Keys) != 1 {
+		t.Fatalf("凭证数量 = %d", len(saved.Keys))
 	}
-	if strings.Contains(string(saved.APIKeyCipher), "sk-secret-p1") {
+	if saved.Keys[0].KeyHint != crypto.Mask("sk-secret-p1") {
+		t.Errorf("hint = %q", saved.Keys[0].KeyHint)
+	}
+	if strings.Contains(string(saved.Keys[0].KeyCipher), "sk-secret-p1") {
 		t.Fatal("落库的凭证必须是密文")
 	}
 	if !saved.Enabled {
@@ -207,8 +210,8 @@ func TestProviderRoundTripStoresCiphertext(t *testing.T) {
 		t.Fatalf("供应商数量 = %d", len(providers))
 	}
 	got := providers[0]
-	if got.APIKey != "sk-secret-p1" {
-		t.Errorf("解密后凭证 = %q", got.APIKey)
+	if len(got.APIKeys) != 1 || got.APIKeys[0].Key != "sk-secret-p1" {
+		t.Errorf("解密后凭证 = %+v", got.APIKeys)
 	}
 	if got.Name != "供应商 p1" || len(got.Models) != 2 {
 		t.Errorf("字段往返异常: %+v", got)
@@ -238,9 +241,13 @@ func TestProviderCipherIsBoundToProviderID(t *testing.T) {
 	if _, err := st.SaveProvider(ctx, master, sampleProvider("b")); err != nil {
 		t.Fatal(err)
 	}
-	// 把 a 的密文搬到 b 上（模拟数据库被手工篡改）
+	// 把 a 的密文搬到 b 的某个 Key 上（模拟数据库被手工篡改）
+	bRec, err := st.GetProvider(ctx, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.DB().ExecContext(ctx,
-		`UPDATE providers SET api_key_cipher = ? WHERE id = ?`, recA.APIKeyCipher, "b"); err != nil {
+		`UPDATE provider_keys SET key_cipher = ? WHERE id = ?`, recA.Keys[0].KeyCipher, bRec.Keys[0].ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.LoadProviders(ctx, master); err == nil {

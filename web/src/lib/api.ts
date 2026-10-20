@@ -96,6 +96,19 @@ export const api = {
     request<{ ok: boolean }>(`/api/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   testProvider: (id: string) =>
     request<TestResult>(`/api/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  /** 只测试某一个已保存的凭证（含已停用的 Key） */
+  testProviderKey: (id: string, keyId: string) =>
+    request<TestResult>(
+      `/api/providers/${encodeURIComponent(id)}/keys/${encodeURIComponent(keyId)}/test`,
+      { method: 'POST' },
+    ),
+  /** 草稿（尚未保存）凭证的连接测试 */
+  testDraftKey: (body: DraftFetchInput) =>
+    request<TestResult>('/api/providers/test-key', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
   /** 拉取上游模型候选列表（勾选在编辑页完成） */
   fetchModels: (id: string) =>
     request<ProviderDTO>(`/api/providers/${encodeURIComponent(id)}/fetch-models`, { method: 'POST' }),

@@ -38,10 +38,11 @@ func canonicalHeader(name string) string { return strings.ToLower(strings.TrimSp
 
 func isHopByHop(name string) bool { return hopByHopHeaders[canonicalHeader(name)] }
 
-// buildUpstreamHeaders 依据入站请求与供应商配置构造上游请求头。
+// buildUpstreamHeaders 依据入站请求、供应商配置与本次选中的凭证构造上游请求头。
 //
-// 其余业务头（anthropic-version、openai-*、user-agent 等）原样透传。
-func buildUpstreamHeaders(in http.Header, p *config.Provider) http.Header {
+// 其余业务头（openai-*、user-agent 等）原样透传；认证头统一替换为本次轮询
+// 选中的供应商 Key（多 Key 轮询/故障转移见 DESIGN §7.10）。
+func buildUpstreamHeaders(in http.Header, p *config.Provider, apiKey string) http.Header {
 	out := make(http.Header, len(in)+len(p.ExtraHeaders)+1)
 	for name, values := range in {
 		lower := canonicalHeader(name)
@@ -53,7 +54,7 @@ func buildUpstreamHeaders(in http.Header, p *config.Provider) http.Header {
 		}
 	}
 
-	out.Set("Authorization", "Bearer "+p.APIKey)
+	out.Set("Authorization", "Bearer "+apiKey)
 
 	// extra_headers 可覆盖业务头，但不允许覆盖 Host 与认证头
 	for name, value := range p.ExtraHeaders {

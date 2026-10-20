@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -307,6 +308,36 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 	usageRecorder := store.NewUsageRecorder(st, slogToRecorderLogger{inner: logger}, store.DefaultUsageRecorderOptions())
 	usageRecorder.Start(ctx)
 
+	// 6.6) 凭证健康状态记录器（失败计数 / 自动停用 / last_used_at）
+	// 数据面只在内存里做原子标记；落库后异步重建快照，让「自动停用」在配置视图里生效。
+	keyStats := store.NewProviderKeyStatsRecorder(st, slogToRecorderLogger{inner: logger}, store.DefaultProviderKeyStatsOptions())
+	keyStats.Start(ctx)
+	var (
+		keyReloadMu sync.Mutex
+		keyReloadAt time.Time
+	)
+	keyStats.SetOnDisabled(func() {
+		keyReloadMu.Lock()
+		if time.Since(keyReloadAt) < time.Second {
+			keyReloadMu.Unlock()
+			return
+		}
+		keyReloadAt = time.Now()
+		keyReloadMu.Unlock()
+		go func() {
+			time.Sleep(time.Second)
+			reloadCtx, reloadCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer reloadCancel()
+			snap, err := loadSnapshot(reloadCtx)
+			if err != nil {
+				logger.Warn("自动停用后重建配置快照失败", "err", err)
+				return
+			}
+			holder.Store(snap)
+			logger.Info("已根据自动停用的凭证重建配置快照")
+		}()
+	})
+
 	// 7) HTTP 服务
 	presetStore := presets.New(presets.Options{
 		OverridePath: opts.PresetsPath,
@@ -342,6 +373,7 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 		WithKeyStore(st).
 		WithRecorder(recorder).
 		WithUsageSink(usageRecorder).
+		WithProviderKeyStats(keyStats).
 		Register(mux)
 
 	srv := &http.Server{
@@ -390,6 +422,13 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 	uWritten, uDropped, uPruned := usageRecorder.Stats()
 	logger.Info("usage 写入",
 		"usage_written", uWritten, "usage_dropped", uDropped, "usage_pruned", uPruned)
+
+	// 等待凭证健康状态刷完
+	if !keyStats.Wait(5 * time.Second) {
+		logger.Warn("凭证健康状态刷新超时，可能有少量失败计数未落库")
+	}
+	kWritten, kDropped := keyStats.Stats()
+	logger.Info("凭证健康状态写入", "key_stats_written", kWritten, "key_stats_dropped", kDropped)
 	return nil
 }
 

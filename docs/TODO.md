@@ -394,11 +394,48 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 ---
 
+## Phase 7 · 多凭证（多 API Key）· 已完成（2026-10）
+
+> **需求变更（第 12 轮）**：一个供应商可能提供多个 API Key。
+> ① 轮询 + 失败自动切换，**失败的 Key 自动停用**；② Key 数量**不设上限**；
+> ③ 运行时供应商与 Key 信息全部在内存中，请求路径零 DB、零全局锁。
+
+- [x] **T7.1｜数据模型（迁移 v6）** ｜ 3h
+  - `provider_keys`（label/position/密文/掩码/启用/自动停用/失败统计/last_used）
+  - `provider_key_usage_daily`（按 Key 的日 token 用量）
+  - `logs.key_hint`；旧单凭证密文原样搬入 `provider_keys` 后删除 `providers.api_key_cipher/api_key_hint`
+  - **验收**：v5 旧库升级后明文可解、旧列消失；`TestMigrationV6MovesSingleKeyToProviderKeys` 通过
+- [x] **T7.2｜配置与存储层** ｜ 4h
+  - `config.ProviderKey`、`APIKeys`、`usableKeys` 预计算、`ValidateKeys`（重复/备注名长度/无数量上限）
+  - `store.SaveProvider` 单事务全量替换（按 id 沿用密文、`position` 保持提交顺序）
+  - `DisableProviderKey`（`WHERE enabled=1` 幂等保护）、`RecordProviderKeyFailure`、`TouchProviderKey`
+  - **验收**：`TestSaveProviderReplacesKeySet` / `TestDisableProviderKeyOnlyWhenEnabled` 通过
+- [x] **T7.3｜数据面：轮询 + 自动停用（内存热路径）** ｜ 5h
+  - `gateway/keyruntime.go`：`sync.Map` 轮询计数 + 原子健康状态；健康优先、冷却兜底、去重
+  - `gateway/failover.go`：401/402/403/429 自动停用并切换（最后一个可用 Key 只冷却不停用）、5xx/断连不重试、最后一次错误原样透传；每次失败（含最后一次）写入请求日志 `error_msg`
+  - `store.ProviderKeyStatsRecorder`：异步落库失败计数/自动停用；落库后防抖重建快照
+  - `observe`：新快照里重新出现的 Key 视为「用户已重新启用」，复位运行时标记
+  - **验收**：`TestKeyRoundRobinAlternatesAuthorization` / `TestKeyFailoverOn401DisablesFailedKey` /
+    `TestKeyRateLimitDisablesFailedKeyLikePaymentRequired` / `TestSingleKeyRateLimitOnlyCoolsDown` /
+    `TestKeyAllFailedPassesLastUpstreamErrorThrough` / `TestKeyFailuresRecordedInRequestLog` /
+    `TestHotPathServesAfterDatabaseClosed` 通过；`go test -race ./internal/gateway` 通过
+- [x] **T7.4｜控制面 API 与前端** ｜ 5h
+  - DTO：`keys[]` + `key_stats{}`（易变字段不进导出，保证 WebDAV 指纹稳定）；兼容字段 `api_key_hint`
+  - 端点：`POST /api/providers/{id}/keys/{key_id}/test`、`POST /api/providers/test-key`
+  - 导入导出：`keys[]`（明文）+ 兼容 `api_key`；旧文件按单 Key 导入、新文件可被旧版本导入第一个 Key
+  - 前端：Key 列表编辑（备注名/启用/单 Key 测试/删除/全部启用）、列表「凭证」列、日志「凭证」列
+  - **验收**：`TestProviderMultiKey*` / `TestTestSingleKeyEndpoint` / `TestExportIncludesAllKeysAndLegacyField` 通过；
+    `npm --prefix web run build` 通过
+- [x] **T7.5｜文档** ｜ 2h
+  - README「多 API Key：轮询与自动停用」、DESIGN §7.10 与 DDL/规则表、PRD 第 12 轮、本 TODO
+
+---
+
 ## Backlog（P2 / 后续迭代）
 
 > 以下项已在 DESIGN 中明确"本期不做"，此处登记以备后续排期。
 
-- [ ] 多网关 Key：按 Agent 发放、单独吊销、最后使用时间统计（表结构已在 `gateway_keys` 预留，零改表）。
+- [ ] 多网关 Key（入站方向）：按 Agent 发放、单独吊销、最后使用时间统计（表结构已在 `gateway_keys` 预留，零改表）。
 - [ ] 模型名映射（`model_alias_json`）：解决「同一模型在两种协议下名称不同」（PRD 风险 R2）。
 - [ ] 日志保留策略：按天数/条数清理，防止 SQLite 无限增长（FR-7.5）。
 - [ ] `/v1/models` 的 Anthropic 格式内容协商（DESIGN §13 已论证低优先级）。

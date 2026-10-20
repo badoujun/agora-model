@@ -18,12 +18,25 @@ import (
 	"time"
 
 	"agora-model/internal/config"
+	"agora-model/internal/crypto"
 	"agora-model/internal/logging"
 	"agora-model/internal/route"
 )
 
 // errBodyTooLarge 表示入站请求体超过上限。
 var errBodyTooLarge = errors.New("请求体过大")
+
+// errNoUsableKey 表示供应商没有任何可用的 API Key（全部停用/被自动停用）。
+var errNoUsableKey = errors.New("供应商没有可用的 API Key（可能已全部被自动停用）")
+
+// ProviderKeyStats 是凭证健康状态的下游接收方（由 store.ProviderKeyStatsRecorder 实现）。
+//
+// 三个方法都必须是非阻塞的：数据面只在内存里做原子标记，落库交给异步 recorder。
+type ProviderKeyStats interface {
+	TouchProviderKey(keyID string)
+	RecordProviderKeyFailure(keyID, reason string)
+	DisableProviderKey(keyID, reason string)
+}
 
 // KeyStore 是网关 Key 的校验与使用记录接口（由 store 实现）。
 //
@@ -41,6 +54,13 @@ type Gateway struct {
 	keys      KeyStore
 	recorder  *logging.Recorder
 	usageSink UsageSink
+	// keyRuntime 是供应商 Key 的进程内健康状态（轮询起点/冷却/自动停用），
+	// 请求路径只读它和配置快照，不碰数据库（DESIGN §7.10）。
+	keyRuntime *keyRuntime
+	keyStats   ProviderKeyStats
+	// lastSnap 记录最近一次"被请求路径观察到"的快照，用于在新快照生效时
+	// 复位被用户重新启用的 Key（见 observe）。
+	lastSnap  atomic.Pointer[config.Snapshot]
 	lastTouch atomic.Int64 // 网关 Key 使用时间的节流（Unix 秒）
 }
 
@@ -65,9 +85,10 @@ func New(holder *config.Holder, logger *slog.Logger) *Gateway {
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	return &Gateway{
-		holder: holder,
-		client: &http.Client{Transport: transport},
-		logger: logger,
+		holder:     holder,
+		client:     &http.Client{Transport: transport},
+		logger:     logger,
+		keyRuntime: newKeyRuntime(),
 	}
 }
 
@@ -80,6 +101,12 @@ func (g *Gateway) WithKeyStore(ks KeyStore) *Gateway {
 // WithRecorder 注入请求日志记录器。
 func (g *Gateway) WithRecorder(r *logging.Recorder) *Gateway {
 	g.recorder = r
+	return g
+}
+
+// WithProviderKeyStats 注入凭证健康状态接收器（异步落库 last_used/失败/自动停用）。
+func (g *Gateway) WithProviderKeyStats(s ProviderKeyStats) *Gateway {
+	g.keyStats = s
 	return g
 }
 
@@ -128,10 +155,15 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 		snap := g.holder.Get()
 		providers := snap.Providers()
 
-		// 裸名：Providers 已按供应商名称升序，首个出现者即默认供应商
+		// 裸名：Providers 已按供应商名称升序，首个出现者即默认供应商。
+		// 没有可用 Key 的供应商不对外暴露模型（含被自动停用的场景）。
+
 		seen := make(map[string]bool)
 		data := make([]modelEntry, 0, 16)
 		for _, p := range providers {
+			if !p.HasUsableKey() {
+				continue
+			}
 			for _, exposed := range p.ExposedModels() {
 				if seen[exposed] {
 					continue
@@ -142,6 +174,9 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 		}
 		// 命名空间形式
 		for _, p := range providers {
+			if !p.HasUsableKey() {
+				continue
+			}
 			for _, exposed := range p.ExposedModels() {
 				data = append(data, modelEntry{ID: p.Name + "/" + exposed, Object: "model", OwnedBy: p.Name})
 			}
@@ -159,6 +194,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 		started := time.Now()
 		requestID := newRequestID()
 		snap := g.holder.Get()
+		g.observe(snap)
 		cfg := snap.Gateway()
 
 		// 包装 ResponseWriter：统一捕获状态码与首字节时间，供请求日志使用
@@ -169,6 +205,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 			model        string
 			providerID   string
 			upstreamURL  string
+			keyHint      string
 			streamServed bool
 		)
 		defer func() {
@@ -178,6 +215,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 				InboundProtocol: config.ProtocolName,
 				Model:           model,
 				ProviderID:      providerID,
+				KeyHint:         keyHint,
 				UpstreamURL:     upstreamURL,
 				StatusCode:      rec.statusCode(),
 				LatencyMS:       time.Since(started).Milliseconds(),
@@ -230,7 +268,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 			switch {
 			case errors.Is(err, route.ErrModelNotFound):
 				writeError(w, http.StatusNotFound, codeModelNotFound, err.Error(), "model")
-			case errors.Is(err, route.ErrProviderDisabled):
+			case errors.Is(err, route.ErrProviderDisabled), errors.Is(err, route.ErrProviderNoKey):
 				writeError(w, http.StatusServiceUnavailable, codeNoAvailableProvider, err.Error(), "")
 			default:
 				writeError(w, http.StatusInternalServerError, codeInvalidRequest, err.Error(), "")
@@ -253,30 +291,29 @@ func (g *Gateway) handler() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), decision.Provider.Timeout())
 		defer cancel()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, decision.Upstream, bytes.NewReader(upstreamBody))
-		if err != nil {
-			writeError(w, http.StatusBadGateway, codeUpstreamUnreachable,
-				"构造上游请求失败: "+err.Error(), "")
-			return
-		}
-		req.Header = buildUpstreamHeaders(r.Header, decision.Provider)
-		if req.Header.Get("Content-Type") == "" {
-			req.Header.Set("Content-Type", "application/json")
-		}
-
 		g.logger.Debug("路由决策",
 			"request_id", requestID, "model", model, "provider", decision.Provider.Name,
 			"upstream_model", decision.Model, "upstream", decision.Upstream,
 			"stream", streamServed)
 
-		// 6) 发送并透传响应
-		resp, err := g.client.Do(req)
+		// 6) 发送并透传响应：多 Key 轮询 + 凭证类失败自动切换/自动停用（DESIGN §7.10）
+		resp, usedKey, keyFailures, err := g.sendWithFailover(ctx, r, decision, upstreamBody, requestID)
+		// 失败明细无论最终是否成功都写入请求日志：后续 Key 成功时客户端看到 200，
+		// 但日志页仍能看到"哪个凭证因什么原因失败、网关做了什么"。
+		if summary := describeKeyFailures(keyFailures); summary != "" {
+			rec.noteError(logging.Redact(summary, 1000))
+		}
 		if err != nil {
 			rec.noteError(err.Error())
+			if errors.Is(err, errNoUsableKey) {
+				writeError(w, http.StatusServiceUnavailable, codeNoAvailableProvider, err.Error(), "")
+				return
+			}
 			g.logUpstreamFailure(requestID, model, decision, started, err)
 			g.writeUpstreamError(w, r, err)
 			return
 		}
+		keyHint = crypto.Mask(usedKey.Key)
 		defer resp.Body.Close()
 
 		if isEventStream(resp) {
@@ -284,7 +321,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 			stats, usage, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle(), started)
 			g.logCompletion(requestID, model, decision, resp.StatusCode, started, stats, serr)
 			if u, ok := usage.Result(); ok {
-				recordUsage(g.usageSink, decision.Provider.ID, decision.Model, resp.StatusCode, u, started)
+				recordUsage(g.usageSink, decision.Provider.ID, usedKey.ID, decision.Model, resp.StatusCode, u, started)
 			}
 			return
 		}
@@ -294,7 +331,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 		written, cerr := copyResponse(w, resp, &bodyBuf)
 		if cerr == nil && bodyBuf.Len() > 0 {
 			if u, ok := parseUsageNonStream(resp.Header.Get("Content-Type"), bodyBuf.Bytes()); ok {
-				recordUsage(g.usageSink, decision.Provider.ID, decision.Model, resp.StatusCode, u, started)
+				recordUsage(g.usageSink, decision.Provider.ID, usedKey.ID, decision.Model, resp.StatusCode, u, started)
 			}
 		}
 		g.logger.Info("请求完成",
@@ -402,7 +439,17 @@ func (s *statusWriter) statusCode() int {
 
 func (s *statusWriter) firstByteMS() int64 { return s.firstByte.Milliseconds() }
 
-func (s *statusWriter) noteError(msg string) { s.errMsg = msg }
+// noteError 追加一条错误摘要（多次失败按出现顺序拼接，供请求日志展示）。
+func (s *statusWriter) noteError(msg string) {
+	if msg == "" {
+		return
+	}
+	if s.errMsg == "" {
+		s.errMsg = msg
+		return
+	}
+	s.errMsg += "；" + msg
+}
 
 func (s *statusWriter) errorMessage() string { return s.errMsg }
 

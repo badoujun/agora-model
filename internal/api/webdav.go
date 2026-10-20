@@ -187,25 +187,9 @@ func (s *Server) saveWebDAVConfig(ctx context.Context, cfg sync.Config) error {
 
 // exportProvidersBytes 复用 /api/export 的逻辑得到导出字节。
 func (s *Server) exportProvidersBytes(ctx context.Context) ([]byte, error) {
-	records, err := s.store.ListProviders(ctx)
+	out, err := s.buildExportPayload(ctx, timeNow())
 	if err != nil {
 		return nil, err
-	}
-	out := exportPayload{
-		Format:     exportFormat,
-		ExportedAt: timeNow(),
-		Gateway:    s.holder.Get().Gateway(),
-		Providers:  make([]exportedProvider, 0, len(records)),
-	}
-	for _, rec := range records {
-		plain, derr := crypto.Decrypt(s.master, rec.APIKeyCipher, rec.ID)
-		if derr != nil {
-			return nil, derr
-		}
-		out.Providers = append(out.Providers, exportedProvider{
-			providerDTO: toDTO(rec, nil),
-			APIKey:      string(plain),
-		})
 	}
 	return json.Marshal(out)
 }
@@ -242,16 +226,8 @@ func (s *Server) importProvidersBytes(ctx context.Context, data []byte) (int, er
 	}
 	count := 0
 	for _, in := range payload.Providers {
-		in := in
-		apiKey := ""
-		if in.APIKey != nil {
-			apiKey = strings.TrimSpace(*in.APIKey)
-		}
-		if apiKey == "" {
-			return count, errors.New("远端供应商缺少 api_key")
-		}
-		if _, err := s.upsertProvider(ctx, in, apiKey); err != nil {
-			return count, err
+		if _, err := s.upsertProvider(ctx, in); err != nil {
+			return count, fmt.Errorf("远端供应商 %q 导入失败: %w", in.displayName(), err)
 		}
 		count++
 	}

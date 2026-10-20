@@ -26,7 +26,7 @@
 **设计边界（明确的"不做"）**：
 
 - 不做请求/响应/SSE 的协议转换——网关只按模型名选择上游，原样透传。
-- 不做凭证池、轮询、故障转移——每个供应商一个凭证。
+- 不做**跨供应商**的故障转移：多凭证轮询、自动停用与凭证级故障转移都发生在**同一供应商内部**（§7.10）。
 - 不做用量统计、计费、WebDAV。
 - 不做多实例/分布式；不做多租户。
 - 不为 `/v1/models` 做 Anthropic 格式内容协商（v1.1 起 Anthropic 协议整体下线）。
@@ -217,6 +217,39 @@ CREATE TABLE IF NOT EXISTS providers (
   updated_at                  TEXT    NOT NULL
 );
 
+-- 供应商凭证（v6）：一个供应商任意多个 Key，position 决定轮询/展示顺序。
+-- 迁移 v6 会把 providers.api_key_cipher/api_key_hint 的既有单凭证搬到本表并删除旧列。
+CREATE TABLE IF NOT EXISTS provider_keys (
+  id              TEXT    PRIMARY KEY,            -- pk_<hex>
+  provider_id     TEXT    NOT NULL,
+  label           TEXT    NOT NULL DEFAULT '',
+  position        INTEGER NOT NULL DEFAULT 0,     -- 轮询顺序（保存时按提交顺序写入）
+  key_cipher      BLOB    NOT NULL,               -- AES-256-GCM，AAD = provider_id
+  key_hint        TEXT    NOT NULL DEFAULT '',
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  auto_disabled   INTEGER NOT NULL DEFAULT 0,     -- 1 = 因 401/402/403 被网关自动停用
+  disabled_reason TEXT    NOT NULL DEFAULT '',
+  created_at      TEXT    NOT NULL,
+  updated_at      TEXT    NOT NULL,
+  last_used_at    TEXT    NOT NULL DEFAULT '',
+  last_failure_at TEXT    NOT NULL DEFAULT '',
+  last_error      TEXT    NOT NULL DEFAULT '',
+  failure_count   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_provider_keys_provider ON provider_keys(provider_id, position);
+
+-- 按 Key 的日 token 用量（控制台展示用；与 model_usage_daily 的「供应商+模型」维度互不影响）
+CREATE TABLE IF NOT EXISTS provider_key_usage_daily (
+  date                TEXT    NOT NULL,
+  key_id              TEXT    NOT NULL,
+  provider_id         TEXT    NOT NULL,
+  requests            INTEGER NOT NULL DEFAULT 0,
+  input_tokens        INTEGER NOT NULL DEFAULT 0,
+  cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, key_id)
+);
+
 -- 网关 Key（v1 只暴露一条，表结构为未来多 Key 预留）
 CREATE TABLE IF NOT EXISTS gateway_keys (
   id           TEXT    PRIMARY KEY,
@@ -247,6 +280,7 @@ CREATE TABLE IF NOT EXISTS logs (
   inbound_protocol TEXT    NOT NULL,          -- openai | anthropic | models
   model            TEXT,
   provider_id      TEXT,
+  key_hint         TEXT,                      -- v6：实际服务该请求的供应商 Key 掩码
   upstream_url     TEXT,
   status_code      INTEGER NOT NULL,
   latency_ms       INTEGER NOT NULL,
@@ -272,8 +306,10 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 
 | 规则 | 说明 |
 | --- | --- |
-| 单凭证 | 一个 `providers` 行携带一个 `api_key_cipher`；不建 credentials 表 |
-| Key 不可回读 | 只存密文与掩码提示；修改采用覆盖语义 |
+| 多凭证（v6） | 凭证单独存 `provider_keys` 表：一个 `providers` 行可以有任意多个 Key（数量不设上限），`position` 决定轮询/展示顺序 |
+| Key 不可回读 | 只存密文与掩码提示；修改采用覆盖语义（按 id 提交表示沿用原密文） |
+| 自动停用 | `401/402/403` 会把该 Key 置为 `enabled=0, auto_disabled=1` 并记录原因；用户在 UI 上重新启用即清除标记 |
+| 顺序稳定 | 排序键为 `(provider_id, position, created_at, id)`；`position` 由保存时提交顺序决定 |
 | 网关 Key 只存哈希 | 入站校验只需比对 `sha256`，明文仅在生成时展示一次 |
 | 至少一个协议 URL | 保存时校验：`openai_base_url`、`anthropic_base_url` 至少有一个非空（含 override） |
 | 默认不启用内网 | `allow_internal = 0` 时拒绝解析到 loopback/private/link-local 的 URL |
@@ -337,7 +373,7 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 
 | 入站头 | 处理 |
 | --- | --- |
-| `Authorization` | **剥离**，替换为 `Authorization: Bearer <provider-key>`（OpenAI 上游） |
+| `Authorization` | **剥离**，替换为 `Authorization: Bearer <本次轮询选中的 provider-key>`（OpenAI 上游，见 §7.10） |
 | `x-api-key` | **剥离**，替换为 `x-api-key: <provider-key>`（Anthropic 上游） |
 | `Host` | 重写为上游 host |
 | `Content-Length` | 重新计算 |
@@ -418,7 +454,9 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | `GET` | `/api/providers/{id}` | 详情（Key 掩码） |
 | `PUT` | `/api/providers/{id}` | 更新（Key 为空表示保持原值） |
 | `DELETE` | `/api/providers/{id}` | 删除（级联删除其 `model_cache`） |
-| `POST` | `/api/providers/{id}/test` | 连接测试，返回 `{ok, status_code, latency_ms, message, detected_protocols}` |
+| `POST` | `/api/providers/{id}/test` | 连接测试：按顺序探测启用的 Key，首个成功即返回，响应含每个 Key 的明细 |
+| `POST` | `/api/providers/{id}/keys/{key_id}/test` | 只测试某个 Key（含已停用的 Key，用于判断能否重新启用） |
+| `POST` | `/api/providers/test-key` | 未保存表单里的单个/多个 Key 的草稿测试（不落库） |
 | `POST` | `/api/providers/{id}/fetch-models` | 立即拉取该供应商模型列表 |
 | `POST` | `/api/providers/fetch-models` | **未保存的供应商**按表单信息拉取候选模型（不落库，供「保存 / 拉取」分离使用） |
 | `GET` | `/api/models` | 聚合模型列表（含来源、是否默认、是否手动、抓取时间） |
@@ -755,6 +793,7 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 | 2xx 非流式 | 可选（设置项 `log_success`，默认关） | 只累加计数，避免写放大 |
 | 2xx 流式 | 可选（同上） | 记录总字节与总时长 |
 | 4xx / 5xx | **必记** | 含上游错误体前 1KB（脱敏后） |
+| 凭证级失败（401/402/403/429） | **必记**（即使最终成功也记） | `error_msg` 追加每个失败 Key 的掩码、状态码/原因与网关动作 |
 | 上游连接失败 / 超时 | **必记** | `status_code` 记 502/504 |
 | 客户端断开 | **必记** | `status_code` = 499 |
 | 管理 API 操作（增删改、Key 重置、登录） | **必记** | 审计用途，写入进程日志 + 可选 `logs`（`inbound_protocol = "admin"`） |
@@ -763,6 +802,47 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 - 队列满时**丢弃并计数**（丢弃数在 `/api/health` 暴露），绝不允许阻塞转发（可用性优先）。
 
 ---
+
+### 7.10 多凭证：内存热路径、轮询与自动停用（v6）
+
+> 需求变更（第 12 轮）：一个供应商可能提供多个 API Key。**轮询 + 失败自动切换，失败的 Key 自动停用**；
+> Key 数量**不设上限**；请求路径**只读内存**，不查库、不持锁。
+
+**数据面热路径**（每请求）：
+
+```
+snap := holder.Get()                       // atomic.Pointer[Snapshot]，无锁
+p := route.Resolve(snap, model)            // 纯内存
+keys := p.UsableKeys()                     // 归一化时预计算，零分配
+order := keyRuntime.order(p.ID, keys, 3)   // 轮询起点 + 健康过滤，仅 atomic/sync.Map 读
+```
+
+- `usableKeys` 在配置归一化时一次性算好（只含「启用且有明文」的 Key），随不可变快照发布。
+- `keyRuntime` 以 `sync.Map` + `atomic` 保存每个供应商的轮询计数与每个 Key 的健康状态；
+  已判定「自动停用」的 Key 不再进入候选，冷却中的 Key 只作为兜底（可用性优先）。
+- 选 Key 的顺序：以轮询计数为起点旋转，健康 Key 优先；单请求最多尝试 `maxKeyAttempts = 3` 个 Key。
+- 快照重建（写配置、自动停用落库后）才访问数据库，且在 1 秒防抖内合并，绝不发生在请求路径上。
+
+**失败处理**：
+
+| 上游结果 | 行为 |
+| --- | --- |
+| `401 / 402 / 403 / 429` | 内存中立即停用该 Key（后续请求不再选它）→ 异步落库 `enabled=0, auto_disabled=1, disabled_reason` → 换下一个 Key；已是最后一次时把该响应原样透传。**保护**：若它是该供应商最后一个可用 Key，则只冷却 60 秒（停用会让供应商彻底无凭证可用，且单请求级 401/429 未必真是凭证问题） |
+| 连接失败 / 超时 | 换下一个 Key（不改 Key 状态）；客户端断开或整体超时则立即停止重试 |
+| `5xx`、其它 4xx | 原样透传，**不重试**（避免重复计费与半截流） |
+| 全部 Key 不可用 | 503 `no_available_provider`（消息说明可能已全部被自动停用） |
+
+**失败可观测**：每一次凭证失败（含最后一次）都会把「掩码 Key + HTTP 状态码/错误体前缀 + 网关动作
+（已自动停用 / 最后一个可用 Key 只冷却）」追加到 `logs.error_msg`；即使后续 Key 成功、请求最终返回
+200，失败明细也会保留（同时写进程日志）。日志页因此可以按 `key_hint` 追溯「哪个 Key 因什么被停用」。
+
+**重新启用**：用户在供应商编辑页把 Key 勾回「启用」并保存（或点「全部启用」）。
+保存后 `auto_disabled/disabled_reason` 清空，快照重建；网关上首次看到新快照时会
+复位该 Key 的运行时标记（`observe`），无需重启。
+
+**统计**：`provider_keys` 记录 `last_used_at / failure_count / last_failure_at / last_error`；
+新增 `provider_key_usage_daily` 保存按 Key 的日 token 用量。两者都由异步 recorder 写入
+（队列满即丢弃并计数，可用性优先），控制台在供应商页展示。
 
 ## 8. 前端设计（Web UI）
 
@@ -823,7 +903,7 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 ### 8.5 日志页
 
 - 顶部筛选：时间范围、状态码段、模型、供应商、仅看失败。
-- 表格：时间 · 协议 · 模型 · 供应商 · 上游 URL · 状态码 · 延迟 · 首字节 · 错误摘要（可展开查看截断错误体）。
+- 表格：时间 · 协议 · 模型 · 供应商 · 上游 URL · 状态码 · 延迟 · 首字节 · 错误摘要（含凭证级故障转移明细，可展开查看截断错误体）。
 - 分页（`limit`/`offset`），默认按时间倒序。
 
 ### 8.6 数据位置页（`/data`）
@@ -859,7 +939,8 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 | --- | --- | --- |
 | Web UI 被公网暴露 | 默认 `127.0.0.1`；远程访问强制管理密码；会话 Cookie HttpOnly + SameSite=Lax；登录限速 | FR-3.5 / §7.7 |
 | SSRF（添加内网上游） | 保存时 URL + IP 段校验；`allow_internal` 显式放行；转发期 debug 日志记录解析 IP | §7.7 |
-| 数据库文件泄露 / 误提交 | 供应商 Key AES-256-GCM 加密；`.gitignore` 排除 `data/`、`master.key` | §4.3 / §7.8 |
+| 数据库文件泄露 / 误提交 | 每个供应商 Key 独立 AES-256-GCM 加密（AAD = `provider.id`）；`.gitignore` 排除 `data/`、`master.key` | §4.3 / §7.8 |
+| 单个上游 Key 失效/欠费拖垮服务 | 凭证级故障转移 + 自动停用 + 冷却，失败不再反复打上游 | §7.10 |
 | 主密钥硬编码 | 优先环境变量；文件方式权限 `0600` | §4.3 |
 | Key 明文外泄 | 出口结构体不含 Key 字段；掩码回显；日志正则脱敏 | §7.8 |
 | 网关 Key 泄露 | 可一键重置（旧 Key 立即失效）；只存哈希；预留多 Key 表结构 | §4.1 / §6.1 |
@@ -878,8 +959,9 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 | 缺少 `model` | 400 `invalid_request_error` |
 | 模型存在但该供应商未配置该协议 URL | 400 `upstream_protocol_not_configured`，错误信息指明「供应商 X 未配置 Anthropic 地址」 |
 | 模型未被任何供应商声明 | 404 `model_not_found`；错误信息附带「可用模型数」便于自查 |
-| 上游 401（供应商 Key 失效） | 原样回传上游 401 + 记录日志（Web UI 供应商页显示红色健康状态） |
-| 上游 429 | 原样回传（单凭证无故障转移），日志标注 `rate_limited` |
+| 上游 401（供应商 Key 失效） | 自动停用该 Key 并切换下一个；全部失败时原样回传最后一次 401（供应商页显示「已自动停用」与原因） |
+| 上游 429（限速 / 额度耗尽） | 与 402 相同：自动停用该 Key 并切换下一个；全部失败时原样回传最后一次 429（最后一个可用 Key 只冷却不停用，日志记录每次失败明细） |
+| 多 Key 全部不可用 | 供应商不再参与路由：聚合寻址跳过、命名空间命中返回 503，界面提示重新启用。数据面不会把最后一个可用 Key 自动停用，因此该状态只会来自"用户在界面上停用了全部 Key"（保存时已拒绝，仅手工改库可能出现） |
 | 上游返回非 JSON / HTML（如 Cloudflare 拦截页） | 原样回传 + 日志记录前 1KB，便于识别 |
 | 上游超时（含 SSE 长时间无数据但连接未断） | 连接级超时按 `timeout_seconds`；SSE 空闲由心跳保活（不主动断开，避免误杀长推理） |
 | 客户端断开 | 取消上游请求，日志记 499 |
@@ -894,7 +976,7 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 
 | 层次 | 内容 | 工具/方式 |
 | --- | --- | --- |
-| 单元测试 | 路由解析（含 `provider/model` 歧义、priority、404）、URL 校验、加解密与掩码、头部改写规则、模型名重写 | Go `testing`，表驱动 |
+| 单元测试 | 路由解析（含 `provider/model` 歧义、无可用 Key、404）、URL 校验、加解密与掩码、头部改写规则、模型名重写、多 Key 轮询/冷却/自动停用、热路径零 DB | Go `testing`，表驱动 + `-race` + 基准 |
 | 契约测试 | `/v1/chat/completions`、`/v1/messages`、`/v1/models` 的请求/响应与错误体风格 | `httptest.Server` 冒充上游 |
 | 流式测试 | 上游分块吐出 SSE + 静默 20s，断言：客户端收到心跳注释、内容字节与上游一致、总时长不受影响 | 自建 mock 上游 + 断言首字节延迟 |
 | 取消测试 | 客户端中途关闭连接，断言上游 mock 观察到 ctx 取消、网关 goroutine 数回落 | `runtime.NumGoroutine` 差值与 mock 信号 |
@@ -913,6 +995,9 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 5. 命名空间路由：`a/gpt-4o` 强制走 provider-a，且上游收到的 `model` 为 `gpt-4o`。
 6. 斜杠模型名保护：`meta-llama/Llama-3-70B` 不被误判为命名空间。
 7. SSRF：`http://127.0.0.1:11434` 被拒；开启 `allow_internal` 后可保存。
+8. 多 Key 轮询：两个 Key 时上游收到的 `Authorization` 交替出现。
+9. 故障转移与自动停用：首个 Key 401 → 第二个 Key 服务成功，且首个 Key 被标记为自动停用。
+10. 内存热路径：快照构建后关闭数据库，转发、故障转移与统计仍然正常。
 
 ---
 
@@ -1026,6 +1111,8 @@ WantedBy=multi-user.target
 | 水平扩展 / 多实例 | 个人自用网关，SQLite 单机足够；定时任务用 goroutine + ticker，不阻塞主流程。单实例设计能省掉分布式配置同步的全部复杂度。 |
 | 把「单网关 Key」当作安全漏洞 | 它本质是**可用性问题**，且用户明确要求只提供一个 Key。v1 在数据库层用 `gateway_keys` 表预留结构，未来零改表即可支持多 Key / 吊销。 |
 | 模型别名表 | 用 `provider/model` 语法即可解决同名冲突，不引入新增概念与配置面。 |
+| 跨供应商凭证共享/跨供应商故障转移 | 供应商各自独立计费与配额，跨供应商重试会把请求发到用户没选的服务上；只在同一供应商内部轮询与切换。 |
+| Key 数量上限 | 需求明确不设上限；代价仅是保存/列表的 O(n) 展示与请求内最多 3 次尝试。 |
 | 请求体全量流式解码 | 收益被夸大（几十 KB JSON 解析是微秒级）；已用「只解 `model` + 无改写时零处理」达成同样的优雅度。 |
 
 ---

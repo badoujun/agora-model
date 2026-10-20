@@ -32,9 +32,9 @@ func (s *Store) InsertLogs(ctx context.Context, entries []logging.Entry) error {
 		return fmt.Errorf("写入日志开启事务失败: %w", err)
 	}
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO logs (ts, request_id, inbound_protocol, model, provider_id, upstream_url,
+		`INSERT INTO logs (ts, request_id, inbound_protocol, model, provider_id, key_hint, upstream_url,
 		                   status_code, latency_ms, first_byte_ms, stream, error_msg, client_ip)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("准备日志语句失败: %w", err)
@@ -52,7 +52,7 @@ func (s *Store) InsertLogs(ctx context.Context, entries []logging.Entry) error {
 		}
 		if _, err := stmt.ExecContext(ctx,
 			ts.UTC().Format(time.RFC3339Nano), e.RequestID, e.InboundProtocol,
-			truncate(e.Model, 256), e.ProviderID, truncate(e.UpstreamURL, 512),
+			truncate(e.Model, 256), e.ProviderID, truncate(e.KeyHint, 64), truncate(e.UpstreamURL, 512),
 			e.StatusCode, e.LatencyMS, e.FirstByteMS, stream,
 			logging.Redact(e.ErrorMsg, 1024), e.ClientIP,
 		); err != nil {
@@ -105,7 +105,7 @@ func (s *Store) QueryLogs(ctx context.Context, f LogFilter) ([]logging.Entry, er
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
-	q := `SELECT ts, request_id, inbound_protocol, model, provider_id, upstream_url,
+	q := `SELECT ts, request_id, inbound_protocol, model, provider_id, key_hint, upstream_url,
 	             status_code, latency_ms, first_byte_ms, stream, error_msg, client_ip
 	      FROM logs`
 	if len(where) > 0 {
@@ -129,7 +129,7 @@ func (s *Store) QueryLogs(ctx context.Context, f LogFilter) ([]logging.Entry, er
 			firstMS int64
 		)
 		if err := rows.Scan(&ts, &entry.RequestID, &entry.InboundProtocol, &entry.Model,
-			&entry.ProviderID, &entry.UpstreamURL, &entry.StatusCode, &entry.LatencyMS,
+			&entry.ProviderID, &entry.KeyHint, &entry.UpstreamURL, &entry.StatusCode, &entry.LatencyMS,
 			&firstMS, &stream, &entry.ErrorMsg, &entry.ClientIP); err != nil {
 			return nil, err
 		}

@@ -8,6 +8,7 @@ import {
   Plug,
   Plus,
   RefreshCw,
+  RotateCcw,
   Sparkles,
   Trash2,
   Upload,
@@ -15,6 +16,7 @@ import {
 import { api, ApiError } from '@/lib/api'
 import type {
   DraftFetchInput,
+  KeyStatsDTO,
   PresetDTO,
   ProviderDTO,
   ProviderInput,
@@ -38,6 +40,25 @@ import {
   TableRow,
 } from '@/components/ui/table'
 
+/** 表单里的单行 API Key。 */
+interface KeyRow {
+  /** 已保存 Key 的记录 id；undefined 表示尚未保存的新增行 */
+  keyId?: string
+  label: string
+  /** 明文；编辑既有 Key 时留空表示不修改 */
+  apiKey: string
+  enabled: boolean
+  /** 已保存 Key 的掩码与运行期状态（只读展示） */
+  hint?: string
+  autoDisabled?: boolean
+  disabledReason?: string
+  failureCount?: number
+  lastError?: string
+  month30Tokens?: number
+  /** 单 Key 测试结果（本地展示，不落库） */
+  testMessage?: string
+}
+
 interface FormState {
   id?: string
   name: string
@@ -45,7 +66,7 @@ interface FormState {
   website_url: string
   openai_base_url: string
   openai_endpoint_override: string
-  api_key: string
+  keys: KeyRow[]
   /** 候选与已选模型的展示顺序（去重） */
   modelOrder: string[]
   /** 上游模型名 -> 是否勾选启用 */
@@ -59,12 +80,16 @@ interface FormState {
   enabled: boolean
 }
 
+function emptyKeyRow(): KeyRow {
+  return { label: '', apiKey: '', enabled: true }
+}
+
 const EMPTY_FORM: FormState = {
   name: '',
   website_url: '',
   openai_base_url: '',
   openai_endpoint_override: '',
-  api_key: '',
+  keys: [emptyKeyRow()],
   modelOrder: [],
   selected: {},
   aliases: {},
@@ -94,13 +119,29 @@ function toForm(p: ProviderDTO): FormState {
   for (const model of p.models_selected ?? []) {
     selected[model] = true
   }
+  const stats: Record<string, KeyStatsDTO> = p.key_stats ?? {}
+  const keys: KeyRow[] = (p.keys ?? []).map((key) => {
+    const st = stats[key.id]
+    return {
+      keyId: key.id,
+      label: key.label ?? '',
+      apiKey: '',
+      enabled: key.enabled,
+      hint: key.api_key_hint,
+      autoDisabled: key.auto_disabled,
+      disabledReason: key.disabled_reason,
+      failureCount: st?.failure_count,
+      lastError: st?.last_error,
+      month30Tokens: st?.month30_tokens,
+    }
+  })
   return {
     id: p.id,
     name: p.name,
     website_url: p.website_url ?? '',
     openai_base_url: p.openai_base_url ?? '',
     openai_endpoint_override: p.openai_endpoint_override ?? '',
-    api_key: '',
+    keys: keys.length > 0 ? keys : [emptyKeyRow()],
     modelOrder: mergeModels(p.models_selected ?? [], p.candidate_models ?? []),
     selected,
     aliases: { ...(p.model_aliases ?? {}) },
@@ -148,9 +189,16 @@ function toInput(form: FormState): ProviderInput {
     timeout_seconds: form.timeout_seconds,
     allow_internal: form.allow_internal,
     enabled: form.enabled,
-  }
-  if (form.api_key.trim() !== '') {
-    input.api_key = form.api_key.trim()
+    // 全量替换凭证集合：既有 Key 只传 id（明文留空即沿用原密文）
+    keys: form.keys.map((row) => {
+      const item: NonNullable<ProviderInput['keys']>[number] = {
+        label: row.label.trim(),
+        enabled: row.enabled,
+      }
+      if (row.keyId) item.id = row.keyId
+      if (row.apiKey.trim() !== '') item.api_key = row.apiKey.trim()
+      return item
+    }),
   }
   if (headers) {
     input.extra_headers = headers as Record<string, string>
@@ -161,16 +209,27 @@ function toInput(form: FormState): ProviderInput {
   return input
 }
 
-/** 未保存的供应商只能按表单里填写的信息拉取：单独组装草稿请求体。 */
-function toDraftInput(form: FormState): DraftFetchInput {
+/** 未保存的供应商只能按表单里填写的信息拉取/测试：单独组装草稿请求体。 */
+function toDraftInput(form: FormState, onlyIndex?: number): DraftFetchInput {
   const headers = parseJSONField(form.extra_headers, '额外请求头') as Record<string, string> | undefined
+  // 拉取模型只带「启用且已填明文」的行；测试某一行时只带那一行（即使它是停用状态，也用于诊断）
+  const rows = form.keys.filter((row, index) =>
+    onlyIndex === undefined
+      ? row.enabled && row.apiKey.trim() !== ''
+      : index === onlyIndex && row.apiKey.trim() !== '',
+  )
   return {
     openai_base_url: form.openai_base_url.trim(),
     openai_endpoint_override: form.openai_endpoint_override.trim(),
-    api_key: form.api_key.trim(),
+    keys: rows.map((row, index) => ({
+      label: row.label.trim() || `Key ${index + 1}`,
+      api_key: row.apiKey.trim(),
+      enabled: true,
+    })),
     extra_headers: headers,
     timeout_seconds: form.timeout_seconds,
     allow_internal: form.allow_internal,
+    models_selected: form.modelOrder.filter((model) => form.selected[model]),
   }
 }
 
@@ -192,6 +251,8 @@ export function ProvidersPage() {
   const [testResult, setTestResult] = useState<{ provider: ProviderDTO; result: TestResult } | null>(null)
   // 当前 dialog 是「从预设点开的」：影响标题文案与「拉取模型」按钮的启用条件（提示而非强制）
   const [openedFromPreset, setOpenedFromPreset] = useState(false)
+  // 正在单独测试的 Key 行下标（null 表示没有进行中的测试）
+  const [testingKeyIndex, setTestingKeyIndex] = useState<number | null>(null)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.listProviders })
   const presets = useQuery({
@@ -371,6 +432,58 @@ export function ProvidersPage() {
     setForm((prev) => ({ ...prev, aliases: { ...prev.aliases, [model]: value } }))
   }
 
+  const updateKeyRow = (index: number, patch: Partial<KeyRow>) => {
+    setForm((prev) => ({
+      ...prev,
+      keys: prev.keys.map((row, i) => (i === index ? { ...row, ...patch } : row)),
+    }))
+  }
+
+  const addKeyRow = () => {
+    setForm((prev) => ({ ...prev, keys: [...prev.keys, emptyKeyRow()] }))
+  }
+
+  const removeKeyRow = (index: number) => {
+    setForm((prev) => ({ ...prev, keys: prev.keys.filter((_, i) => i !== index) }))
+  }
+
+  /** 把所有 Key 标记为启用（自动停用的 Key 也一并恢复），随「保存」一起提交。 */
+  const reEnableAllKeys = () => {
+    setForm((prev) => ({ ...prev, keys: prev.keys.map((row) => ({ ...row, enabled: true })) }))
+    toast.show('已把所有 Key 标记为启用，点「保存」后生效', 'success')
+  }
+
+  const enabledKeyRows = form.keys.filter((row) => row.enabled)
+  const hasUsableKeyDraft = enabledKeyRows.some((row) => row.apiKey.trim() !== '')
+
+  /** 单独测试某一行 Key：已保存的走单 Key 接口，未保存的走草稿接口。 */
+  const testKeyRow = async (index: number) => {
+    const row = form.keys[index]
+    if (!row) return
+    setFormError('')
+    if (!row.keyId && row.apiKey.trim() === '') {
+      setFormError(`第 ${index + 1} 个 API Key 还没有填写明文，无法测试`)
+      return
+    }
+    setTestingKeyIndex(index)
+    try {
+      const result = row.keyId && form.id
+        ? await api.testProviderKey(form.id, row.keyId)
+        : await api.testDraftKey(toDraftInput(form, index))
+      updateKeyRow(index, {
+        testMessage: `${result.ok ? '通过' : '失败'}：${result.message}`,
+      })
+      toast.show(
+        result.ok ? `第 ${index + 1} 个 Key 测试通过` : `第 ${index + 1} 个 Key 测试失败：${result.message}`,
+        result.ok ? 'success' : 'error',
+      )
+    } catch (err) {
+      setFormError(err instanceof ApiError ? err.message : String(err))
+    } finally {
+      setTestingKeyIndex(null)
+    }
+  }
+
   /** 拉取模型与保存是两个独立动作：先做与后端一致的本地校验。 */
   const startFetchModels = () => {
     setFormError('')
@@ -378,8 +491,8 @@ export function ProvidersPage() {
       setFormError('请先填写 OpenAI Base URL，再拉取模型')
       return
     }
-    if (!form.id && form.api_key.trim() === '') {
-      setFormError('请先填写 API Key，再拉取模型')
+    if (!form.id && !hasUsableKeyDraft) {
+      setFormError('请先填写至少一个已启用的 API Key，再拉取模型')
       return
     }
     fetchModels.mutate(form)
@@ -395,9 +508,20 @@ export function ProvidersPage() {
       setFormError('请填写 OpenAI Base URL（或端点覆盖）')
       return
     }
-    if (!form.id && form.api_key.trim() === '') {
-      setFormError('新建供应商必须填写 API Key')
+    if (form.keys.length === 0) {
+      setFormError('请至少添加一个 API Key')
       return
+    }
+    if (enabledKeyRows.length === 0) {
+      setFormError('请至少启用一个 API Key（如需整体停用请停用供应商）')
+      return
+    }
+    for (let i = 0; i < form.keys.length; i += 1) {
+      const row = form.keys[i]
+      if (!row.keyId && row.apiKey.trim() === '') {
+        setFormError(`第 ${i + 1} 个 API Key 还没有填写明文`)
+        return
+      }
     }
     if (form.timeout_seconds <= 0) {
       setFormError('超时时间必须为正整数')
@@ -419,7 +543,8 @@ export function ProvidersPage() {
         <div>
           <h1 className="text-xl font-semibold text-slate-900">供应商管理</h1>
           <p className="mt-1 text-sm text-slate-500">
-            填写名称、OpenAI 兼容地址与 API Key，在编辑页拉取并勾选要启用的模型——所有 Agent 立即生效。
+            填写名称、OpenAI 兼容地址与一个或多个 API Key，在编辑页拉取并勾选要启用的模型——所有 Agent 立即生效。
+            多个 Key 会按顺序轮询，凭证类失败时自动切换并停用失败的 Key。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -447,7 +572,7 @@ export function ProvidersPage() {
             onClick={() => {
               if (
                 window.confirm(
-                  '导出文件包含所有供应商的 API Key 明文，请自行妥善保管。确认导出？',
+                  '导出文件包含所有供应商的全部 API Key 明文，请自行妥善保管。确认导出？',
                 )
               ) {
                 exportProviders.mutate()
@@ -497,6 +622,29 @@ export function ProvidersPage() {
                 ) : null}
               </div>
               <p className="mt-1 break-all text-xs text-slate-500">{testResult.result.message}</p>
+              {testResult.result.keys && testResult.result.keys.length > 0 ? (
+                <div className="mt-2 grid gap-1">
+                  {testResult.result.keys.map((keyResult, index) => (
+                    <div
+                      key={keyResult.key_id || `${keyResult.hint ?? 'key'}-${index}`}
+                      className="flex flex-wrap items-center gap-2 rounded border border-slate-100 px-2 py-1 text-xs"
+                    >
+                      <Badge variant={keyResult.ok ? 'success' : 'danger'}>
+                        {keyResult.ok ? '通过' : '失败'}
+                      </Badge>
+                      <span className="font-mono text-slate-700">{keyResult.hint || keyResult.key_id}</span>
+                      {keyResult.label ? <span className="text-slate-500">{keyResult.label}</span> : null}
+                      {keyResult.status_code ? (
+                        <span className="text-slate-500">HTTP {keyResult.status_code}</span>
+                      ) : null}
+                      <span className="text-slate-500">{keyResult.latency_ms} ms</span>
+                      <span className="max-w-[420px] truncate text-slate-500" title={keyResult.message}>
+                        {keyResult.message}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           </CardContent>
         </Card>
@@ -524,6 +672,7 @@ export function ProvidersPage() {
                   <TableHead>名称</TableHead>
                   <TableHead>OpenAI 地址</TableHead>
                   <TableHead>官网</TableHead>
+                  <TableHead>凭证</TableHead>
                   <TableHead>已启用模型</TableHead>
                   <TableHead>最近拉取</TableHead>
                   <TableHead>状态</TableHead>
@@ -554,6 +703,31 @@ export function ProvidersPage() {
                       ) : (
                         <span className="text-slate-400">—</span>
                       )}
+                    </TableCell>
+                    <TableCell className="text-xs">
+                      {provider.keys.length === 0 ? (
+                        <span className="text-slate-400">未配置</span>
+                      ) : (
+                        <span
+                          title={provider.keys
+                            .map(
+                              (key) =>
+                                `${key.label || '未命名'} · ${key.api_key_hint}${key.enabled ? '' : key.auto_disabled ? '（自动停用）' : '（停用）'}`,
+                            )
+                            .join('\n')}
+                        >
+                          启用 {provider.keys.filter((key) => key.enabled).length} / 共 {provider.keys.length}
+                        </span>
+                      )}
+                      {provider.keys.filter((key) => key.auto_disabled).length > 0 ? (
+                        <Badge
+                          variant="danger"
+                          className="ml-1"
+                          title="被网关因凭证类失败自动停用，可在编辑页重新启用"
+                        >
+                          {provider.keys.filter((key) => key.auto_disabled).length} 自动停用
+                        </Badge>
+                      ) : null}
                     </TableCell>
                     <TableCell>{provider.model_count}</TableCell>
                     <TableCell className="text-xs">
@@ -597,7 +771,11 @@ export function ProvidersPage() {
                           size="sm"
                           className="text-red-600 hover:bg-red-50"
                           onClick={() => {
-                            if (window.confirm(`确认删除供应商「${provider.name || provider.id}」？`)) {
+                            if (
+                              window.confirm(
+                                `确认删除供应商「${provider.name || provider.id}」？其全部 ${provider.keys.length} 个 API Key 与模型选择将一并删除。`,
+                              )
+                            ) {
                               remove.mutate(provider.id)
                             }
                           }}
@@ -643,7 +821,7 @@ export function ProvidersPage() {
         <div className="grid gap-4">
           {openedFromPreset ? (
             <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
-              已按预设填入名称、官网与 OpenAI Base URL。请继续填写 API Key，
+              已按预设填入名称、官网与 OpenAI Base URL。请继续添加 API Key，
               在「模型」区域点「拉取模型」勾选要启用的模型，再点底部「保存」。
             </p>
           ) : null}
@@ -673,27 +851,120 @@ export function ProvidersPage() {
             </p>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="grid gap-1.5">
-              <Label htmlFor="p-openai">OpenAI Base URL</Label>
-              <Input
-                id="p-openai"
-                value={form.openai_base_url}
-                onChange={(event) => setForm({ ...form, openai_base_url: event.target.value })}
-                placeholder="https://api.example.com/v1"
-              />
+          <div className="grid gap-1.5">
+            <Label htmlFor="p-openai">OpenAI Base URL</Label>
+            <Input
+              id="p-openai"
+              value={form.openai_base_url}
+              onChange={(event) => setForm({ ...form, openai_base_url: event.target.value })}
+              placeholder="https://api.example.com/v1"
+            />
+          </div>
+
+          <div className="grid gap-2 rounded-md border border-slate-200 p-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p className="text-sm font-medium text-slate-800">API Key（可配置多个，按顺序轮询）</p>
+                <p className="text-xs text-slate-500">
+                  共 {form.keys.length} 个，启用 {enabledKeyRows.length} 个。上游返回 401/402/403 时，
+                  网关会自动停用该 Key 并切换到下一个；429 只冷却 60 秒。数量不设上限。
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {form.keys.some((row) => !row.enabled) ? (
+                  <Button variant="outline" size="sm" type="button" onClick={reEnableAllKeys}>
+                    <RotateCcw className="h-4 w-4" />
+                    全部启用
+                  </Button>
+                ) : null}
+                <Button variant="outline" size="sm" type="button" onClick={addKeyRow}>
+                  <Plus className="h-4 w-4" />
+                  添加 Key
+                </Button>
+              </div>
             </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="p-key">API Key {form.id ? '' : '*'}</Label>
-              <Input
-                id="p-key"
-                type="password"
-                autoComplete="new-password"
-                value={form.api_key}
-                onChange={(event) => setForm({ ...form, api_key: event.target.value })}
-                placeholder={form.id ? '留空表示不修改当前凭证' : '供应商的真实 API Key'}
-              />
-            </div>
+
+            {form.keys.length === 0 ? (
+              <p className="py-2 text-center text-xs text-slate-500">还没有 API Key：至少添加一个并启用。</p>
+            ) : (
+              <div className="grid max-h-72 gap-2 overflow-y-auto pr-1">
+                {form.keys.map((row, index) => (
+                  <div key={row.keyId ?? `new-${index}`} className="grid gap-1.5 rounded border border-slate-100 p-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Input
+                        className="w-36"
+                        value={row.label}
+                        onChange={(event) => updateKeyRow(index, { label: event.target.value })}
+                        placeholder="备注名（可选）"
+                      />
+                      <Input
+                        className="min-w-[200px] flex-1"
+                        type="password"
+                        autoComplete="new-password"
+                        value={row.apiKey}
+                        onChange={(event) => updateKeyRow(index, { apiKey: event.target.value })}
+                        placeholder={
+                          row.keyId
+                            ? `留空保持不变（当前 ${row.hint ?? '已保存'}）`
+                            : '粘贴供应商的真实 API Key'
+                        }
+                      />
+                      <div className="flex items-center gap-1.5 text-xs text-slate-600">
+                        <Switch
+                          checked={row.enabled}
+                          onCheckedChange={(checked) => updateKeyRow(index, { enabled: checked })}
+                        />
+                        启用
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        type="button"
+                        onClick={() => void testKeyRow(index)}
+                        disabled={testingKeyIndex === index}
+                      >
+                        {testingKeyIndex === index ? (
+                          <RefreshCw className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Plug className="h-4 w-4" />
+                        )}
+                        测试
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        type="button"
+                        className="text-red-600 hover:bg-red-50"
+                        onClick={() => removeKeyRow(index)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        删除
+                      </Button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                      {row.keyId ? (
+                        <span className="font-mono">{row.hint}</span>
+                      ) : (
+                        <span>尚未保存（保存后生成掩码）</span>
+                      )}
+                      {row.autoDisabled ? (
+                        <Badge variant="danger" title={row.disabledReason ?? row.lastError ?? ''}>
+                          已自动停用
+                        </Badge>
+                      ) : null}
+                      {row.failureCount ? <span className="text-red-600">失败 {row.failureCount} 次</span> : null}
+                      {row.month30Tokens ? <span>近 30 天 {row.month30Tokens} tokens</span> : null}
+                      {row.lastError ? (
+                        <span className="max-w-[420px] truncate" title={row.lastError}>
+                          最近错误：{row.lastError}
+                        </span>
+                      ) : null}
+                      {row.testMessage ? <span className="text-sky-700">{row.testMessage}</span> : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="grid gap-2 rounded-md border border-slate-200 p-3">
@@ -716,7 +987,7 @@ export function ProvidersPage() {
                   size="sm"
                   onClick={startFetchModels}
                   disabled={fetchModels.isPending}
-                  title="按上方填写的 Base URL 与 API Key 拉取上游 /models"
+                  title="按上方填写的 Base URL 与 API Key（按顺序尝试）拉取上游 /models"
                 >
                   {fetchModels.isPending ? (
                     <RefreshCw className="h-4 w-4 animate-spin" />
@@ -730,7 +1001,7 @@ export function ProvidersPage() {
 
             {!form.id ? (
               <p className="text-xs text-amber-700">
-                无需先保存：填好 Base URL 与 API Key 即可点「拉取模型」，勾选后再点底部「保存」写入。
+                无需先保存：填好 Base URL 与至少一个 API Key 即可点「拉取模型」，勾选后再点底部「保存」写入。
               </p>
             ) : null}
 

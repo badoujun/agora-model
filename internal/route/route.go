@@ -13,6 +13,9 @@ var (
 	ErrModelNotFound = errors.New("模型未被任何启用的供应商声明")
 	// ErrProviderDisabled 命名空间命中的供应商已停用。
 	ErrProviderDisabled = errors.New("供应商已停用")
+	// ErrProviderNoKey 命名空间命中的供应商没有可用的 API Key
+	// （全部停用，或被网关因凭证类失败自动停用）。
+	ErrProviderNoKey = errors.New("供应商没有可用的 API Key")
 )
 
 // Result 是一次成功的路由决策。
@@ -45,6 +48,9 @@ func Resolve(snap *config.Snapshot, model string) (Result, error) {
 			if !p.IsEnabled() {
 				return Result{}, fmt.Errorf("%w：%s", ErrProviderDisabled, p.Name)
 			}
+			if !p.HasUsableKey() {
+				return Result{}, fmt.Errorf("%w：%s（可能已全部被自动停用，请在供应商页重新启用）", ErrProviderNoKey, p.Name)
+			}
 			real, known := p.RealModel(rest)
 			if !known {
 				return Result{}, fmt.Errorf("%w：供应商 %s 未提供模型 %q", ErrModelNotFound, p.Name, rest)
@@ -64,9 +70,18 @@ func Resolve(snap *config.Snapshot, model string) (Result, error) {
 			ErrModelNotFound, model)
 	}
 
+	var noKeyProvider *config.Provider
 	for _, p := range providers {
 		real, known := p.RealModel(model)
 		if !known {
+			continue
+		}
+		// 没有可用 Key 的供应商不参与聚合路由（含被自动停用的场景）；
+		// 记下来，便于在"唯一声明者也用不了"时给出明确的 503 而不是笼统的 404。
+		if !p.HasUsableKey() {
+			if noKeyProvider == nil {
+				noKeyProvider = p
+			}
 			continue
 		}
 		upstream := p.Endpoint()
@@ -74,6 +89,9 @@ func Resolve(snap *config.Snapshot, model string) (Result, error) {
 			continue // Normalize 已保证非空，这里仅防御
 		}
 		return Result{Provider: p, Model: real, Upstream: upstream}, nil
+	}
+	if noKeyProvider != nil {
+		return Result{}, fmt.Errorf("%w：%s（可能已全部被自动停用，请在供应商页重新启用）", ErrProviderNoKey, noKeyProvider.Name)
 	}
 	return Result{}, fmt.Errorf("%w：%q", ErrModelNotFound, model)
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ func TestNormalizeDefaults(t *testing.T) {
 		Providers: []Provider{{
 			ID:            " a ",
 			OpenAIBaseURL: "http://upstream.example/v1/",
+			APIKey:        " sk-test ",
 			Models:        []string{"m1", " m1 ", "", "m2"},
 			ModelAliases:  map[string]string{"m1": " 我的模型 ", "m2": "   ", "ghost": "x"},
 		}},
@@ -66,6 +68,16 @@ func TestNormalizeDefaults(t *testing.T) {
 	}
 	if got := p.ModelsEndpoint(); got != "http://upstream.example/v1/models" {
 		t.Errorf("models endpoint = %q", got)
+	}
+	// 旧单凭证字段应折叠为唯一的一个启用 Key，且运行期不再保留明文旧字段
+	if p.APIKey != "" {
+		t.Errorf("APIKey 应在归一化后清空，得到 %q", p.APIKey)
+	}
+	if len(p.APIKeys) != 1 || p.APIKeys[0].Key != "sk-test" || !p.APIKeys[0].IsEnabled() {
+		t.Errorf("APIKeys = %#v", p.APIKeys)
+	}
+	if len(p.UsableKeys()) != 1 || !p.HasUsableKey() {
+		t.Errorf("UsableKeys = %#v", p.UsableKeys())
 	}
 }
 
@@ -146,35 +158,35 @@ func TestNormalizeErrors(t *testing.T) {
 		{
 			name: "供应商 id 重复",
 			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
-				{ID: "dup", Name: "a", OpenAIBaseURL: "http://x/v1"},
-				{ID: "dup", Name: "b", OpenAIBaseURL: "http://y/v1"},
+				{ID: "dup", Name: "a", OpenAIBaseURL: "http://x/v1", APIKey: "sk-a"},
+				{ID: "dup", Name: "b", OpenAIBaseURL: "http://y/v1", APIKey: "sk-b"},
 			}},
 			want: "id 重复",
 		},
 		{
 			name: "供应商名称重复",
 			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
-				{ID: "a", Name: "同名", OpenAIBaseURL: "http://x/v1"},
-				{ID: "b", Name: " 同名 ", OpenAIBaseURL: "http://y/v1"},
+				{ID: "a", Name: "同名", OpenAIBaseURL: "http://x/v1", APIKey: "sk-a"},
+				{ID: "b", Name: " 同名 ", OpenAIBaseURL: "http://y/v1", APIKey: "sk-b"},
 			}},
 			want: "供应商名称重复",
 		},
 		{
 			name: "供应商未配置上游地址",
-			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{{ID: "a", Name: "a"}}},
+			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{{ID: "a", Name: "a", APIKey: "sk-a"}}},
 			want: "必须配置 openai_base_url",
 		},
 		{
 			name: "URL scheme 非法",
 			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
-				{ID: "a", Name: "a", OpenAIBaseURL: "ftp://x/v1"},
+				{ID: "a", Name: "a", OpenAIBaseURL: "ftp://x/v1", APIKey: "sk-a"},
 			}},
 			want: "仅支持 http/https",
 		},
 		{
 			name: "别名冲突",
 			file: File{Gateway: Gateway{APIKey: "k"}, Providers: []Provider{
-				{ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1",
+				{ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1", APIKey: "sk-a",
 					Models: []string{"m1", "m2"}, ModelAliases: map[string]string{"m2": "m1"}},
 			}},
 			want: "重复",
@@ -211,9 +223,9 @@ func TestSnapshotOrderingByNameAndDisabled(t *testing.T) {
 	f := File{
 		Gateway: Gateway{APIKey: "k"},
 		Providers: []Provider{
-			{ID: "late", Name: "Beta", OpenAIBaseURL: "http://x/v1", Models: []string{"m"}},
-			{ID: "off", Name: "Alpha", OpenAIBaseURL: "http://x/v1", Models: []string{"m"}, Enabled: boolPtr(false)},
-			{ID: "early", Name: "Delta", OpenAIBaseURL: "http://x/v1", Models: []string{"m"}},
+			{ID: "late", Name: "Beta", OpenAIBaseURL: "http://x/v1", APIKey: "sk-b", Models: []string{"m"}},
+			{ID: "off", Name: "Alpha", OpenAIBaseURL: "http://x/v1", APIKey: "sk-a", Models: []string{"m"}, Enabled: boolPtr(false)},
+			{ID: "early", Name: "Delta", OpenAIBaseURL: "http://x/v1", APIKey: "sk-d", Models: []string{"m"}},
 		},
 	}
 	snap, err := NewSnapshot(f)
@@ -246,6 +258,7 @@ func TestLoadFileAndHolder(t *testing.T) {
 	body := `{
 	  "gateway": {"api_key": "gw-1", "port": 1234},
 	  "providers": [{"id": "p1", "name": "供应商 1", "openai_base_url": "http://x/v1",
+	                 "api_key": "sk-1",
 	                 "models": ["m"], "model_aliases": {"m": "别名M"}}]
 	}`
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -326,24 +339,123 @@ func TestAllowEmptyProvidersForRuntimeSnapshot(t *testing.T) {
 
 func TestNormalizeAllowEmptyStillValidatesOtherFields(t *testing.T) {
 	// 「允许空」只针对供应商数量，其它校验一个都不能松
-	if _, err := (File{Providers: []Provider{{ID: "a", Name: "a"}}}).NormalizeAllowEmpty(); err == nil {
+	if _, err := (File{Providers: []Provider{{ID: "a", Name: "a", APIKey: "sk-a"}}}).NormalizeAllowEmpty(); err == nil {
 		t.Fatal("缺上游地址仍应报错")
 	}
 	if _, err := (File{Providers: []Provider{
-		{ID: "dup", Name: "a", OpenAIBaseURL: "http://x/v1"},
-		{ID: "dup", Name: "b", OpenAIBaseURL: "http://y/v1"},
+		{ID: "dup", Name: "a", OpenAIBaseURL: "http://x/v1", APIKey: "sk-a"},
+		{ID: "dup", Name: "b", OpenAIBaseURL: "http://y/v1", APIKey: "sk-b"},
 	}}).NormalizeAllowEmpty(); err == nil {
 		t.Fatal("id 重复仍应报错")
 	}
 
 	// 全部停用：严格模式拒绝，宽松模式放行（用户可能先停用、稍后再启用）
 	disabled := File{Providers: []Provider{
-		{ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1", Enabled: boolPtr(false)},
+		{ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1", APIKey: "sk-a", Enabled: boolPtr(false)},
 	}}
 	if _, err := disabled.Normalize(); !errors.Is(err, ErrNoProviders) {
 		t.Fatalf("Normalize 应拒绝全部停用的供应商，得到 %v", err)
 	}
 	if _, err := disabled.NormalizeAllowEmpty(); err != nil {
 		t.Fatalf("NormalizeAllowEmpty 应放行全部停用的供应商: %v", err)
+	}
+}
+
+// TestCleanKeysKeepOrderAndFlagDisabled 覆盖多凭证的归一化：
+// 顺序即轮询顺序，停用的 Key 不进入 usableKeys，旧 api_key 与 keys 不会同时生效。
+func TestCleanKeysKeepOrderAndFlagDisabled(t *testing.T) {
+	p := Provider{
+		ID:            "p",
+		OpenAIBaseURL: "http://x/v1",
+		APIKey:        "sk-legacy", // 与 keys 同时给出时，keys 优先
+		APIKeys: []ProviderKey{
+			{ID: "k1", Label: " 主账号 ", Key: " sk-1 "},
+			{ID: "k2", Label: "备用", Key: "sk-2", Enabled: boolPtr(false)},
+			{ID: "k3", Key: "  "},   // 空占位行（有 id 无明文）保留，由存储层沿用密文
+			{Label: "", Key: "   "}, // 既无 id 又无明文 → 丢弃
+			{Label: "新", Key: "sk-3"},
+		},
+	}
+	p.CleanSelection()
+
+	if p.APIKey != "" {
+		t.Errorf("旧字段应被清空: %q", p.APIKey)
+	}
+	if len(p.APIKeys) != 4 {
+		t.Fatalf("应保留 4 个 Key（丢弃空占位行），得到 %#v", p.APIKeys)
+	}
+	if p.APIKeys[0].Label != "主账号" || p.APIKeys[0].Key != "sk-1" {
+		t.Errorf("应去空白且保持顺序: %#v", p.APIKeys[0])
+	}
+	usable := p.UsableKeys()
+	if len(usable) != 2 || usable[0].Key != "sk-1" || usable[1].Key != "sk-3" {
+		t.Fatalf("usableKeys 应只含启用且有明文的 Key: %#v", usable)
+	}
+}
+
+// TestCleanKeysFoldsLegacyOnly 覆盖 guidance：只有 api_key 时折叠为单个「默认」Key。
+func TestCleanKeysFoldsLegacyOnly(t *testing.T) {
+	p := Provider{ID: "p", APIKey: "sk-only"}
+	p.CleanSelection()
+	if len(p.APIKeys) != 1 || p.APIKeys[0].Key != "sk-only" || p.APIKeys[0].Label != "默认" {
+		t.Fatalf("旧单凭证应折叠为默认 Key: %#v", p.APIKeys)
+	}
+	if !p.HasUsableKey() {
+		t.Error("折叠后应有可用 Key")
+	}
+}
+
+// TestValidateKeysRules 覆盖结构校验：数量不设上限、拒绝重复明文与超长备注名。
+func TestValidateKeysRules(t *testing.T) {
+	// 不设上限：500 个 Key 必须通过
+	many := Provider{ID: "p", Name: "p"}
+	for i := 0; i < 500; i++ {
+		many.APIKeys = append(many.APIKeys, ProviderKey{Key: fmt.Sprintf("sk-%d", i)})
+	}
+	if err := many.ValidateKeys(); err != nil {
+		t.Fatalf("Key 数量不应设上限: %v", err)
+	}
+
+	dup := Provider{ID: "p", Name: "p", APIKeys: []ProviderKey{{Key: "sk-same"}, {Key: " sk-same "}}}
+	dup.CleanSelection()
+	if err := dup.ValidateKeys(); err == nil || !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("重复明文应被拒绝，得到 %v", err)
+	}
+
+	long := Provider{ID: "p", Name: "p", APIKeys: []ProviderKey{{Label: strings.Repeat("长", MaxProviderKeyLabelLen+1), Key: "sk-1"}}}
+	long.CleanSelection()
+	if err := long.ValidateKeys(); err == nil || !strings.Contains(err.Error(), "过长") {
+		t.Fatalf("超长备注名应被拒绝，得到 %v", err)
+	}
+
+	empty := Provider{ID: "p", Name: "p"}
+	empty.CleanSelection()
+	if err := empty.ValidateKeys(); err == nil {
+		t.Fatal("没有任何 Key 应被拒绝")
+	}
+
+	noneEnabled := Provider{ID: "p", Name: "p", APIKeys: []ProviderKey{{Key: "sk-1", Enabled: boolPtr(false)}}}
+	noneEnabled.CleanSelection()
+	if err := noneEnabled.ValidateKeys(); err != nil {
+		t.Fatalf("结构校验不应拒绝全部停用: %v", err)
+	}
+	if err := noneEnabled.ValidateEnabledKeys(); err == nil || !strings.Contains(err.Error(), "至少需要启用一个") {
+		t.Fatalf("全部停用应被 ValidateEnabledKeys 拒绝，得到 %v", err)
+	}
+}
+
+// TestNormalizeRequiresEnabledKeyForBootstrap 覆盖引导配置的严格性：
+// 写了供应商却把 Key 全部停用，几乎一定是配错了。
+func TestNormalizeRequiresEnabledKeyForBootstrap(t *testing.T) {
+	f := File{Providers: []Provider{{
+		ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1",
+		APIKeys: []ProviderKey{{Key: "sk-1", Enabled: boolPtr(false)}},
+	}}}
+	if _, err := f.Normalize(); err == nil {
+		t.Fatal("引导配置中全部 Key 停用应被拒绝")
+	}
+	// 运行时快照是宽松的（自动停用可能让某供应商暂时没有启用 Key）
+	if _, err := f.NormalizeAllowEmpty(); err != nil {
+		t.Fatalf("运行时快照不应拒绝全部 Key 停用: %v", err)
 	}
 }

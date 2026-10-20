@@ -36,6 +36,29 @@ var (
 	ErrNoProviders = errors.New("未配置任何启用的供应商（providers[].enabled 需为 true）")
 )
 
+// MaxProviderKeyLabelLen 是单个 API Key 备注名的最大长度（按 rune 计）。
+//
+// Key 数量刻意**不设上限**：一个供应商可以配置任意多个凭证。
+const MaxProviderKeyLabelLen = 64
+
+// ProviderKey 是供应商的一个上游凭证。
+//
+// 一个供应商可以配置任意多个 Key：数据面按顺序轮询，凭证类失败时自动切换，
+// 并把失败的 Key 自动停用（见 docs/DESIGN.md §7.10）。
+type ProviderKey struct {
+	// ID 是已有 Key 的记录 id；新增时留空，由存储层生成（pk_<hex>）。
+	ID string `json:"id,omitempty"`
+	// Label 是备注名（如「主账号」「备用1」），仅用于展示。
+	Label string `json:"label"`
+	// Key 是明文凭证。编辑既有 Key 时留空表示"沿用原密文"。
+	Key string `json:"api_key"`
+	// Enabled 为 nil 时视为启用。
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// IsEnabled 报告该 Key 是否启用（缺省视为启用）。
+func (k ProviderKey) IsEnabled() bool { return k.Enabled == nil || *k.Enabled }
+
 // Provider 是一个上游供应商的接入配置（OpenAI 兼容协议）。
 //
 // Phase 1 由 JSON 引导配置提供；Phase 2 起改由 SQLite 构建快照（字段语义不变）。
@@ -46,7 +69,11 @@ type Provider struct {
 	OpenAIEndpointOverride string `json:"openai_endpoint_override"`
 	// WebsiteURL 是供应商官网地址，仅用于在控制台展示与跳转，不参与转发。
 	WebsiteURL string `json:"website_url"`
-	APIKey     string `json:"api_key"`
+	// APIKey 是**兼容字段**：只用于读取旧的引导配置 / 旧导出文件。
+	// 归一化时会折叠进 APIKeys，运行期（路由、转发、连接测试）一律不再读取它。
+	APIKey string `json:"api_key"`
+	// APIKeys 是该供应商的凭证列表；顺序即轮询顺序与展示顺序。
+	APIKeys []ProviderKey `json:"keys"`
 	// Models 是**已启用**的上游模型名（在供应商编辑页从拉取结果中勾选），顺序即展示顺序。
 	Models []string `json:"models"`
 	// ModelAliases 把上游模型名映射为对外别名；别名即 Agent 请求时使用的模型名。
@@ -56,10 +83,42 @@ type Provider struct {
 	ExtraBody      map[string]any    `json:"extra_body"`
 	AllowInternal  bool              `json:"allow_internal"`
 	Enabled        *bool             `json:"enabled"`
+
+	// usableKeys 是 CleanKeys 预计算的「启用且有明文」的 Key 切片。
+	//
+	// 数据面热路径直接读它，避免每个请求都重新过滤/分配（DESIGN §7.10）。
+	// 它随 Provider 值一起进入不可变快照，运行期不再变化。
+	usableKeys []ProviderKey
+	// keysReady 表示 usableKeys 已经算过（CleanKeys 之后为 true）。
+	// 未归一化的临时 Provider（测试/草稿）在 UsableKeys 里走冷路径现算。
+	keysReady bool
 }
 
 // IsEnabled 报告该供应商是否启用（缺省视为启用）。
 func (p *Provider) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+
+// UsableKeys 返回该供应商可用于转发的 Key（顺序即轮询顺序）。
+//
+// 归一化过的 Provider 返回预计算切片（热路径零分配，调用方**不得修改**）；
+// 未归一化的临时对象（测试/草稿）现算一次，不写接收者以免并发读写竞争。
+func (p *Provider) UsableKeys() []ProviderKey {
+	if p == nil {
+		return nil
+	}
+	if !p.keysReady {
+		// 未归一化的临时对象：现算一次，并兼容只填了旧 api_key 字段的调用方。
+		keys := p.APIKeys
+		if len(keys) == 0 && strings.TrimSpace(p.APIKey) != "" {
+			enabled := true
+			keys = []ProviderKey{{Label: "默认", Key: strings.TrimSpace(p.APIKey), Enabled: &enabled}}
+		}
+		return enabledKeys(keys)
+	}
+	return p.usableKeys
+}
+
+// HasUsableKey 报告该供应商是否有至少一个可用于转发的 Key。
+func (p *Provider) HasUsableKey() bool { return len(p.UsableKeys()) > 0 }
 
 // Endpoint 返回上游对话接口的完整 URL；空字符串表示未配置。
 func (p *Provider) Endpoint() string {
@@ -124,6 +183,7 @@ func (p *Provider) ExposedModels() []string {
 
 // CleanSelection 规整模型选择与别名：去空白、去重，并丢弃未勾选模型的别名。
 func (p *Provider) CleanSelection() {
+	p.CleanKeys()
 	p.Models = cleanStrings(p.Models)
 	if len(p.ModelAliases) == 0 {
 		p.ModelAliases = nil
@@ -147,6 +207,91 @@ func (p *Provider) CleanSelection() {
 		return
 	}
 	p.ModelAliases = aliases
+}
+
+// CleanKeys 规整凭证列表：
+//   - 旧版单凭证字段 api_key 折叠为唯一的一个 Key（label「默认」），之后清空该字段；
+//   - 去首尾空白；丢弃「既没有 id 也没有明文」的空占位行（UI 新增后未填写）；
+//   - 重算热路径使用的 usableKeys（启用且有明文）。
+func (p *Provider) CleanKeys() {
+	in := p.APIKeys
+	if len(in) == 0 && strings.TrimSpace(p.APIKey) != "" {
+		enabled := true
+		in = []ProviderKey{{Label: "默认", Key: strings.TrimSpace(p.APIKey), Enabled: &enabled}}
+	}
+	// 运行期不再读取旧字段：归一化后它一定是空的。
+	p.APIKey = ""
+
+	out := make([]ProviderKey, 0, len(in))
+	for _, k := range in {
+		k.ID = strings.TrimSpace(k.ID)
+		k.Label = strings.TrimSpace(k.Label)
+		k.Key = strings.TrimSpace(k.Key)
+		if k.ID == "" && k.Key == "" {
+			continue
+		}
+		out = append(out, k)
+	}
+	p.APIKeys = out
+	p.recomputeUsableKeys()
+}
+
+// recomputeUsableKeys 重算数据面热路径使用的 Key 切片（顺序即轮询顺序）。
+//
+// 返回的切片由 CleanKeys 一次性构建、之后不再修改；请求路径只读，零分配。
+func (p *Provider) recomputeUsableKeys() {
+	p.usableKeys = enabledKeys(p.APIKeys)
+	p.keysReady = true
+}
+
+// enabledKeys 过滤出「启用且有明文」的 Key（保持顺序）。
+func enabledKeys(keys []ProviderKey) []ProviderKey {
+	var out []ProviderKey
+	for _, k := range keys {
+		if k.IsEnabled() && k.Key != "" {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// ValidateKeys 校验凭证列表的结构合法性（不检查「至少一个启用」——
+// 那条规则需要知道库里已有凭证，见 store.SaveProvider）。
+func (p *Provider) ValidateKeys() error {
+	if len(p.APIKeys) == 0 {
+		return fmt.Errorf("供应商 %s 至少需要一个 API Key", p.displayRef())
+	}
+	seen := make(map[string]int, len(p.APIKeys))
+	for i, k := range p.APIKeys {
+		if n := len([]rune(k.Label)); n > MaxProviderKeyLabelLen {
+			return fmt.Errorf("供应商 %s 的第 %d 个 API Key 备注名过长（%d 个字符，最多 %d 个）",
+				p.displayRef(), i+1, n, MaxProviderKeyLabelLen)
+		}
+		if k.Key == "" {
+			if k.ID == "" {
+				return fmt.Errorf("供应商 %s 的第 %d 个 API Key 为空", p.displayRef(), i+1)
+			}
+			continue // 有 id 无明文：表示沿用库中密文，由存储层校验归属
+		}
+		if prev, dup := seen[k.Key]; dup {
+			return fmt.Errorf("供应商 %s 的第 %d 个 API Key 与第 %d 个重复", p.displayRef(), i+1, prev)
+		}
+		seen[k.Key] = i + 1
+	}
+	return nil
+}
+
+// ValidateEnabledKeys 校验至少存在一个启用的 Key。
+//
+// 仅在「凭证明文都在手上的场景」使用（引导配置、运行时快照）；
+// 保存路径需要先由存储层把「有 id 无明文」解析为库中密文，再判断。
+func (p *Provider) ValidateEnabledKeys() error {
+	for _, k := range p.APIKeys {
+		if k.IsEnabled() {
+			return nil
+		}
+	}
+	return fmt.Errorf("供应商 %s 至少需要启用一个 API Key（如需整体停用请停用供应商）", p.displayRef())
 }
 
 // ValidateModelSelection 校验勾选的模型与别名的合法性。
@@ -292,6 +437,16 @@ func (f File) normalize(requireProviders bool) (File, error) {
 		}
 		if err := p.ValidateModelSelection(); err != nil {
 			return File{}, err
+		}
+		if err := p.ValidateKeys(); err != nil {
+			return File{}, err
+		}
+		if requireProviders {
+			// 引导配置由人手写：要求每个供应商确实有可用凭证，避免把空配置带进库。
+			// 运行时快照不强校验（自动停用可能让某供应商暂时没有启用 Key，见 DESIGN §7.10）。
+			if err := p.ValidateEnabledKeys(); err != nil {
+				return File{}, err
+			}
 		}
 		if p.IsEnabled() {
 			enabled++

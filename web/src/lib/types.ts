@@ -1,5 +1,31 @@
 // 与后端 internal/api 的 DTO 一一对应（字段名不可随意改动）
 
+/** 供应商的单个 API Key（永不回传明文）。 */
+export interface ProviderKeyDTO {
+  id: string
+  label: string
+  api_key_hint: string
+  enabled: boolean
+  /** 是否为网关因凭证类失败自动停用 */
+  auto_disabled: boolean
+  /** 自动停用原因（仅 auto_disabled 为真时有值） */
+  disabled_reason?: string
+  created_at?: string
+  updated_at?: string
+}
+
+/** 单个 Key 的运行期统计（易变，导出文件里不含）。 */
+export interface KeyStatsDTO {
+  last_used_at?: string
+  failure_count: number
+  last_failure_at?: string
+  last_error?: string
+  today_tokens: number
+  week7_tokens: number
+  month30_tokens: number
+  month30_requests: number
+}
+
 export interface ProviderDTO {
   id: string
   name: string
@@ -7,7 +33,12 @@ export interface ProviderDTO {
   openai_endpoint_override: string
   /** 供应商官网地址（仅展示/跳转用，可留空） */
   website_url: string
+  /** 兼容字段：首个启用 Key 的掩码 */
   api_key_hint: string
+  /** 该供应商的全部凭证（顺序即轮询顺序） */
+  keys: ProviderKeyDTO[]
+  /** key_id -> 运行期统计 */
+  key_stats?: Record<string, KeyStatsDTO>
   /** 已勾选启用的上游模型名（顺序即展示顺序） */
   models_selected: string[]
   /** 上游模型名 -> 对外别名 */
@@ -26,6 +57,15 @@ export interface ProviderDTO {
   last_fetch_error?: string
 }
 
+/** 创建/更新请求里的单个凭证；id 为空表示新增（必须给明文）。 */
+export interface ProviderKeyInput {
+  id?: string
+  label?: string
+  /** 编辑既有 Key 时留空表示沿用原密文 */
+  api_key?: string
+  enabled?: boolean
+}
+
 export interface ProviderInput {
   id?: string
   name: string
@@ -33,8 +73,10 @@ export interface ProviderInput {
   openai_endpoint_override?: string
   /** 供应商官网地址；编辑时传空串表示清空，不传表示沿用原值 */
   website_url?: string
-  /** 编辑时留空表示不修改凭证 */
+  /** 兼容字段：单凭证的旧写法；新前端一律走 keys */
   api_key?: string
+  /** 凭证集合；不传表示不改动，传空数组/完整列表表示全量替换 */
+  keys?: ProviderKeyInput[]
   models_selected?: string[]
   model_aliases?: Record<string, string>
   timeout_seconds?: number
@@ -44,14 +86,24 @@ export interface ProviderInput {
   enabled?: boolean
 }
 
-/** 尚未保存的供应商（草稿）拉取模型候选的请求体 */
+/** 草稿（尚未保存）供应商的单个凭证 */
+export interface DraftKeyInput {
+  label?: string
+  api_key: string
+  enabled?: boolean
+}
+
+/** 尚未保存的供应商（草稿）拉取模型候选 / 测试凭证的请求体 */
 export interface DraftFetchInput {
   openai_base_url: string
   openai_endpoint_override?: string
-  api_key: string
+  /** 兼容字段：单 Key */
+  api_key?: string
+  keys?: DraftKeyInput[]
   extra_headers?: Record<string, string>
   timeout_seconds?: number
   allow_internal?: boolean
+  models_selected?: string[]
 }
 
 /** /api/export 的响应：providers[].api_key 是明文（换机迁移用） */
@@ -63,6 +115,18 @@ export interface ProviderExportPayload {
   notes?: Record<string, string>
 }
 
+/** 单个 Key 的连接测试结果 */
+export interface KeyTestResult {
+  key_id: string
+  label?: string
+  hint?: string
+  ok: boolean
+  status_code?: number
+  latency_ms: number
+  message: string
+  model_count?: number
+}
+
 export interface TestResult {
   ok: boolean
   status_code: number
@@ -70,6 +134,8 @@ export interface TestResult {
   message: string
   model_count?: number
   checked_at: string
+  /** 实际尝试过的 Key（多 Key 时逐个尝试，首个成功即停止） */
+  keys?: KeyTestResult[]
 }
 
 export interface ModelItem {
@@ -89,6 +155,8 @@ export interface LogItem {
   inbound_protocol: string
   model: string
   provider_id: string
+  /** 实际服务该请求的供应商 Key 掩码 */
+  key_hint?: string
   upstream_url: string
   status_code: number
   latency_ms: number

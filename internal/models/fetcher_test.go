@@ -119,3 +119,66 @@ func TestFetchRequiresBaseURL(t *testing.T) {
 		t.Fatal("端点覆盖模式下应拒绝拉取模型")
 	}
 }
+
+// TestFetchFallsOverAcrossKeys 覆盖多凭证拉取：首个 401 时换下一个 Key。
+func TestFetchFallsOverAcrossKeys(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer sk-good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"invalid key"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1"}]}`))
+	}))
+	defer upstream.Close()
+
+	enabled := true
+	p := config.Provider{
+		ID:            "p",
+		OpenAIBaseURL: upstream.URL + "/v1",
+		APIKeys: []config.ProviderKey{
+			{ID: "k1", Key: "sk-bad", Enabled: &enabled},
+			{ID: "k2", Key: "sk-good", Enabled: &enabled},
+		},
+	}
+	p.CleanSelection()
+
+	got, err := NewFetcher().Fetch(context.Background(), p)
+	if err != nil {
+		t.Fatalf("应回退到第二个 Key: %v", err)
+	}
+	if len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("候选模型 = %v", got)
+	}
+}
+
+// TestFetchAllKeysFailReportsEachKey 覆盖全部失败时错误里能看出是哪些 Key 失败。
+func TestFetchAllKeysFailReportsEachKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	enabled := true
+	p := config.Provider{
+		ID:            "p",
+		OpenAIBaseURL: upstream.URL + "/v1",
+		APIKeys: []config.ProviderKey{
+			{ID: "k1", Key: "sk-aaaa1111", Enabled: &enabled},
+			{ID: "k2", Key: "sk-bbbb2222", Enabled: &enabled},
+		},
+	}
+	p.CleanSelection()
+
+	_, err := NewFetcher().Fetch(context.Background(), p)
+	if err == nil {
+		t.Fatal("全部 Key 失败应报错")
+	}
+	if !strings.Contains(err.Error(), "全部 2 个 API Key") {
+		t.Fatalf("错误应说明尝试了几个 Key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "sk-****1111") || !strings.Contains(err.Error(), "sk-****2222") {
+		t.Fatalf("错误应包含每个 Key 的掩码: %v", err)
+	}
+}

@@ -19,38 +19,80 @@ import (
 // defaultTimeoutSeconds 与 config 包保持一致。
 const defaultTimeoutSeconds = 120
 
-// providerDTO 是对外的供应商表示：凭证只输出掩码。
+// providerKeyDTO 是单个凭证的对外表示（永不回传明文）。
+type providerKeyDTO struct {
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	APIKeyHint   string `json:"api_key_hint"`
+	Enabled      bool   `json:"enabled"`
+	AutoDisabled bool   `json:"auto_disabled"`
+	// DisabledReason 仅在自动停用时非空（网关记录的原因，已脱敏）。
+	DisabledReason string `json:"disabled_reason,omitempty"`
+	CreatedAt      string `json:"created_at,omitempty"`
+	UpdatedAt      string `json:"updated_at,omitempty"`
+}
+
+// keyStatsDTO 是单个凭证的运行期统计（易变，不参与导出与 WebDAV 指纹）。
+type keyStatsDTO struct {
+	LastUsedAt      string `json:"last_used_at,omitempty"`
+	FailureCount    int64  `json:"failure_count"`
+	LastFailureAt   string `json:"last_failure_at,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
+	TodayTokens     int64  `json:"today_tokens"`
+	Week7Tokens     int64  `json:"week7_tokens"`
+	Month30Tokens   int64  `json:"month30_tokens"`
+	Month30Requests int64  `json:"month30_requests"`
+}
+
+// providerDTO 是对外的供应商表示：凭证只输出掩码与运行期统计。
 type providerDTO struct {
-	ID                     string            `json:"id"`
-	Name                   string            `json:"name"`
-	OpenAIBaseURL          string            `json:"openai_base_url"`
-	OpenAIEndpointOverride string            `json:"openai_endpoint_override"`
-	WebsiteURL             string            `json:"website_url"`
-	APIKeyHint             string            `json:"api_key_hint"`
-	ModelsSelected         []string          `json:"models_selected"`
-	ModelAliases           map[string]string `json:"model_aliases"`
-	ExposedModels          []string          `json:"exposed_models"`
-	TimeoutSeconds         int               `json:"timeout_seconds"`
-	ExtraHeaders           map[string]string `json:"extra_headers,omitempty"`
-	ExtraBody              map[string]any    `json:"extra_body,omitempty"`
-	AllowInternal          bool              `json:"allow_internal"`
-	Enabled                bool              `json:"enabled"`
-	ModelCount             int               `json:"model_count"`
+	ID                     string `json:"id"`
+	Name                   string `json:"name"`
+	OpenAIBaseURL          string `json:"openai_base_url"`
+	OpenAIEndpointOverride string `json:"openai_endpoint_override"`
+	WebsiteURL             string `json:"website_url"`
+	// APIKeyHint 是兼容字段：首个启用 Key 的掩码。
+	APIKeyHint     string                 `json:"api_key_hint"`
+	Keys           []providerKeyDTO       `json:"keys"`
+	KeyStats       map[string]keyStatsDTO `json:"key_stats,omitempty"`
+	ModelsSelected []string               `json:"models_selected"`
+	ModelAliases   map[string]string      `json:"model_aliases"`
+	ExposedModels  []string               `json:"exposed_models"`
+	TimeoutSeconds int                    `json:"timeout_seconds"`
+	ExtraHeaders   map[string]string      `json:"extra_headers,omitempty"`
+	ExtraBody      map[string]any         `json:"extra_body,omitempty"`
+	AllowInternal  bool                   `json:"allow_internal"`
+	Enabled        bool                   `json:"enabled"`
+	ModelCount     int                    `json:"model_count"`
 	// CandidateModels 是最近一次「拉取模型」得到的结果，供编辑页勾选。
 	CandidateModels []string `json:"candidate_models,omitempty"`
 	LastFetchAt     string   `json:"last_fetch_at,omitempty"`
 	LastFetchError  string   `json:"last_fetch_error,omitempty"`
 }
 
+// providerKeyInput 是创建/更新请求里的单个凭证。
+//
+//   - ID 为空表示新增（必须给明文 api_key）；
+//   - ID 非空表示沿用既有记录，api_key 留空即"不修改原密文"。
+type providerKeyInput struct {
+	ID      string  `json:"id"`
+	Label   string  `json:"label"`
+	APIKey  *string `json:"api_key"`
+	Enabled *bool   `json:"enabled"`
+}
+
 // providerInput 是创建/更新供应商的请求体。
 //
 // 指针字段用于区分「未提供」与「显式置零/置 false」。
 type providerInput struct {
-	ID                     string  `json:"id"`
-	Name                   string  `json:"name"`
-	OpenAIBaseURL          string  `json:"openai_base_url"`
-	OpenAIEndpointOverride string  `json:"openai_endpoint_override"`
-	APIKey                 *string `json:"api_key"`
+	ID                     string `json:"id"`
+	Name                   string `json:"name"`
+	OpenAIBaseURL          string `json:"openai_base_url"`
+	OpenAIEndpointOverride string `json:"openai_endpoint_override"`
+	// APIKey 是兼容字段：单凭证的旧请求/旧导出文件仍然可用。
+	APIKey *string `json:"api_key"`
+	// Keys 为 nil 表示"不改动凭证集合"；非 nil（含空数组）表示全量替换。
+	Keys []providerKeyInput `json:"keys"`
 	// WebsiteURL 使用指针：nil 表示未提供（沿用既有值），空串表示显式清空。
 	WebsiteURL     *string           `json:"website_url"`
 	ModelsSelected []string          `json:"models_selected"`
@@ -85,14 +127,45 @@ func exposedModels(rec store.ProviderRecord) []string {
 	return out
 }
 
-func toDTO(rec store.ProviderRecord, candidates []string) providerDTO {
-	return providerDTO{
+func toKeyDTO(k store.ProviderKeyRecord) providerKeyDTO {
+	return providerKeyDTO{
+		ID:             k.ID,
+		Label:          k.Label,
+		APIKeyHint:     k.KeyHint,
+		Enabled:        k.Enabled,
+		AutoDisabled:   k.AutoDisabled,
+		DisabledReason: k.DisabledReason,
+		CreatedAt:      formatOptionalTime(k.CreatedAt),
+		UpdatedAt:      formatOptionalTime(k.UpdatedAt),
+	}
+}
+
+// toDTO 把记录转换为对外 DTO；usages 为空表示不填充按 Key 用量（导出路径）。
+func toDTO(rec store.ProviderRecord, candidates []string, usages map[string]store.KeyUsageTotals) providerDTO {
+	keys := make([]providerKeyDTO, 0, len(rec.Keys))
+	stats := make(map[string]keyStatsDTO, len(rec.Keys))
+	for _, k := range rec.Keys {
+		keys = append(keys, toKeyDTO(k))
+		u := usages[k.ID]
+		stats[k.ID] = keyStatsDTO{
+			LastUsedAt:      formatOptionalTime(k.LastUsedAt),
+			FailureCount:    k.FailureCount,
+			LastFailureAt:   formatOptionalTime(k.LastFailureAt),
+			LastError:       k.LastError,
+			TodayTokens:     u.TodayTokens,
+			Week7Tokens:     u.Week7Tokens,
+			Month30Tokens:   u.Month30Tokens,
+			Month30Requests: u.Month30Requests,
+		}
+	}
+	dto := providerDTO{
 		ID:                     rec.ID,
 		Name:                   rec.Name,
 		OpenAIBaseURL:          rec.OpenAIBaseURL,
 		OpenAIEndpointOverride: rec.OpenAIEndpointOverride,
 		WebsiteURL:             rec.WebsiteURL,
-		APIKeyHint:             rec.APIKeyHint,
+		APIKeyHint:             rec.EnabledKeyHint(),
+		Keys:                   keys,
 		ModelsSelected:         rec.ModelsSelected,
 		ModelAliases:           rec.ModelAliases,
 		ExposedModels:          exposedModels(rec),
@@ -106,6 +179,10 @@ func toDTO(rec store.ProviderRecord, candidates []string) providerDTO {
 		LastFetchAt:            formatOptionalTime(rec.LastFetchAt),
 		LastFetchError:         rec.LastFetchError,
 	}
+	if len(stats) > 0 {
+		dto.KeyStats = stats
+	}
+	return dto
 }
 
 func formatOptionalTime(t time.Time) string {
@@ -132,7 +209,7 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 		if cerr != nil {
 			s.logger.Debug("读取候选模型失败", "provider", rec.ID, "err", cerr)
 		}
-		items = append(items, toDTO(rec, candidates))
+		items = append(items, toDTO(rec, candidates, s.keyUsage(ctx, rec.ID)))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -151,7 +228,17 @@ func (s *Server) handleGetProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidates, _, _ := s.store.LoadCandidateModels(ctx, rec.ID)
-	writeJSON(w, http.StatusOK, toDTO(rec, candidates))
+	writeJSON(w, http.StatusOK, toDTO(rec, candidates, s.keyUsage(ctx, rec.ID)))
+}
+
+// keyUsage 读取某供应商按 Key 的用量汇总；失败只记 debug（不影响主响应）。
+func (s *Server) keyUsage(ctx context.Context, providerID string) map[string]store.KeyUsageTotals {
+	usages, err := s.store.ProviderKeyUsageTotals(ctx, providerID)
+	if err != nil {
+		s.logger.Debug("读取按 Key 用量失败", "provider", providerID, "err", err)
+		return nil
+	}
+	return usages
 }
 
 func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
@@ -160,19 +247,11 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	apiKey := ""
-	if in.APIKey != nil {
-		apiKey = strings.TrimSpace(*in.APIKey)
-	}
-	if apiKey == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "创建供应商必须提供 api_key"})
-		return
-	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	rec, err := s.upsertProvider(ctx, in, apiKey)
+	rec, err := s.upsertProvider(ctx, in)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -180,7 +259,7 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	_ = s.applyReload(ctx)
 
 	refreshed, _ := s.store.GetProvider(ctx, rec.ID)
-	writeJSON(w, http.StatusCreated, toDTO(refreshed, nil))
+	writeJSON(w, http.StatusCreated, toDTO(refreshed, nil, nil))
 }
 
 func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
@@ -192,15 +271,10 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	in.ID = id
 
-	apiKey := ""
-	if in.APIKey != nil {
-		apiKey = strings.TrimSpace(*in.APIKey) // 空表示保持原值
-	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	if _, err := s.upsertProvider(ctx, in, apiKey); err != nil {
+	if _, err := s.upsertProvider(ctx, in); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "供应商不存在"})
 			return
@@ -216,7 +290,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidates, _, _ := s.store.LoadCandidateModels(ctx, id)
-	writeJSON(w, http.StatusOK, toDTO(rec, candidates))
+	writeJSON(w, http.StatusOK, toDTO(rec, candidates, s.keyUsage(ctx, id)))
 }
 
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
@@ -290,49 +364,64 @@ func (s *Server) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toDTO(rec, candidates))
+	writeJSON(w, http.StatusOK, toDTO(rec, candidates, s.keyUsage(ctx, p.ID)))
 }
 
-// draftFetchInput 是「尚未保存的供应商」拉取模型候选的请求体。
+// draftKeyInput 是草稿（尚未保存）供应商的一个凭证。
+type draftKeyInput struct {
+	Label   string `json:"label"`
+	APIKey  string `json:"api_key"`
+	Enabled *bool  `json:"enabled"`
+}
+
+// draftProviderInput 是「尚未保存的供应商」拉取模型 / 测试连接的请求体。
 //
-// 与保存接口分开：这里只做一次上游 /models 探测，明文凭证不落库。
-type draftFetchInput struct {
+// 与保存接口分开：明文凭证只用于这一次探测，不落库。
+type draftProviderInput struct {
 	OpenAIBaseURL          string            `json:"openai_base_url"`
 	OpenAIEndpointOverride string            `json:"openai_endpoint_override"`
-	APIKey                 string            `json:"api_key"`
+	APIKey                 string            `json:"api_key"` // 兼容旧表单：单 Key
+	Keys                   []draftKeyInput   `json:"keys"`
 	ExtraHeaders           map[string]string `json:"extra_headers"`
 	TimeoutSeconds         int               `json:"timeout_seconds"`
 	AllowInternal          bool              `json:"allow_internal"`
+	// ModelsSelected 只用于连接测试的最小对话探测（/models 不可用时）。
+	ModelsSelected []string `json:"models_selected"`
 }
 
-// handleFetchDraftModels 在供应商尚未保存时，用表单里填写的信息直接拉取上游模型候选。
-//
-// 结果不落库：用户在编辑页勾选后再点保存即可（保存接口负责持久化勾选结果）。
-func (s *Server) handleFetchDraftModels(w http.ResponseWriter, r *http.Request) {
-	var in draftFetchInput
-	if err := decodeJSON(r, &in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-
-	apiKey := strings.TrimSpace(in.APIKey)
-	if apiKey == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请先填写 API Key，再拉取模型"})
-		return
-	}
-
+// draftProvider 把草稿表单转换为运行时配置（按顺序尝试所有有明文的启用 Key）。
+func (in draftProviderInput) draftProvider() (config.Provider, error) {
 	base := strings.TrimSpace(in.OpenAIBaseURL)
 	override := strings.TrimSpace(in.OpenAIEndpointOverride)
 	if base == "" && override == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请先填写 OpenAI Base URL，再拉取模型"})
-		return
+		return config.Provider{}, errors.New("请先填写 OpenAI Base URL，再继续")
 	}
 	// 与保存路径一致：SSRF 校验在发出请求前完成
 	for _, u := range []string{base, override} {
 		if err := security.ValidateUpstreamURL(u, in.AllowInternal); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
+			return config.Provider{}, err
 		}
+	}
+
+	var keys []config.ProviderKey
+	for i, k := range in.Keys {
+		key := strings.TrimSpace(k.APIKey)
+		if key == "" || (k.Enabled != nil && !*k.Enabled) {
+			continue
+		}
+		enabled := true
+		label := strings.TrimSpace(k.Label)
+		if label == "" {
+			label = fmt.Sprintf("Key %d", i+1)
+		}
+		keys = append(keys, config.ProviderKey{Label: label, Key: key, Enabled: &enabled})
+	}
+	if len(keys) == 0 && strings.TrimSpace(in.APIKey) != "" {
+		enabled := true
+		keys = append(keys, config.ProviderKey{Label: "默认", Key: strings.TrimSpace(in.APIKey), Enabled: &enabled})
+	}
+	if len(keys) == 0 {
+		return config.Provider{}, errors.New("请先填写至少一个 API Key")
 	}
 
 	timeout := in.TimeoutSeconds
@@ -340,12 +429,33 @@ func (s *Server) handleFetchDraftModels(w http.ResponseWriter, r *http.Request) 
 		timeout = defaultTimeoutSeconds
 	}
 	draft := config.Provider{
+		ID:                     "draft",
+		Name:                   "draft",
 		OpenAIBaseURL:          base,
 		OpenAIEndpointOverride: override,
-		APIKey:                 apiKey,
+		APIKeys:                keys,
+		Models:                 cleanList(in.ModelsSelected),
 		ExtraHeaders:           in.ExtraHeaders,
 		TimeoutSeconds:         timeout,
 		AllowInternal:          in.AllowInternal,
+	}
+	draft.CleanSelection()
+	return draft, nil
+}
+
+// handleFetchDraftModels 在供应商尚未保存时，用表单里填写的信息直接拉取上游模型候选。
+//
+// 结果不落库：用户在编辑页勾选后再点保存即可（保存接口负责持久化勾选结果）。
+func (s *Server) handleFetchDraftModels(w http.ResponseWriter, r *http.Request) {
+	var in draftProviderInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	draft, err := in.draftProvider()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
 	}
 	if draft.ModelsEndpoint() == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -368,8 +478,119 @@ func (s *Server) handleFetchDraftModels(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// upsertProvider 把请求体转换为供应商并写库（apiKey 为空且已存在时沿用原凭证）。
-func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey string) (store.ProviderRecord, error) {
+// handleTestDraftKey 在供应商尚未保存时测试表单里填写的 Key（逐个尝试，首个成功即返回）。
+func (s *Server) handleTestDraftKey(w http.ResponseWriter, r *http.Request) {
+	var in draftProviderInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	draft, err := in.draftProvider()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, provider.Test(ctx, draft, s.client))
+}
+
+// handleTestProviderKey 只测试某个已保存的 Key（含已停用的 Key，便于判断能否重新启用）。
+func (s *Server) handleTestProviderKey(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	providerID := r.PathValue("id")
+	keyID := r.PathValue("key_id")
+
+	p, err := s.loadProvider(ctx, providerID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "供应商不存在"})
+			return
+		}
+		s.fail(w, http.StatusInternalServerError, "读取供应商失败", err)
+		return
+	}
+	rec, err := s.store.GetProviderKey(ctx, providerID, keyID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "该供应商没有这个 API Key"})
+		return
+	}
+	if err != nil {
+		s.fail(w, http.StatusInternalServerError, "读取 API Key 失败", err)
+		return
+	}
+	plain, derr := crypto.Decrypt(s.master, rec.KeyCipher, providerID)
+	if derr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("该 API Key 的密文无法用当前主密钥解密（%s）：请重新填写该 Key", rec.KeyHint),
+		})
+		return
+	}
+	enabled := true
+	key := config.ProviderKey{ID: rec.ID, Label: rec.Label, Key: string(plain), Enabled: &enabled}
+	writeJSON(w, http.StatusOK, provider.TestKey(ctx, p, key, s.client))
+}
+
+// defaultProviderKeyLabel 是旧单凭证请求转换出来的 Key 的默认备注名。
+const defaultProviderKeyLabel = "默认"
+
+// resolveProviderKeys 把请求体解析为最终要保存的凭证列表。
+//
+//   - Keys 非 nil：全量替换（新增必须给明文；带 id 且明文为空表示沿用库中密文）；
+//   - Keys 为 nil 且给了 api_key：等价于"替换为单个凭证"（兼容旧客户端/旧文件）；
+//   - 都没有且供应商已存在：沿用现有凭证（不触碰密文）；
+//   - 都没有且是新建：报错。
+func resolveProviderKeys(in providerInput, existing store.ProviderRecord, hasExisting bool) ([]config.ProviderKey, error) {
+	switch {
+	case in.Keys != nil:
+		out := make([]config.ProviderKey, 0, len(in.Keys))
+		for i, k := range in.Keys {
+			id := strings.TrimSpace(k.ID)
+			key := ""
+			if k.APIKey != nil {
+				key = strings.TrimSpace(*k.APIKey)
+			}
+			enabled := k.Enabled == nil || *k.Enabled
+			if id == "" && key == "" {
+				return nil, fmt.Errorf("第 %d 个 API Key 为空：新增的 Key 必须填写明文", i+1)
+			}
+			out = append(out, config.ProviderKey{
+				ID:      id,
+				Label:   strings.TrimSpace(k.Label),
+				Key:     key,
+				Enabled: &enabled,
+			})
+		}
+		if len(out) == 0 {
+			return nil, errors.New("至少需要一个 API Key")
+		}
+		return out, nil
+	case in.APIKey != nil && strings.TrimSpace(*in.APIKey) != "":
+		enabled := true
+		return []config.ProviderKey{{
+			Label:   defaultProviderKeyLabel,
+			Key:     strings.TrimSpace(*in.APIKey),
+			Enabled: &enabled,
+		}}, nil
+	case hasExisting:
+		out := make([]config.ProviderKey, 0, len(existing.Keys))
+		for _, k := range existing.Keys {
+			enabled := k.Enabled
+			out = append(out, config.ProviderKey{ID: k.ID, Label: k.Label, Enabled: &enabled})
+		}
+		if len(out) == 0 {
+			return nil, errors.New("该供应商没有 API Key，请至少添加一个")
+		}
+		return out, nil
+	default:
+		return nil, errors.New("创建供应商必须提供至少一个 API Key")
+	}
+}
+
+// upsertProvider 把请求体转换为供应商并写库（未提供凭证时沿用既有凭证）。
+func (s *Server) upsertProvider(ctx context.Context, in providerInput) (store.ProviderRecord, error) {
 	id := strings.TrimSpace(in.ID)
 	if id == "" {
 		id = newProviderID()
@@ -382,15 +603,9 @@ func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey st
 		return store.ProviderRecord{}, err
 	}
 
-	if apiKey == "" && hasExisting {
-		plain, derr := crypto.Decrypt(s.master, existing.APIKeyCipher, existing.ID)
-		if derr != nil {
-			return store.ProviderRecord{}, fmt.Errorf("读取既有凭证失败: %w", derr)
-		}
-		apiKey = string(plain)
-	}
-	if apiKey == "" {
-		return store.ProviderRecord{}, errors.New("首次创建供应商必须提供 api_key")
+	keys, err := resolveProviderKeys(in, existing, hasExisting)
+	if err != nil {
+		return store.ProviderRecord{}, err
 	}
 
 	name := strings.TrimSpace(in.Name)
@@ -417,7 +632,7 @@ func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey st
 		OpenAIBaseURL:          strings.TrimSpace(in.OpenAIBaseURL),
 		OpenAIEndpointOverride: strings.TrimSpace(in.OpenAIEndpointOverride),
 		WebsiteURL:             website,
-		APIKey:                 apiKey,
+		APIKeys:                keys,
 		Models:                 cleanList(in.ModelsSelected),
 		ModelAliases:           in.ModelAliases,
 		TimeoutSeconds:         valueOr(in.TimeoutSeconds, defaultTimeoutSeconds),
@@ -458,7 +673,8 @@ func (s *Server) upsertProvider(ctx context.Context, in providerInput, apiKey st
 		return store.ProviderRecord{}, err
 	}
 
-	// SaveProvider 内部会做 SSRF 校验（allow_internal=false 时拒绝内网地址）与 AES 加密
+	// SaveProvider 内部会做 SSRF 校验（allow_internal=false 时拒绝内网地址）、
+	// 凭证结构校验与 AES 加密，并在同一事务里全量替换凭证集合。
 	return s.store.SaveProvider(ctx, s.master, base)
 }
 
@@ -480,18 +696,9 @@ func (s *Server) ensureNameAvailable(ctx context.Context, id, name string) error
 	return nil
 }
 
-// loadProvider 读出并解密单个供应商。
+// loadProvider 读出并解密单个供应商（只含启用的 Key）。
 func (s *Server) loadProvider(ctx context.Context, id string) (config.Provider, error) {
-	providers, err := s.store.LoadProviders(ctx, s.master)
-	if err != nil {
-		return config.Provider{}, err
-	}
-	for _, p := range providers {
-		if p.ID == id {
-			return p, nil
-		}
-	}
-	return config.Provider{}, store.ErrNotFound
+	return s.store.LoadProvider(ctx, s.master, id)
 }
 
 // ---------------- 模型 ----------------

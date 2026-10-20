@@ -58,6 +58,7 @@ type UsageRecorder struct {
 type usageEvent struct {
 	ts         time.Time
 	providerID string
+	keyID      string
 	model      string
 	usage      logging.Usage
 }
@@ -107,7 +108,7 @@ func NewUsageRecorder(s *Store, logger slogLogger, opts UsageRecorderOptions) *U
 //
 // 仅 statusCode < 400 的请求计入（与 gateway 端 recordUsage 一致）。
 // zero usage 直接丢弃，避免给 daily 灌零。
-func (r *UsageRecorder) Record(providerID, model string, statusCode int, usage logging.Usage, ts time.Time) {
+func (r *UsageRecorder) Record(providerID, keyID, model string, statusCode int, usage logging.Usage, ts time.Time) {
 	if statusCode >= 400 {
 		return
 	}
@@ -115,7 +116,7 @@ func (r *UsageRecorder) Record(providerID, model string, statusCode int, usage l
 		return
 	}
 	select {
-	case r.ch <- usageEvent{ts: ts, providerID: providerID, model: model, usage: usage}:
+	case r.ch <- usageEvent{ts: ts, providerID: providerID, keyID: keyID, model: model, usage: usage}:
 	default:
 		r.dropped.Add(1)
 	}
@@ -211,8 +212,14 @@ func (r *UsageRecorder) loop(ctx context.Context) {
 func (r *UsageRecorder) flushBatch(ctx context.Context, batch []usageEvent) error {
 	dayBuckets := aggregateDay(batch)
 	minuteBuckets := aggregateMinute(batch)
-	if len(dayBuckets) == 0 && len(minuteBuckets) == 0 {
+	keyBuckets := aggregateKeyDay(batch)
+	if len(dayBuckets) == 0 && len(minuteBuckets) == 0 && len(keyBuckets) == 0 {
 		return nil
+	}
+	// 按 Key 的日用量是附加维度：失败只告警，不影响主用量链路。
+	if err := r.writer.UpsertProviderKeyUsageDaily(ctx, keyBuckets); err != nil {
+		r.logger.Warn("按 Key 用量写入失败，下一窗口会重试",
+			"buckets", len(keyBuckets), "err", err)
 	}
 	if err := r.writer.UpsertUsageDaily(ctx, dayBuckets); err != nil {
 		r.logger.Warn("日聚合写入失败，下一窗口会重试",
@@ -284,6 +291,42 @@ func aggregateMinute(batch []usageEvent) []MinuteBucket {
 		b.OutputTokens += e.usage.OutputTokens
 	}
 	out := make([]MinuteBucket, 0, len(merged))
+	for _, b := range merged {
+		out = append(out, *b)
+	}
+	return out
+}
+
+// aggregateKeyDay 按 (date, key) 合并事件，返回按 Key 的日用量桶。
+//
+// 没有 keyID 的事件（历史调用方/未注入）直接跳过：按 Key 统计是附属能力。
+func aggregateKeyDay(batch []usageEvent) []KeyDailyBucket {
+	type key struct {
+		date  string
+		keyID string
+	}
+	merged := make(map[key]*KeyDailyBucket)
+	for _, e := range batch {
+		if e.keyID == "" {
+			continue
+		}
+		date := e.ts.UTC().Format("2006-01-02")
+		k := key{date: date, keyID: e.keyID}
+		b, ok := merged[k]
+		if !ok {
+			b = &KeyDailyBucket{
+				Date:       date,
+				KeyID:      e.keyID,
+				ProviderID: e.providerID,
+			}
+			merged[k] = b
+		}
+		b.Requests++
+		b.InputTokens += e.usage.InputTokens
+		b.CachedInputTokens += e.usage.CachedInputTokens
+		b.OutputTokens += e.usage.OutputTokens
+	}
+	out := make([]KeyDailyBucket, 0, len(merged))
 	for _, b := range merged {
 		out = append(out, *b)
 	}

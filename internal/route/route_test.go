@@ -20,7 +20,10 @@ func snapshot(t *testing.T, providers ...config.Provider) *config.Snapshot {
 }
 
 func provider(id, name, upstreamURL string, models ...string) config.Provider {
-	return config.Provider{ID: id, Name: name, OpenAIBaseURL: upstreamURL + "/v1", Models: models}
+	return config.Provider{
+		ID: id, Name: name, OpenAIBaseURL: upstreamURL + "/v1",
+		APIKey: "sk-" + id, Models: models,
+	}
 }
 
 func TestResolvePicksFirstProviderByName(t *testing.T) {
@@ -107,6 +110,7 @@ func TestResolveNamespaceDoesNotBreakSlashModelNames(t *testing.T) {
 		ID:            "p",
 		Name:          "p",
 		OpenAIBaseURL: "http://p/v1",
+		APIKey:        "sk-p",
 		Models:        []string{"meta-llama/Llama-3-70B"},
 	})
 	got, err := Resolve(snap, "meta-llama/Llama-3-70B")
@@ -121,8 +125,8 @@ func TestResolveNamespaceDoesNotBreakSlashModelNames(t *testing.T) {
 func TestResolveNamespaceErrors(t *testing.T) {
 	disabled := false
 	snap := snapshot(t,
-		config.Provider{ID: "on", Name: "启用中", OpenAIBaseURL: "http://on/v1", Models: []string{"m"}},
-		config.Provider{ID: "off", Name: "已停用", OpenAIBaseURL: "http://off/v1", Models: []string{"m"}, Enabled: &disabled},
+		config.Provider{ID: "on", Name: "启用中", OpenAIBaseURL: "http://on/v1", APIKey: "sk-on", Models: []string{"m"}},
+		config.Provider{ID: "off", Name: "已停用", OpenAIBaseURL: "http://off/v1", APIKey: "sk-off", Models: []string{"m"}, Enabled: &disabled},
 	)
 
 	if _, err := Resolve(snap, "已停用/m"); !errors.Is(err, ErrProviderDisabled) {
@@ -141,6 +145,7 @@ func TestResolveAliasRewritesToUpstreamModel(t *testing.T) {
 		ID:            "p",
 		Name:          "供应商A",
 		OpenAIBaseURL: "http://a/v1",
+		APIKey:        "sk-a",
 		Models:        []string{"gpt-4o"},
 		ModelAliases:  map[string]string{"gpt-4o": "我的模型"},
 	})
@@ -166,5 +171,36 @@ func TestResolveAliasRewritesToUpstreamModel(t *testing.T) {
 	// 上游原名在配置了别名后不再对外可用
 	if _, err := Resolve(snap, "gpt-4o"); !errors.Is(err, ErrModelNotFound) {
 		t.Fatalf("配置别名后原名不应命中，得到 %v", err)
+	}
+}
+
+// TestResolveSkipsProviderWithoutUsableKey 覆盖「Key 全部被自动停用」后的路由行为：
+// 聚合寻址跳过该供应商，命名空间命中时给出明确的 ErrProviderNoKey。
+func TestResolveSkipsProviderWithoutUsableKey(t *testing.T) {
+	noneEnabled := false
+	keyless := config.Provider{
+		ID: "dead", Name: "无可用Key", OpenAIBaseURL: "http://dead/v1",
+		Models:  []string{"shared", "only-dead"},
+		APIKeys: []config.ProviderKey{{Key: "sk-dead", Enabled: &noneEnabled}},
+	}
+	healthy := provider("ok", "健康供应商", "http://ok", "shared")
+
+	snap := snapshot(t, keyless, healthy)
+
+	got, err := Resolve(snap, "shared")
+	if err != nil {
+		t.Fatalf("聚合寻址应跳过没有可用 Key 的供应商: %v", err)
+	}
+	if got.Provider.ID != "ok" {
+		t.Fatalf("应命中健康供应商，得到 %s", got.Provider.ID)
+	}
+
+	if _, err := Resolve(snap, "无可用Key/only-dead"); !errors.Is(err, ErrProviderNoKey) {
+		t.Fatalf("命名空间命中无可用 Key 的供应商应返回 ErrProviderNoKey，得到 %v", err)
+	}
+
+	// 只有无可用 Key 的供应商声明该模型时，也要给出 ErrProviderNoKey 而不是笼统的 404
+	if _, err := Resolve(snap, "only-dead"); !errors.Is(err, ErrProviderNoKey) {
+		t.Fatalf("唯一声明者没有可用 Key 时应返回 ErrProviderNoKey，得到 %v", err)
 	}
 }

@@ -19,13 +19,15 @@ type Entry struct {
 	InboundProtocol string    `json:"inbound_protocol"`
 	Model           string    `json:"model"`
 	ProviderID      string    `json:"provider_id"`
-	UpstreamURL     string    `json:"upstream_url"`
-	StatusCode      int       `json:"status_code"`
-	LatencyMS       int64     `json:"latency_ms"`
-	FirstByteMS     int64     `json:"first_byte_ms"`
-	Stream          bool      `json:"stream"`
-	ErrorMsg        string    `json:"error_msg,omitempty"`
-	ClientIP        string    `json:"client_ip"`
+	// KeyHint 是实际服务该请求的供应商 Key 掩码（sk-****abcd），用于排障。
+	KeyHint     string `json:"key_hint,omitempty"`
+	UpstreamURL string `json:"upstream_url"`
+	StatusCode  int    `json:"status_code"`
+	LatencyMS   int64  `json:"latency_ms"`
+	FirstByteMS int64  `json:"first_byte_ms"`
+	Stream      bool   `json:"stream"`
+	ErrorMsg    string `json:"error_msg,omitempty"`
+	ClientIP    string `json:"client_ip"`
 }
 
 // Writer 是日志落库接口（由 store 实现）。

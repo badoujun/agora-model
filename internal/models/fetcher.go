@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"agora-model/internal/config"
+	"agora-model/internal/crypto"
 )
 
 // DefaultFetchTimeout 是单次拉取的超时。
@@ -42,12 +43,33 @@ func NewFetcher() *Fetcher {
 }
 
 // Fetch 拉取单个供应商的模型列表（失败时不返回部分结果）。
+//
+// 多 Key：按顺序逐个尝试启用的 Key，第一个成功即返回；全部失败时返回
+// 聚合错误（含每个 Key 的掩码与失败原因），便于在编辑页定位是哪个 Key 有问题。
 func (f *Fetcher) Fetch(ctx context.Context, p config.Provider) ([]string, error) {
 	endpoint := p.ModelsEndpoint()
 	if endpoint == "" {
 		return nil, errors.New("无法推导 /models 地址：请填写 openai_base_url（端点覆盖模式下不支持拉取模型）")
 	}
 
+	keys := p.UsableKeys()
+	if len(keys) == 0 {
+		return nil, errors.New("没有可用的 API Key（可能已全部被自动停用，请在供应商页重新启用）")
+	}
+
+	failures := make([]string, 0, len(keys))
+	for _, key := range keys {
+		ids, err := f.fetchWithKey(ctx, endpoint, p, key.Key)
+		if err == nil {
+			return ids, nil
+		}
+		failures = append(failures, fmt.Sprintf("%s: %v", crypto.Mask(key.Key), err))
+	}
+	return nil, fmt.Errorf("全部 %d 个 API Key 拉取模型均失败：%s", len(keys), strings.Join(failures, "；"))
+}
+
+// fetchWithKey 用指定凭证执行一次 /models 拉取。
+func (f *Fetcher) fetchWithKey(ctx context.Context, endpoint string, p config.Provider, apiKey string) ([]string, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 
@@ -55,7 +77,7 @@ func (f *Fetcher) Fetch(ctx context.Context, p config.Provider) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
 	for k, v := range p.ExtraHeaders {
 		req.Header.Set(k, v)

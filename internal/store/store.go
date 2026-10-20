@@ -26,6 +26,7 @@ var migrations = []migration{
 	{version: 3, name: "single_protocol_model_selection", statements: schemaV3},
 	{version: 4, name: "provider_website_and_gateway_key_cipher", statements: schemaV4},
 	{version: 5, name: "model_usage_daily_and_minute", statements: schemaV5},
+	{version: 6, name: "provider_keys_multi", statements: schemaV6},
 }
 
 type migration struct {
@@ -267,4 +268,53 @@ var schemaV5 = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_usage_minute_date ON model_usage_minute(minute)`,
 	`CREATE INDEX IF NOT EXISTS idx_usage_daily_date  ON model_usage_daily(date)`,
+}
+
+// schemaV6 把「一个供应商一个凭证」升级为「一个供应商多个凭证」，并落地
+// 数据面热路径需要的运行时字段：
+//   - provider_keys：每个 Key 独立成行（密文、掩码、启用状态、自动停用标记、
+//     失败计数、最后使用时间）。数量不设上限。
+//   - provider_key_usage_daily：按 Key 的 token 用量（日粒度，仅用于控制台展示，
+//     请求路径不读它）。
+//   - logs.key_hint：记录实际服务该请求的 Key（排障用）。
+//
+// 既有的单凭证密文原样搬运到 provider_keys（AAD 仍是 provider.id，因此不需要
+// 主密钥即可完成迁移），随后删除 providers 上的两个凭证列。
+// 注意：本迁移之后不再支持降级到 0.4.0 及更早版本。
+var schemaV6 = []string{
+	`CREATE TABLE IF NOT EXISTS provider_keys (
+		id              TEXT    PRIMARY KEY,
+		provider_id     TEXT    NOT NULL,
+		label           TEXT    NOT NULL DEFAULT '',
+		position        INTEGER NOT NULL DEFAULT 0,  -- 展示/轮询顺序（与提交顺序一致）
+		key_cipher      BLOB    NOT NULL,
+		key_hint        TEXT    NOT NULL DEFAULT '',
+		enabled         INTEGER NOT NULL DEFAULT 1,
+		auto_disabled   INTEGER NOT NULL DEFAULT 0,
+		disabled_reason TEXT    NOT NULL DEFAULT '',
+		created_at      TEXT    NOT NULL,
+		updated_at      TEXT    NOT NULL,
+		last_used_at    TEXT    NOT NULL DEFAULT '',
+		last_failure_at TEXT    NOT NULL DEFAULT '',
+		last_error      TEXT    NOT NULL DEFAULT '',
+		failure_count   INTEGER NOT NULL DEFAULT 0
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_provider_keys_provider ON provider_keys(provider_id, position)`,
+	`CREATE TABLE IF NOT EXISTS provider_key_usage_daily (
+		date                TEXT    NOT NULL,
+		key_id              TEXT    NOT NULL,
+		provider_id         TEXT    NOT NULL,
+		requests            INTEGER NOT NULL DEFAULT 0,
+		input_tokens        INTEGER NOT NULL DEFAULT 0,
+		cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens       INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (date, key_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_key_usage_provider ON provider_key_usage_daily(provider_id, date)`,
+	`INSERT INTO provider_keys (id, provider_id, label, key_cipher, key_hint, enabled, created_at, updated_at)
+		SELECT 'pk_' || id, id, '主 Key', api_key_cipher, api_key_hint, 1, created_at, updated_at
+		FROM providers`,
+	`ALTER TABLE logs ADD COLUMN key_hint TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE providers DROP COLUMN api_key_cipher`,
+	`ALTER TABLE providers DROP COLUMN api_key_hint`,
 }

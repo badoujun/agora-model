@@ -338,8 +338,8 @@ func TestProviderCRUDAndMasking(t *testing.T) {
 	for _, p := range providers {
 		if p.ID == id {
 			found = true
-			if p.APIKey != "sk-live-abcdefghijkl" {
-				t.Errorf("未提供凭证时应沿用原值，得到 %q", p.APIKey)
+			if len(p.APIKeys) != 1 || p.APIKeys[0].Key != "sk-live-abcdefghijkl" {
+				t.Errorf("未提供凭证时应沿用原值，得到 %+v", p.APIKeys)
 			}
 			if p.ModelAliases["m1"] != "别名一" {
 				t.Errorf("别名应被保存: %#v", p.ModelAliases)
@@ -725,8 +725,8 @@ func TestExportImportRoundTrip(t *testing.T) {
 	for _, p := range providers2 {
 		if p.ID == "imported" {
 			found = true
-			if p.APIKey != "sk-seed" {
-				t.Errorf("导入的凭证 = %q", p.APIKey)
+			if len(p.APIKeys) != 1 || p.APIKeys[0].Key != "sk-seed" {
+				t.Errorf("导入的凭证 = %+v", p.APIKeys)
 			}
 			if len(p.Models) != 1 || p.Models[0] != "seed-model" {
 				t.Errorf("导入的模型选择 = %v", p.Models)
@@ -737,10 +737,11 @@ func TestExportImportRoundTrip(t *testing.T) {
 		t.Fatal("导入后未找到供应商")
 	}
 
-	// 缺少 api_key 的导入应被拒绝
+	// 缺少任何凭证的导入应被拒绝（新格式的 keys 与兼容字段 api_key 都要清掉）
 	delete(exported, "id")
 	exported["name"] = "无凭证"
 	delete(exported, "api_key")
+	delete(exported, "keys")
 	code, _, _ = h.do(client, http.MethodPost, "/api/import", map[string]any{"providers": []any{exported}})
 	if code != http.StatusBadRequest {
 		t.Fatalf("缺少凭证的导入状态码 = %d, 期望 400", code)

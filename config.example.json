@@ -1,4 +1,5 @@
 {
+  "_comment": "供应商凭证有两种写法：① 旧版单凭证 api_key（仍完全支持，会被当作唯一的一个 Key）；② 多凭证 keys:[{label, api_key, enabled}]（一个供应商可配置任意多个，按顺序轮询；401/402/403 的 Key 会被网关自动停用）。两种写法同时出现时以 keys 为准。",
   "gateway": {
     "api_key": "gw-dev-change-me",
     "listen": "127.0.0.1",
