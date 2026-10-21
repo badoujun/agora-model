@@ -1,0 +1,56 @@
+# AgoraModel 单容器部署。配套说明见 docs/DOCKER.md。
+#
+# 首次使用：
+#   cp .env.example .env      # 填入 ADMIN_PASSWORD 与 GW_MASTER_KEY
+#   docker compose up -d --build
+#   docker compose logs agoramodel | grep gateway_key
+
+name: agoramodel
+
+services:
+  agoramodel:
+    build:
+      context: .
+      args:
+        # 版本号会注入二进制；留空则用 cmd/agoramodel 内置版本号。
+        VERSION: ${AGORAMODEL_VERSION:-}
+        # 基础镜像默认走 docker.aityp.com 收录的华为云 SWR 地址。
+        # 外网可直连时在 .env 里改成 node:22-alpine / golang:1.25-alpine / alpine:3.22。
+        NODE_IMAGE: ${NODE_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/node:22-alpine}
+        GO_IMAGE: ${GO_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/golang:1.25-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/alpine:3.22}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        APK_MIRROR: ${APK_MIRROR:-mirrors.aliyun.com}
+    image: agoramodel:${AGORAMODEL_VERSION:-local}
+    container_name: agoramodel
+    restart: unless-stopped
+
+    # 只监听宿主机回环时保持默认 127.0.0.1；要给局域网 / 其他机器使用时改成 0.0.0.0。
+    # 容器内监听的始终是 0.0.0.0，所以 ADMIN_PASSWORD 必须设置。
+    ports:
+      - "${AGORAMODEL_BIND:-127.0.0.1}:9090:9090"
+
+    environment:
+      # compose 在变量缺失时直接报错，避免容器起来后因「非回环监听但无密码」退出。
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在 .env 或环境变量中设置 ADMIN_PASSWORD}
+      # 推荐用环境变量保存主密钥；留空则使用 /data/master.key 文件。
+      GW_MASTER_KEY: ${GW_MASTER_KEY:-}
+      TZ: ${TZ:-Asia/Shanghai}
+
+    volumes:
+      # 命名卷由 Docker 创建并继承镜像内 /data 的属主（10001），无需手工 chown。
+      - agoramodel-data:/data
+      # 需要在首次启动时导入供应商，取消下面这行注释并把 config.json 放到项目根目录。
+      # 数据库非空后不会重复导入。
+      # - ./config.json:/app/config.json:ro
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  agoramodel-data:

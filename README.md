@@ -250,6 +250,26 @@ agoramodel uninstall         # 先注销系统服务（数据目录会保留）
 npm uninstall -g @bakeroot/agoramodel  # 再卸载包
 ```
 
+## Docker 部署
+
+仓库自带 `Dockerfile` 与 `docker-compose.yml`，基础镜像默认使用
+[docker.aityp.com](https://docker.aityp.com/)（渡渡鸟镜像站）收录的华为云 SWR 地址：
+
+```bash
+cp .env.example .env
+# 编辑 .env：设置 ADMIN_PASSWORD（必填），建议同时设置 GW_MASTER_KEY=$(openssl rand -hex 32)
+docker compose up -d --build
+docker compose logs agoramodel | grep gateway_key   # 首次启动打印一次的网关 Key
+```
+
+默认只绑定宿主机 `127.0.0.1:9090`；要让其他机器上的 Agent 访问，把 `.env` 里的
+`AGORAMODEL_BIND` 改成 `0.0.0.0`。数据保存在命名卷 `/data`（`agora.db` + `master.key`）。
+
+> `docker.aityp.com` 是镜像**索引站**，不是 registry，不能配置为 `registry-mirrors`；
+> 详情页给出的实际拉取地址形如 `swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/golang:1.25-alpine`。
+
+构建参数、数据备份/恢复、arm64 与升级说明见 **[docs/DOCKER.md](docs/DOCKER.md)**。
+
 ## Web 控制台
 
 | 页面 | 用途 |

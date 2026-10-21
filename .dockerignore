@@ -1,0 +1,33 @@
+# 版本控制 / 编辑器 / agent 宿主
+.git
+.gitignore
+.github
+.idea
+.vscode
+.reasonix
+.codegraph
+
+# 本地产物
+dist
+npm/dist
+web/node_modules
+web/dist
+internal/webui/dist
+*.test
+*.out
+
+# 运行时数据（含凭证，绝不能进镜像）
+data
+*.db
+*.db-wal
+*.db-shm
+master.key
+config.json
+.env
+mock-upstream.log
+
+# 与镜像构建无关
+docs
+tools
+build.ps1
+node_modules
