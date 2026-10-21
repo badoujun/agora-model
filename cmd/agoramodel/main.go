@@ -35,7 +35,7 @@ import (
 // version 是程序版本号（语义化版本）。发布构建可用
 // -ldflags "-X main.version=<tag>" 注入 git tag；未注入时用这里的内置版本号，
 // 保证控制台左上角始终显示可读的版本号而不是构建哈希。
-var version = "0.5.0"
+var version = "0.6.0"
 
 // slogToRecorderLogger 把 *slog.Logger 适配到 store.UsageRecorder 期望的 slogLogger 接口。
 //
@@ -59,7 +59,7 @@ func main() {
 		logLevel    = flag.String("log-level", "info", "日志级别：debug|info|warn|error")
 		logFile     = flag.String("log-file", "", "日志文件路径（默认写 stdout；install 缺省为 <数据目录>/logs/agoramodel.log）")
 		noColor     = flag.Bool("no-color", false, "禁用彩色输出")
-		resetKey    = flag.Bool("reset-gateway-key", false, "吊销现有网关 Key 并生成新的（明文只打印一次）")
+		resetKey    = flag.Bool("reset-gateway-key", false, "软删全部网关 Key 并新建一个（旧 Key 立即失效，明文只打印一次）")
 		adminPass   = flag.String("admin-password", "", "Web UI 管理密码（也可用环境变量 ADMIN_PASSWORD；非回环监听时必填）")
 		showVer     = flag.Bool("version", false, "打印版本并退出")
 		svcExec     = flag.String("service-exec", "", "服务要运行的可执行文件（install 用；默认复制当前二进制到 <数据目录>/bin/ 后运行该副本）")
@@ -290,7 +290,13 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 		if err != nil {
 			return nil, err
 		}
-		return config.NewSnapshot(config.File{Gateway: gwSettings, Providers: providers})
+		// 网关 Key 的模型范围随供应商一起装载：数据面路由只查内存快照，
+		// 不碰数据库；Key 的启用状态仍由 VerifyGatewayKey 查库即时生效。
+		scopes, err := st.ListAllGatewayKeyScopes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return config.NewSnapshotWithScopes(config.File{Gateway: gwSettings, Providers: providers}, scopes)
 	}
 
 	snapshot, err := loadSnapshot(ctx)

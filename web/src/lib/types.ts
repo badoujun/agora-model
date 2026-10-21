@@ -157,6 +157,10 @@ export interface LogItem {
   provider_id: string
   /** 实际服务该请求的供应商 Key 掩码 */
   key_hint?: string
+  /** 发起该请求的网关 API Key id（空表示静态 Key 或历史无归属数据） */
+  gateway_key_id?: string
+  /** 网关 API Key 的展示名（别名，附备注）；查询时由服务端回填 */
+  gateway_key_name?: string
   upstream_url: string
   status_code: number
   latency_ms: number
@@ -166,11 +170,74 @@ export interface LogItem {
   client_ip: string
 }
 
+/* -------------------------- 网关 API Key -------------------------- */
+
+/** 网关 Key 可调用的一个「供应商 × 上游模型」。 */
+export interface GatewayKeyScope {
+  provider_id: string
+  /** 上游模型名（非对外别名）；对外展示时需映射回 alias */
+  model: string
+}
+
+/** 某个网关 Key 的全部历史累计 token 用量。 */
+export interface GatewayKeyUsageDTO {
+  /** 输入 + 输出 */
+  total_tokens: number
+  /** 输入中命中缓存的部分 */
+  input_cached: number
+  /** 输入中未命中缓存的部分（= 输入总量 - 命中缓存） */
+  input_uncached: number
+  output: number
+}
+
+export interface GatewayKeyDTO {
+  id: string
+  name: string
+  note?: string
+  key_hint: string
+  enabled: boolean
+  /** 是否已软删除（记录保留以便历史日志/统计显示名称） */
+  deleted: boolean
+  deleted_at?: string
+  created_at?: string
+  updated_at?: string
+  last_used_at?: string
+  /** 明文是否可还原；false 表示只能重置 */
+  revealable: boolean
+  /** 模型范围；空数组表示不限制（可调用全部模型） */
+  scopes: GatewayKeyScope[]
+  /** 累计用量；没有产生过请求时各项为 0 */
+  usage?: GatewayKeyUsageDTO
+}
+
+/** 新建 / 更新网关 Key 的请求体；更新时字段可省略表示沿用现值。 */
+export interface GatewayKeyInput {
+  name?: string
+  note?: string
+  enabled?: boolean
+  /** 传数组表示全量替换模型范围，传空数组表示改为不限制 */
+  scopes?: GatewayKeyScope[]
+}
+
+export interface GatewayKeyListPayload {
+  items: GatewayKeyDTO[]
+}
+
+/** 新建 / 重置网关 Key 的响应：gateway_key 是明文，仅本次返回。 */
+export interface GatewayKeyPlainPayload {
+  gateway_key: string
+  key_hint: string
+  warning?: string
+  key?: GatewayKeyDTO
+}
+
 export interface SettingsPayload {
   listen: string
   port: number
   sse_idle_seconds: number
   max_body_bytes: number
+  /** 默认网关 Key（最早创建的启用 Key）的 id；空表示尚未生成 */
+  gateway_key_id?: string
   gateway_key_hint: string
   /** 当前网关 Key 明文（可随时查看/复制） */
   gateway_key: string
@@ -346,6 +413,8 @@ export interface UsagePayload {
   first_used_at: string
   active_days: number
   granularity: UsageGranularity
+  /** 本次统计作用的网关 Key；空串表示「全部」 */
+  gateway_key_id: string
   kpi: UsageKPI
   models: UsageModelShare[]
   providers: UsageProviderShare[]

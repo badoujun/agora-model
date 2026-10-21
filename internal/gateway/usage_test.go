@@ -224,35 +224,38 @@ func TestParseUsageNonStream(t *testing.T) {
 // TestRecordUsage 验证 statusCode>=400 跳过、零值跳过、nil sink 不 panic。
 func TestRecordUsage(t *testing.T) {
 	var got Usage
-	var gotProvider, gotKey, gotModel string
+	var gotGatewayKey, gotProvider, gotKey, gotModel string
 	var gotStatus int
 	var gotTS time.Time
-	sink := logging.UsageSinkFunc(func(p, k, m string, s int, u Usage, ts time.Time) {
-		gotProvider, gotKey, gotModel, gotStatus = p, k, m, s
+	sink := logging.UsageSinkFunc(func(gk, p, k, m string, s int, u Usage, ts time.Time) {
+		gotGatewayKey, gotProvider, gotKey, gotModel, gotStatus = gk, p, k, m, s
 		got = u
 		gotTS = ts
 	})
 
 	// nil sink 不能 panic
-	recordUsage(nil, "p", "k1", "m", 200, Usage{InputTokens: 1, OutputTokens: 1}, time.Now())
+	recordUsage(nil, "", "p", "k1", "m", 200, Usage{InputTokens: 1, OutputTokens: 1}, time.Now())
 
 	// 失败请求跳过
-	recordUsage(sink, "p", "k1", "m", 500, Usage{InputTokens: 1, OutputTokens: 1}, time.Now())
+	recordUsage(sink, "", "p", "k1", "m", 500, Usage{InputTokens: 1, OutputTokens: 1}, time.Now())
 	if gotStatus == 500 {
 		t.Error("statusCode>=400 应跳过")
 	}
 
 	// 零值跳过
-	recordUsage(sink, "p", "k1", "m", 200, Usage{}, time.Now())
+	recordUsage(sink, "", "p", "k1", "m", 200, Usage{}, time.Now())
 	if got.InputTokens != 0 || got.OutputTokens != 0 {
 		t.Errorf("零值应跳过；got=%+v", got)
 	}
 
 	// 正常调用
 	now := time.Unix(1700000000, 0)
-	recordUsage(sink, "providerA", "key-1", "modelB", 200, Usage{InputTokens: 100, OutputTokens: 50}, now)
+	recordUsage(sink, "gk_a", "providerA", "key-1", "modelB", 200, Usage{InputTokens: 100, OutputTokens: 50}, now)
 	if gotProvider != "providerA" || gotKey != "key-1" || gotModel != "modelB" || gotStatus != 200 {
 		t.Errorf("provider/key/model/status 未透传：%s/%s/%s/%d", gotProvider, gotKey, gotModel, gotStatus)
+	}
+	if gotGatewayKey != "gk_a" {
+		t.Errorf("gatewayKeyID 未透传：%q", gotGatewayKey)
 	}
 	if got.InputTokens != 100 || got.OutputTokens != 50 || gotTS != now {
 		t.Errorf("usage/ts 未透传：%+v ts=%v", got, gotTS)

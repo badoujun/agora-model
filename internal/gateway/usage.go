@@ -26,7 +26,7 @@ type UsageSink = logging.UsageSink
 // noopUsageSink 在没注入 sink 时使用，避免 nil 检查散落在调用处。
 type noopUsageSink struct{}
 
-func (noopUsageSink) Record(string, string, string, int, Usage, time.Time) {}
+func (noopUsageSink) Record(string, string, string, string, int, Usage, time.Time) {}
 
 // parseOpenAIUsageNonStream 从一个 OpenAI 风格的非流式响应体解析 usage。
 //
@@ -231,7 +231,9 @@ func teeNonStreamBody(w io.Writer, src io.Reader, buf *bytes.Buffer) (int64, err
 }
 
 // recordUsage 在成功请求里调用 sink。失败请求（statusCode >= 400）由调用方跳过。
-func recordUsage(sink UsageSink, providerID, keyID, model string, statusCode int, u Usage, ts time.Time) {
+//
+// gatewayKeyID 是发起该请求的网关 API Key，用于「使用统计」按 Key 归集。
+func recordUsage(sink UsageSink, gatewayKeyID, providerID, keyID, model string, statusCode int, u Usage, ts time.Time) {
 	if sink == nil {
 		return
 	}
@@ -241,7 +243,7 @@ func recordUsage(sink UsageSink, providerID, keyID, model string, statusCode int
 	if u.IsZero() {
 		return
 	}
-	sink.Record(providerID, keyID, model, statusCode, u, ts)
+	sink.Record(gatewayKeyID, providerID, keyID, model, statusCode, u, ts)
 }
 
 // parseUsageNonStream 从一个完整的非流式响应体解析 usage，按 Content-Type

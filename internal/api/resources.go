@@ -775,6 +775,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"port":                   gw.Port,
 		"sse_idle_seconds":       gw.SSEIdleSeconds,
 		"max_body_bytes":         gw.MaxBodyBytes,
+		"gateway_key_id":         keyInfo.ID,
 		"gateway_key_hint":       keyInfo.KeyHint,
 		"gateway_key":            plainKey,
 		"gateway_key_revealable": revealable,
@@ -854,13 +855,14 @@ func (s *Server) handleListLogs(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	filter := store.LogFilter{
-		Model:      strings.TrimSpace(q.Get("model")),
-		ProviderID: strings.TrimSpace(q.Get("provider_id")),
-		FailedOnly: q.Get("failed") == "true" || q.Get("failed") == "1",
-		StatusMin:  atoiOr(q.Get("status_min"), 0),
-		StatusMax:  atoiOr(q.Get("status_max"), 0),
-		Limit:      atoiOr(q.Get("limit"), 200),
-		Offset:     atoiOr(q.Get("offset"), 0),
+		Model:        strings.TrimSpace(q.Get("model")),
+		ProviderID:   strings.TrimSpace(q.Get("provider_id")),
+		GatewayKeyID: strings.TrimSpace(q.Get("gateway_key_id")),
+		FailedOnly:   q.Get("failed") == "true" || q.Get("failed") == "1",
+		StatusMin:    atoiOr(q.Get("status_min"), 0),
+		StatusMax:    atoiOr(q.Get("status_max"), 0),
+		Limit:        atoiOr(q.Get("limit"), 200),
+		Offset:       atoiOr(q.Get("offset"), 0),
 	}
 	if from := strings.TrimSpace(q.Get("from")); from != "" {
 		if t, err := time.Parse(time.RFC3339, from); err == nil {
@@ -878,7 +880,8 @@ func (s *Server) handleListLogs(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "查询日志失败", err)
 		return
 	}
-	total, err := s.store.CountLogs(ctx)
+	// 总数必须跟筛选条件走：只按 Key 过滤却返回全表条数，翻页会翻到空页。
+	total, err := s.store.CountLogsFiltered(ctx, filter)
 	if err != nil {
 		s.logger.Debug("统计日志条数失败", "err", err)
 	}

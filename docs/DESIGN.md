@@ -178,10 +178,12 @@ agora-model/
 - **决定**：带读超时的转发循环，空闲时注入 SSE 注释行 `: keep-alive\n\n`。
 - **理由**：SSE 注释行被所有合规客户端忽略；只在空闲注入，有数据时字节流完全透明，语义无损。
 
-### ADR-006：错误日志 vs 用量统计
+### ADR-006：错误日志与用量统计
 
-- **决定**：保留「错误/审计日志」，不做「用量统计」。
-- **理由**：日志是排查「Agent 发错还是上游拒了」的唯一手段；用量统计是另一回事，用户已明确暂不做。
+- **决定**：保留「错误/审计日志」，并补充「按网关 Key 的用量统计」（第 14 轮起可整体或按单个 Key 查看）。
+- **理由**：日志是排查「Agent 发错还是上游拒了」的唯一手段；用量统计回答「谁用了多少」，
+  两者维度不同（日志按请求、统计按日聚合），因此分别落地而不是二选一。
+- **修订**：最初判定「不做用量统计」，第 14 轮按用户要求补齐，并把统计与日志都打上网关 Key 维度。
 
 ---
 
@@ -253,17 +255,29 @@ CREATE TABLE IF NOT EXISTS provider_key_usage_daily (
   PRIMARY KEY (date, key_id)
 );
 
--- 网关 Key（v1 只暴露一条，表结构为未来多 Key 预留）
+-- 网关 Key（可同时存在多条；v7 起支持状态、备注、软删除与模型范围）
 CREATE TABLE IF NOT EXISTS gateway_keys (
   id           TEXT    PRIMARY KEY,
-  name         TEXT    NOT NULL DEFAULT 'default',
+  name         TEXT    NOT NULL DEFAULT 'default',  -- 别名（日志/下拉里的展示名）
+  note         TEXT    NOT NULL DEFAULT '',         -- v7：用途 / 使用人备注
   key_hash     TEXT    NOT NULL UNIQUE,   -- sha256(gw-key)，比对用
   key_hint     TEXT    NOT NULL,          -- gw-****abcd
   key_cipher   BLOB,                      -- v4 迁移新增：明文的 AES-256-GCM 密文（控制台可查看/复制）
-  enabled      INTEGER NOT NULL DEFAULT 1,
+  enabled      INTEGER NOT NULL DEFAULT 1, -- 多条可同时为 1
   created_at   TEXT    NOT NULL,
+  updated_at   TEXT    NOT NULL DEFAULT '', -- v7
   last_used_at TEXT,
-  revoked_at   TEXT
+  revoked_at   TEXT,
+  deleted_at   TEXT                       -- v7：软删除；记录保留供历史日志/统计显示名称
+);
+
+-- v7：单个网关 Key 可调用的模型白名单（键为供应商 + 上游模型名）
+-- 没有行的 Key 表示「不限制模型范围」——升级前的既有 Key 都落在这里。
+CREATE TABLE IF NOT EXISTS gateway_key_models (
+  gateway_key_id TEXT NOT NULL,
+  provider_id    TEXT NOT NULL,
+  model          TEXT NOT NULL,           -- 上游模型名（非对外别名）
+  PRIMARY KEY (gateway_key_id, provider_id, model)
 );
 
 -- 聚合模型缓存
@@ -284,6 +298,7 @@ CREATE TABLE IF NOT EXISTS logs (
   model            TEXT,
   provider_id      TEXT,
   key_hint         TEXT,                      -- v6：实际服务该请求的供应商 Key 掩码
+  gateway_key_id   TEXT    NOT NULL DEFAULT '', -- v7：该请求用的入站网关 Key（软删除后仍保留 id，名称由 JOIN 得到）
   upstream_url     TEXT,
   status_code      INTEGER NOT NULL,
   latency_ms       INTEGER NOT NULL,
@@ -302,8 +317,12 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE INDEX IF NOT EXISTS idx_logs_ts        ON logs(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_status    ON logs(status_code);
 CREATE INDEX IF NOT EXISTS idx_logs_model     ON logs(model);
+CREATE INDEX IF NOT EXISTS idx_logs_gateway_key ON logs(gateway_key_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 ```
+
+> `model_usage_daily` 在第 14 轮（v7）重建为按 `(date, gateway_key_id, provider_id, model)` 四列主键，
+> 迁移时把既有行归属到「最早创建的网关 Key」，使按 Key 的统计口径与日志一致。
 
 ### 4.2 关键约束与规则
 
@@ -313,7 +332,9 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | Key 不可回读 | 只存密文与掩码提示；修改采用覆盖语义（按 id 提交表示沿用原密文） |
 | 自动停用 | `401/402/403` 会把该 Key 置为 `enabled=0, auto_disabled=1` 并记录原因；用户在 UI 上重新启用即清除标记 |
 | 顺序稳定 | 排序键为 `(provider_id, position, created_at, id)`；`position` 由保存时提交顺序决定 |
-| 网关 Key 只存哈希 | 入站校验只需比对 `sha256`，明文仅在生成时展示一次 |
+| 多网关 Key（v7） | 一个网关可同时启用任意多条 Key；`name`（别名）必填且 ≤64 rune，`note` ≤256；停用/删除最后一个启用的 Key 会被拒绝（避免所有 Agent 立刻锁死）；删除为软删除，记录保留供历史日志与统计显示名称 |
+| 网关 Key 模型范围（v7） | `gateway_key_models` 存「供应商 + 上游模型名」白名单；**没有行的 Key = 不限制**。范围参与路由：裸模型名只在范围内的供应商里挑目标，显式命名空间越界返回 403 `model_not_allowed`；`/v1/models` 同样按范围过滤 |
+| 网关 Key 只存哈希 | 入站校验只需比对 `sha256`（常量时间），明文以 AES-256-GCM 密文另存一份供控制台查看/复制，仅在创建/重置时也返回一次 |
 | 至少一个协议 URL | 保存时校验：`openai_base_url`、`anthropic_base_url` 至少有一个非空（含 override） |
 | 默认不启用内网 | `allow_internal = 0` 时拒绝解析到 loopback/private/link-local 的 URL |
 | 迁移 | 使用 `schema_migrations(version, applied_at)` 表管理；启动时自动执行缺失迁移 |
@@ -412,6 +433,7 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | 401 | `invalid_api_key` | 网关 Key 缺失/错误/已吊销 | `authentication_error` |
 | 400 | `upstream_protocol_not_configured` | 该供应商未配置对应协议的 URL | `invalid_request_error` |
 | 404 | `model_not_found` | 模型不在任何启用供应商的可用模型中 | `not_found_error` |
+| 403 | `model_not_allowed` | 模型存在，但**当前网关 Key 的模型范围不包含它**（显式 `供应商/模型` 越界） | `permission_error` |
 | 404 | `not_found` | 未知路径 | `not_found_error` |
 | 413 | `payload_too_large` | 请求体超 `MAX_BODY_BYTES` | `invalid_request_error` |
 | 502 | `upstream_unreachable` | 连接失败、上游返回非法响应 | `api_error` |
@@ -467,11 +489,18 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | `POST` | `/api/models/refresh` | 全量刷新 |
 | `POST` | `/api/models/manual` | 手动添加模型到某供应商 |
 | `DELETE` | `/api/models/manual` | 移除手动模型 |
-| `GET` | `/api/settings` | 读取设置（含网关 Key 掩码与可复制的明文、监听地址） |
+| `GET` | `/api/settings` | 读取设置（含默认网关 Key 的掩码与可复制的明文、监听地址）；`gateway_key_*` 字段始终指向默认 Key（最早创建的启用 Key） |
 | `PUT` | `/api/settings` | 更新设置（日志开关等） |
-| `GET` | `/api/gateway-key` | 返回掩码与提示（不含明文） |
-| `POST` | `/api/gateway-key/reset` | 重新生成网关 Key；明文同时以密文入库，控制台可随时查看/复制 |
-| `GET` | `/api/logs` | 查询日志：`?status=&model=&provider_id=&from=&to=&limit=&offset=` |
+| `GET` | `/api/gateway-keys` | 网关 Key 列表（别名 / 备注 / 掩码 / 启停 / 模型范围 / 创建与最近使用）；`?include_deleted=1` 含已软删除的记录 |
+| `POST` | `/api/gateway-keys` | 新建网关 Key（别名必填 ≤64 rune、备注 ≤256、可指定启用状态与模型范围）；明文只在响应里返回一次，同时以密文入库 |
+| `PUT` | `/api/gateway-keys/{id}` | 更新别名 / 备注 / 启用状态 / 模型范围；停用或删除最后一个启用的 Key 返回 409 |
+| `DELETE` | `/api/gateway-keys/{id}` | 软删除（记录保留供历史日志与统计显示名称）；撤销最后一个启用的 Key 返回 409 |
+| `GET` | `/api/gateway-keys/{id}/reveal` | 查看某个 Key 的明文（旧记录只存哈希或主密钥不匹配时返回 409 + `revealable=false`） |
+| `POST` | `/api/gateway-keys/{id}/reset` | 只重置某个 Key 的明文（别名 / 备注 / 启用状态 / 模型范围不变） |
+| `GET` | `/api/gateway-key` | 默认 Key 的掩码与提示（不含明文）；兼容保留 |
+| `POST` | `/api/gateway-key/reset` | 软删全部网关 Key 并新建一个默认 Key；明文同时以密文入库，控制台可随时查看/复制 |
+| `GET` | `/api/logs` | 查询日志：`?status=&model=&provider_id=&gateway_key_id=&from=&to=&limit=&offset=`；`total` 跟随筛选条件 |
+| `GET` | `/api/usage` | 用量统计：`?granularity=&from=&to=&gateway_key_id=`；带 `gateway_key_id` 时只统计该 Key |
 | `GET` | `/api/export` | 导出配置（**含明文 API Key**，按凭证保管） |
 | `POST` | `/api/import` | 导入配置（含明文 API Key；导入后用本机主密钥重新加密） |
 | `GET` | `/api/data-locations` | 数据位置：按当前系统返回数据目录、数据库、主密钥、日志等路径与大小 |
@@ -787,7 +816,8 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 - 掩码函数：`hint(s) = s[:3] + "****" + s[len(s)-4:]`（长度不足时全掩码）。
 - **出口唯一性**：所有 API 响应经由序列化结构体（不含 `api_key`/`api_key_cipher` 字段），从类型层面杜绝明文泄露；禁止直接 `SELECT *` 后 `json.Marshal`。
   唯一的例外是显式的导出/迁移接口：`/api/export` 输出明文 `api_key`（用户要求换机迁移可用），
-  网关 Key 的明文只出现在 `/api/settings`（同源控制台复制用），两者都经会话鉴权保护。
+  网关 Key 的明文只出现在 `/api/settings`（默认 Key，兼容字段）、`/api/gateway-keys` 的创建响应
+  与 `/api/gateway-keys/{id}/reveal`（按需取回单个 Key，供同源控制台复制），三者都经会话鉴权保护。
 - 日志与错误信息过滤：正则剔除 `sk-[A-Za-z0-9_\-]{8,}`、`gw-[A-Za-z0-9_\-]{8,}` 形态的字符串。
 
 ### 7.9 日志写入策略
@@ -857,8 +887,9 @@ order := keyRuntime.order(p.ID, keys, 3)   // 轮询起点 + 健康过滤，仅 
 | `/` | 概览（可选，非 P0） | `/api/health`、`/api/providers`、`/api/models` |
 | `/providers` | 供应商管理（列表 + 抽屉/弹窗表单） | `/api/providers` |
 | `/models` | 模型列表（聚合视图） | `/api/models` |
-| `/settings` | 网关设置（Key、端口、刷新间隔、Base URL 片段） | `/api/settings`、`/api/gateway-key` |
-| `/logs` | 请求日志 | `/api/logs` |
+| `/settings` | 网关设置（多网关 Key、端口、刷新间隔、Base URL 片段） | `/api/settings`、`/api/gateway-keys` |
+| `/logs` | 请求日志 | `/api/logs`、`/api/gateway-keys?include_deleted=1` |
+| `/usage` | 使用统计（可按网关 Key 过滤） | `/api/usage`、`/api/gateway-keys?include_deleted=1` |
 | `/data` | 数据位置（本机落盘路径与大小） | `/api/data-locations` |
 | `/login` | 登录（仅远程模式） | `/api/auth/login` |
 
@@ -897,18 +928,28 @@ order := keyRuntime.order(p.ID, keys, 3)   // 轮询起点 + 健康过滤，仅 
 
 ### 8.4 网关设置页
 
-- 展示 **Base URL**（依据当前监听地址生成）与**网关 Key**（明文，附「复制」按钮），提供一键复制。
-- 直接给出可粘贴到 Agent 的环境变量片段（并把当前网关 Key 填进片段），并提供「复制」按钮——对应 PRD 的 S2 场景。
-- 网关 Key 重置：二次确认 + 旧 Key 立即失效提示；明文以密文入库，重置后可继续查看/复制。
-  明文还原不了时（旧版本只存哈希，或主密钥被更换后密文无法解密）接口仍返回 200、
-  `gateway_key_revealable=false`，页面提示「请重置网关 Key」，并在服务端日志留一条 WARN——不按接口故障处理。
+- **多网关 Key 列表**：每行展示别名、备注（用途 / 使用人）、掩码、启用开关、模型范围摘要、
+  创建与最近使用时间；支持新建、编辑、启停、软删除（记录保留供历史日志/统计显示名称）、
+  按需查看并复制明文、只重置明文（别名 / 备注 / 状态 / 范围保持不变）。
+- 每行标签后显示该 Key 的**全部历史累计用量**：总 token、输入(命中缓存)、输入(未命中缓存)、
+  输出；口径与使用统计页一致（未命中 = 输入总量 − 命中缓存，总量 = 输入总量 + 输出）。
+- 模型范围选择：按供应商分组勾选「对外模型名」，提交时映射回**上游模型名**；
+  不勾选任何项 = 不限制（与升级前的行为一致）。保存前会拒绝指向已删除供应商或未勾选模型的范围。
+- 最后一个启用的 Key 不允许停用或删除（409），避免把所有 Agent 立刻锁死。
+- 展示 **Base URL**（依据当前监听地址生成）与**可选的网关 Key**：下拉选一个 Key，
+  明文按需取回并填进下方环境变量片段，提供「复制」按钮——对应 PRD 的 S2 场景。
+- 明文还原不了时（旧版本只存哈希，或主密钥被更换后密文无法解密）单 Key 的 reveal 返回 409 +
+  `revealable=false`，该行提示「请重置」，并在服务端日志留一条 WARN——不按接口故障处理。
+  `/api/settings` 的 `gateway_key_*` 兼容字段仍指向默认 Key（最早创建的启用 Key）。
 - 成功日志开关、监听地址（修改需重启时给出明确提示）。
 
 ### 8.5 日志页
 
-- 顶部筛选：时间范围、状态码段、模型、供应商、仅看失败。
-- 表格：时间 · 协议 · 模型 · 供应商 · 上游 URL · 状态码 · 延迟 · 首字节 · 错误摘要（含凭证级故障转移明细，可展开查看截断错误体）。
-- 分页（`limit`/`offset`），默认按时间倒序。
+- 顶部筛选：时间范围、状态码段、模型、供应商、**网关 Key（全量下拉，含已删除）**、仅看失败。
+- 表格：时间 · 协议 · 模型 · 供应商 · **网关 Key** · 上游 URL · 状态码 · 延迟 · 首字节 · 错误摘要
+  （含凭证级故障转移明细，可展开查看截断错误体）。网关 Key 列显示「别名（备注）」，
+  已删除的 Key 也能显示名称，无归属的历史行为 `—`。
+- 分页（`limit`/`offset`），默认按时间倒序；`total` 跟随筛选条件，保证翻页与列表一致。
 
 ### 8.6 数据位置页（`/data`）
 
@@ -947,7 +988,7 @@ order := keyRuntime.order(p.ID, keys, 3)   // 轮询起点 + 健康过滤，仅 
 | 单个上游 Key 失效/欠费拖垮服务 | 凭证级故障转移 + 自动停用 + 冷却，失败不再反复打上游 | §7.10 |
 | 主密钥硬编码 | 优先环境变量；文件方式权限 `0600` | §4.3 |
 | Key 明文外泄 | 出口结构体不含 Key 字段；掩码回显；日志正则脱敏 | §7.8 |
-| 网关 Key 泄露 | 可一键重置（旧 Key 立即失效）；只存哈希；预留多 Key 表结构 | §4.1 / §6.1 |
+| 网关 Key 泄露 | 每个 Key 可单独启停 / 软删除 / 只重置明文（旧明文立即失效）；只存哈希（常量时间比对）；可限定该 Key 的模型范围缩小影响面 | §4.1 / §6.1 |
 | 恶意/异常上游耗尽内存 | body 上限、响应体/流总时长保护、日志队列丢弃策略 | FR-9.6 / §7.9 |
 | 头部注入 | 剥离逐跳头；`extra_headers` 禁止覆盖 `Host`/认证头 | §5.3 |
 | 常量时间比对 | 网关 Key 哈希比对用 `subtle.ConstantTimeCompare` | §5.2 |
@@ -1113,7 +1154,7 @@ WantedBy=multi-user.target
 | --- | --- |
 | `/v1/models` 的 Anthropic 格式内容协商 | Anthropic 官方较晚才提供 `/v1/models`，且 Claude Code / Anthropic SDK 等主流客户端**不依赖它**工作（模型名写死在配置里）。为极少数严格校验 schema 的客户端做内容协商，投入产出比极低。保持 OpenAI 格式。 |
 | 水平扩展 / 多实例 | 个人自用网关，SQLite 单机足够；定时任务用 goroutine + ticker，不阻塞主流程。单实例设计能省掉分布式配置同步的全部复杂度。 |
-| 把「单网关 Key」当作安全漏洞 | 它本质是**可用性问题**，且用户明确要求只提供一个 Key。v1 在数据库层用 `gateway_keys` 表预留结构，未来零改表即可支持多 Key / 吊销。 |
+| ~~把「单网关 Key」当作安全漏洞~~ | **第 14 轮已变更**：用户要求从「一个 Key」改为「多个 Key + 启停 + 别名备注 + 模型范围」。现按 `gateway_keys` 表实现多条记录，单一入口仍在（`/v1`），隔离靠「不同 Key + 各自模型范围」。 |
 | 模型别名表 | 用 `provider/model` 语法即可解决同名冲突，不引入新增概念与配置面。 |
 | 跨供应商凭证共享/跨供应商故障转移 | 供应商各自独立计费与配额，跨供应商重试会把请求发到用户没选的服务上；只在同一供应商内部轮询与切换。 |
 | Key 数量上限 | 需求明确不设上限；代价仅是保存/列表的 O(n) 展示与请求内最多 3 次尝试。 |

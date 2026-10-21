@@ -20,14 +20,19 @@ type Entry struct {
 	Model           string    `json:"model"`
 	ProviderID      string    `json:"provider_id"`
 	// KeyHint 是实际服务该请求的供应商 Key 掩码（sk-****abcd），用于排障。
-	KeyHint     string `json:"key_hint,omitempty"`
-	UpstreamURL string `json:"upstream_url"`
-	StatusCode  int    `json:"status_code"`
-	LatencyMS   int64  `json:"latency_ms"`
-	FirstByteMS int64  `json:"first_byte_ms"`
-	Stream      bool   `json:"stream"`
-	ErrorMsg    string `json:"error_msg,omitempty"`
-	ClientIP    string `json:"client_ip"`
+	KeyHint string `json:"key_hint,omitempty"`
+	// GatewayKeyID 是发起该请求的网关 API Key id（空表示静态 Key 或历史数据）。
+	// 落库后由查询侧回填 GatewayKeyName 供页面展示，本结构不写该列。
+	GatewayKeyID string `json:"gateway_key_id,omitempty"`
+	// GatewayKeyName 是该网关 Key 的别名/备注（只读展示用，不落库）。
+	GatewayKeyName string `json:"gateway_key_name,omitempty"`
+	UpstreamURL    string `json:"upstream_url"`
+	StatusCode     int    `json:"status_code"`
+	LatencyMS      int64  `json:"latency_ms"`
+	FirstByteMS    int64  `json:"first_byte_ms"`
+	Stream         bool   `json:"stream"`
+	ErrorMsg       string `json:"error_msg,omitempty"`
+	ClientIP       string `json:"client_ip"`
 }
 
 // Writer 是日志落库接口（由 store 实现）。

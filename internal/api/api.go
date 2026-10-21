@@ -122,6 +122,14 @@ func (s *Server) Register(mux *http.ServeMux) {
 	// 设置与网关 Key
 	mux.HandleFunc("GET /api/settings", s.guard(s.handleGetSettings))
 	mux.HandleFunc("PUT /api/settings", s.guard(s.handleUpdateSettings))
+	// 多网关 Key：列表（含已删除）/ 新建 / 更新 / 软删除 / 查看明文 / 重置明文
+	mux.HandleFunc("GET /api/gateway-keys", s.guard(s.handleListGatewayKeys))
+	mux.HandleFunc("POST /api/gateway-keys", s.guard(s.handleCreateGatewayKey))
+	mux.HandleFunc("PUT /api/gateway-keys/{id}", s.guard(s.handleUpdateGatewayKey))
+	mux.HandleFunc("DELETE /api/gateway-keys/{id}", s.guard(s.handleDeleteGatewayKey))
+	mux.HandleFunc("GET /api/gateway-keys/{id}/reveal", s.guard(s.handleRevealGatewayKey))
+	mux.HandleFunc("POST /api/gateway-keys/{id}/reset", s.guard(s.handleResetGatewayKeyByID))
+	// 兼容旧接口：指向「默认 Key」（最早创建的启用 Key）
 	mux.HandleFunc("GET /api/gateway-key", s.guard(s.handleGetGatewayKey))
 	mux.HandleFunc("POST /api/gateway-key/reset", s.guard(s.handleResetGatewayKey))
 

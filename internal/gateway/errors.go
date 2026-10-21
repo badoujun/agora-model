@@ -10,6 +10,7 @@ const (
 	codeInvalidRequest      = "invalid_request_error"
 	codeInvalidAPIKey       = "invalid_api_key"
 	codeModelNotFound       = "model_not_found"
+	codeModelNotAllowed     = "model_not_allowed"
 	codeNotFound            = "not_found"
 	codePayloadTooLarge     = "payload_too_large"
 	codeUpstreamUnreachable = "upstream_unreachable"
@@ -33,6 +34,10 @@ func openAITypeOf(code string) string {
 	switch code {
 	case codeInvalidAPIKey:
 		return "authentication_error"
+	case codeModelNotAllowed:
+		// 模型存在、但当前网关 Key 的模型范围不允许：是权限问题而不是参数问题，
+		// 客户端据此区分「改请求」与「找管理员加权限」。
+		return "permission_error"
 	case codeModelNotFound, codeNotFound:
 		return "not_found_error"
 	case codeUpstreamUnreachable, codeUpstreamTimeout, codeNoAvailableProvider:

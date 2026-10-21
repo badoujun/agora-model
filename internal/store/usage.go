@@ -22,9 +22,13 @@ type MinuteBucket struct {
 
 // DailyBucket 是一天内一个 (provider, model) 的 token 累计。
 //
-// 与 MinuteBucket 同样的字段，区别仅在聚合键（按天 vs 按分钟）。
+// 与 MinuteBucket 同样的字段，区别仅在聚合键（按天 vs 按分钟），
+// 并额外带上网关 Key 维度（GatewayKeyID）：控制台的「使用统计」要能按
+// 网关 Key 过滤，因此日聚合的主键是 (date, gateway_key_id, provider, model)。
 type DailyBucket struct {
-	Date              string // YYYY-MM-DD
+	Date string // YYYY-MM-DD
+	// GatewayKeyID 是发起请求的网关 Key id；空串表示无归属（历史数据或静态 Key）。
+	GatewayKeyID      string
 	ProviderID        string
 	Model             string
 	Requests          int
@@ -89,6 +93,9 @@ func (s *Store) UpsertUsageMinute(ctx context.Context, buckets []MinuteBucket) e
 // UpsertUsageDaily 把当日分钟的累计"提升"到日聚合表（同时也会用于跨日
 // 写入——同主键原子合并）。调用方通常在 UpsertUsageMinute 的同一事务
 // 里一并调用，保证日聚合与分钟明细强一致。
+//
+// 主键是 (date, gateway_key_id, provider_id, model)：同一个模型被不同网关
+// Key 调用时会各占一行，因此控制台既能看「全部」，也能看「单个 Key」。
 func (s *Store) UpsertUsageDaily(ctx context.Context, buckets []DailyBucket) error {
 	if len(buckets) == 0 {
 		return nil
@@ -99,9 +106,9 @@ func (s *Store) UpsertUsageDaily(ctx context.Context, buckets []DailyBucket) err
 	}
 	stmt, err := tx.PrepareContext(ctx,
 		`INSERT INTO model_usage_daily
-		 (date, provider_id, model, requests, input_tokens, cached_input_tokens, output_tokens)
-		 VALUES (?,?,?,?,?,?,?)
-		 ON CONFLICT(date, provider_id, model) DO UPDATE SET
+		 (date, gateway_key_id, provider_id, model, requests, input_tokens, cached_input_tokens, output_tokens)
+		 VALUES (?,?,?,?,?,?,?,?)
+		 ON CONFLICT(date, gateway_key_id, provider_id, model) DO UPDATE SET
 		   requests           = requests           + excluded.requests,
 		   input_tokens       = input_tokens       + excluded.input_tokens,
 		   cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
@@ -114,7 +121,7 @@ func (s *Store) UpsertUsageDaily(ctx context.Context, buckets []DailyBucket) err
 
 	for _, b := range buckets {
 		if _, err := stmt.ExecContext(ctx,
-			b.Date, b.ProviderID, b.Model,
+			b.Date, b.GatewayKeyID, b.ProviderID, b.Model,
 			b.Requests, b.InputTokens, b.CachedInputTokens, b.OutputTokens,
 		); err != nil {
 			_ = tx.Rollback()
@@ -248,4 +255,48 @@ func (s *Store) ProviderKeyUsageTotals(ctx context.Context, providerID string) (
 		out[keyID] = t
 	}
 	return out, rows.Err()
+}
+
+// GatewayKeyUsageTotals 是某个网关 Key 的全部历史累计用量（跨日期 / 供应商 / 模型）。
+type GatewayKeyUsageTotals struct {
+	InputTokens       int64
+	CachedInputTokens int64
+	OutputTokens      int64
+}
+
+// SumUsageByGatewayKey 按网关 Key 汇总 model_usage_daily 的全部历史用量。
+//
+// 返回的 map 以 gateway_key_id 为键：没产生过用量的 Key 不会出现；
+// gateway_key_id 为空串的历史无归属行也会单独成项，不会误挂到某个 Key 上。
+//
+// 口径与 /api/usage 一致：InputTokens 已包含命中缓存的部分，因此
+// 「未命中缓存」= InputTokens - CachedInputTokens，「总 token」= InputTokens + OutputTokens。
+func (s *Store) SumUsageByGatewayKey(ctx context.Context) (map[string]GatewayKeyUsageTotals, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT gateway_key_id,
+		        COALESCE(SUM(input_tokens), 0),
+		        COALESCE(SUM(cached_input_tokens), 0),
+		        COALESCE(SUM(output_tokens), 0)
+		 FROM model_usage_daily
+		 GROUP BY gateway_key_id`)
+	if err != nil {
+		return nil, fmt.Errorf("汇总网关 Key 用量失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]GatewayKeyUsageTotals)
+	for rows.Next() {
+		var (
+			keyID  string
+			totals GatewayKeyUsageTotals
+		)
+		if err := rows.Scan(&keyID, &totals.InputTokens, &totals.CachedInputTokens, &totals.OutputTokens); err != nil {
+			return nil, fmt.Errorf("读取网关 Key 用量失败: %w", err)
+		}
+		out[keyID] = totals
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读取网关 Key 用量失败: %w", err)
+	}
+	return out, nil
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"agora-model/internal/config"
@@ -253,6 +254,9 @@ func (s *Store) GetProviderKey(ctx context.Context, providerID, keyID string) (P
 }
 
 // DeleteProvider 删除供应商并清理其模型候选缓存、凭证与按 Key 用量明细。
+//
+// 同时清理网关 Key 的模型范围里指向该供应商的行：否则这些范围条目会
+// 永久失效（供应商已不存在），在设置页显示为勾选状态却永远命中不了。
 func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -262,6 +266,7 @@ func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 		`DELETE FROM model_cache WHERE provider_id = ?`,
 		`DELETE FROM provider_key_usage_daily WHERE provider_id = ?`,
 		`DELETE FROM provider_keys WHERE provider_id = ?`,
+		`DELETE FROM gateway_key_models WHERE provider_id = ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, id); err != nil {
 			_ = tx.Rollback()
@@ -420,10 +425,44 @@ func (s *Store) SaveProvider(ctx context.Context, master []byte, p config.Provid
 		}
 	}
 
+	// 供应商取消勾选某个模型后，网关 Key 的模型范围里指向它的行也必须清掉：
+	// 否则设置页会显示「已勾选」，实际路由却永远跳过（模型已不再暴露）。
+	if err := pruneGatewayKeyScopesTx(ctx, tx, p.ID, p.Models); err != nil {
+		return ProviderRecord{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return ProviderRecord{}, fmt.Errorf("提交供应商保存失败: %w", err)
 	}
 	return s.GetProvider(ctx, p.ID)
+}
+
+// pruneGatewayKeyScopesTx 在既有事务里清掉某个供应商下「已不再勾选」的模型范围行。
+//
+// 传入的 modelNames 是该供应商保存后的最终上游模型列表；不在此列表中的
+// 范围条目一律删除（别名对应的是同一个上游名，因此不会误删）。
+func pruneGatewayKeyScopesTx(ctx context.Context, tx *sql.Tx, providerID string, modelNames []string) error {
+	args := make([]any, 0, len(modelNames)+1)
+	args = append(args, providerID)
+	q := `DELETE FROM gateway_key_models WHERE provider_id = ?`
+	if len(modelNames) > 0 {
+		placeholders := make([]string, 0, len(modelNames))
+		for _, m := range modelNames {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, m)
+		}
+		if len(placeholders) > 0 {
+			q += ` AND model NOT IN (` + strings.Join(placeholders, ",") + `)`
+		}
+	}
+	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("清理网关 Key 模型范围失败: %w", err)
+	}
+	return nil
 }
 
 // LoadProviders 读出全部供应商并解密启用的凭证，返回可直接构建快照的配置。

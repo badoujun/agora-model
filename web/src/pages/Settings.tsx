@@ -1,11 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Check,
   CloudUpload,
   Copy,
   Download,
-  KeyRound,
   Plug,
   RefreshCw,
   Save,
@@ -18,7 +17,9 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { GatewayKeysCard } from '@/components/GatewayKeysCard'
 
 export function SettingsPage() {
   const toast = useToast()
@@ -31,8 +32,10 @@ export function SettingsPage() {
     refetchInterval: 15_000,
   })
 
-  const [newKey, setNewKey] = useState<string | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
+  // 接入片段当前使用的网关 Key（明文按需 reveal，只留在本页内存）
+  const [snippetKeyId, setSnippetKeyId] = useState('')
+  const [snippetPlain, setSnippetPlain] = useState('')
 
   // WebDAV 表单本地状态：只暴露远程根目录与凭证；文件名由服务端内置（agoramodel-providers.json）
   const [webdavUrl, setWebdavUrl] = useState('')
@@ -47,15 +50,6 @@ export function SettingsPage() {
     setWebdavFormInitialized(true)
   }
 
-  const resetKey = useMutation({
-    mutationFn: api.resetGatewayKey,
-    onSuccess: async (data) => {
-      setNewKey(data.gateway_key)
-      await queryClient.invalidateQueries({ queryKey: ['settings'] })
-      toast.show('已生成新的网关 Key：旧 Key 立即失效，请更新所有 Agent 配置', 'success')
-    },
-    onError: (err: Error) => toast.show(`重置失败：${err.message}`, 'error'),
-  })
   const saveSettings = useMutation({
     mutationFn: (payload: { log_success?: boolean }) => api.updateSettings(payload),
     onSuccess: async () => {
@@ -157,10 +151,45 @@ export function SettingsPage() {
 
   const data = settings.data
   const logSuccess = data?.log_success === 'true'
-  // 当前网关 Key 的明文（可随时查看/复制）；旧版本的 Key 只能重置
-  const currentKey = data?.gateway_key || ''
-  // 接入示例里的 Key 直接带上明文，方便一键复制
-  const keyForSnippet = currentKey || '<你的网关 Key>'
+
+  // 接入片段使用的网关 Key：默认选中「默认 Key」（最早的启用 Key，由 /api/settings 给出）。
+  const gatewayKeys = useQuery({
+    queryKey: ['gateway-keys', { includeDeleted: false }],
+    queryFn: () => api.listGatewayKeys(),
+  })
+  const activeKeys = (gatewayKeys.data?.items ?? []).filter((key) => !key.deleted && key.enabled)
+
+  useEffect(() => {
+    if (snippetKeyId || activeKeys.length === 0) return
+    const preferred = data?.gateway_key_id
+    const picked = activeKeys.find((key) => key.id === preferred) ?? activeKeys[0]
+    setSnippetKeyId(picked.id)
+  }, [snippetKeyId, activeKeys, data?.gateway_key_id])
+
+  // 选中 Key 的明文按需取回（旧记录只存哈希时取不到，片段退化为占位符）。
+  useEffect(() => {
+    if (!snippetKeyId) {
+      setSnippetPlain('')
+      return
+    }
+    // 用户已切换 Key：先清掉上一个 Key 的明文，避免串号
+    setSnippetPlain('')
+    let cancelled = false
+    void (async () => {
+      try {
+        const revealed = await api.revealGatewayKey(snippetKeyId)
+        if (!cancelled) setSnippetPlain(revealed.gateway_key)
+      } catch {
+        if (!cancelled) setSnippetPlain('')
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [snippetKeyId])
+
+  const selectedSnippetKey = activeKeys.find((key) => key.id === snippetKeyId)
+  const keyForSnippet = snippetPlain || '<你的网关 Key>'
 
   const origin = window.location.origin
   const openaiSnippet = `OPENAI_BASE_URL=${origin}/v1\nOPENAI_API_KEY=${keyForSnippet}`
@@ -170,85 +199,45 @@ export function SettingsPage() {
       <div>
         <h1 className="text-xl font-semibold text-slate-900">网关设置</h1>
         <p className="mt-1 text-sm text-slate-500">
-          所有 Agent 共用同一个入口与同一个 Key；新增供应商只需在「供应商管理」里填一次。
+          所有 Agent 共用同一个入口；可按 Agent / 使用人发放多个网关 Key，各自设置模型范围。
         </p>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <KeyRound className="h-4 w-4" />
-            网关 API Key
-          </CardTitle>
-          <CardDescription>
-            所有 Agent 共用这一个 Key；明文以 AES 加密保存在本机数据库中，仅同源控制台可查看，可随时复制。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <code className="min-w-0 flex-1 break-all rounded bg-slate-100 px-2 py-1 font-mono text-sm">
-              {currentKey || '（尚未生成）'}
-            </code>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => copy('current-key', currentKey)}
-              disabled={!currentKey}
-              title={currentKey ? '复制网关 Key' : '暂无可复制的明文'}
-            >
-              {copied === 'current-key' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-              复制
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                if (window.confirm('重置后旧 Key 会立即失效，需要更新所有 Agent 配置。确认继续？')) {
-                  resetKey.mutate()
-                }
-              }}
-              disabled={resetKey.isPending}
-            >
-              <RefreshCw className="h-4 w-4" />
-              重置网关 Key
-            </Button>
-          </div>
-          <span className="text-xs text-slate-500">
-            创建于 {formatTime(data?.gateway_key_created_at)} · 最近使用 {formatTime(data?.gateway_key_last_used)}
-            {data?.gateway_key_hint ? ` · 掩码 ${data.gateway_key_hint}` : ''}
-          </span>
-
-          {data && data.gateway_key_hint && !data.gateway_key_revealable ? (
-            <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-              无法还原这个 Key 的明文：可能是旧版本创建的 Key（数据库里只保存了哈希），或主密钥被更换后无法解密已保存的密文。
-              点「重置网关 Key」即可生成一个可随时复制的新 Key。
-            </p>
-          ) : null}
-
-          {newKey ? (
-            <div className="rounded-md border border-amber-200 bg-amber-50 p-3">
-              <p className="text-sm font-medium text-amber-900">已生成新的网关 Key（旧 Key 已失效）</p>
-              <div className="mt-2 flex items-center gap-2">
-                <code className="min-w-0 flex-1 break-all rounded bg-white px-2 py-1 font-mono text-sm">{newKey}</code>
-                <Button variant="outline" size="sm" onClick={() => copy('new-key', newKey)}>
-                  {copied === 'new-key' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                  复制
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => setNewKey(null)}>
-                  知道了
-                </Button>
-              </div>
-            </div>
-          ) : null}
-        </CardContent>
-      </Card>
+      <GatewayKeysCard selectedKeyId={snippetKeyId} onSelectKey={setSnippetKeyId} />
 
       <Card>
         <CardHeader>
           <CardTitle>接入地址</CardTitle>
           <CardDescription>把下面的环境变量填进任意支持自定义 Base URL 的 Agent。</CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="snippet-key">使用哪个网关 Key</Label>
+            <Select
+              id="snippet-key"
+              className="w-full sm:w-80"
+              value={snippetKeyId}
+              onChange={(event) => setSnippetKeyId(event.target.value)}
+            >
+              {activeKeys.length === 0 ? <option value="">（没有启用的 Key）</option> : null}
+              {activeKeys.map((key) => (
+                <option key={key.id} value={key.id}>
+                  {key.name}
+                  {key.note ? `（${key.note}）` : ''}
+                </option>
+              ))}
+            </Select>
+            <p className="text-xs text-slate-500">
+              {snippetKeyId && !snippetPlain
+                ? '该 Key 的明文取不到（旧记录只存哈希或主密钥已更换）：片段里是占位符，请到上方该 Key 的行点「重置」生成新明文。'
+                : '选中的 Key 明文会自动填入下面的片段；明文只留在当前页面内存中。'}
+            </p>
+            {selectedSnippetKey ? (
+              <p className="text-xs text-slate-500">
+                模型范围：{selectedSnippetKey.scopes.length === 0 ? '不限制（可调用全部模型）' : `${selectedSnippetKey.scopes.length} 个模型`}
+              </p>
+            ) : null}
+          </div>
           <div className="rounded-md border border-slate-200 p-3">
             <div className="flex items-center justify-between">
               <p className="text-sm font-medium">OpenAI 协议（Codex / Cursor / 任意 OpenAI 兼容工具）</p>

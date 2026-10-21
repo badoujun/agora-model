@@ -1,6 +1,10 @@
 import type {
   DataLocationsPayload,
   DraftFetchInput,
+  GatewayKeyDTO,
+  GatewayKeyInput,
+  GatewayKeyListPayload,
+  GatewayKeyPlainPayload,
   HealthInfo,
   LogItem,
   ModelItem,
@@ -141,7 +145,37 @@ export const api = {
       body: JSON.stringify(body),
     }),
   resetGatewayKey: () =>
-    request<{ gateway_key: string; key_hint: string; warning: string }>('/api/gateway-key/reset', {
+    request<GatewayKeyPlainPayload>('/api/gateway-key/reset', {
+      method: 'POST',
+    }),
+
+  // 多网关 API Key：列表（含已删除）/ 新建 / 更新 / 软删除 / 查看明文 / 重置明文
+  listGatewayKeys: (params: { includeDeleted?: boolean } = {}) =>
+    request<GatewayKeyListPayload>(
+      `/api/gateway-keys${params.includeDeleted ? '?include_deleted=1' : ''}`,
+    ),
+  createGatewayKey: (body: GatewayKeyInput) =>
+    request<GatewayKeyPlainPayload>('/api/gateway-keys', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  updateGatewayKey: (id: string, body: GatewayKeyInput) =>
+    request<{ key: GatewayKeyDTO }>(`/api/gateway-keys/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  deleteGatewayKey: (id: string) =>
+    request<{ ok: boolean; deleted: boolean }>(`/api/gateway-keys/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  /** 查看某个网关 Key 的明文（旧记录只存哈希时返回 409） */
+  revealGatewayKey: (id: string) =>
+    request<GatewayKeyPlainPayload>(`/api/gateway-keys/${encodeURIComponent(id)}/reveal`),
+  /** 只换明文，保留别名、备注、状态与模型范围 */
+  resetGatewayKeyById: (id: string) =>
+    request<GatewayKeyPlainPayload>(`/api/gateway-keys/${encodeURIComponent(id)}/reset`, {
       method: 'POST',
     }),
 
@@ -182,12 +216,18 @@ export const api = {
     failed?: string
     model?: string
     provider_id?: string
+    gateway_key_id?: string
     status_min?: number
     limit?: number
     offset?: number
   }) => request<{ items: LogItem[]; total: number; limit: number; offset: number }>(`/api/logs${query(params)}`),
 
   // 使用统计（前端「使用统计」页面读取）
-  usage: (params: { granularity?: 'daily' | 'weekly' | 'monthly'; from?: string; to?: string } = {}) =>
-    request<UsagePayload>(`/api/usage${query(params)}`),
+  usage: (params: {
+    granularity?: 'daily' | 'weekly' | 'monthly'
+    from?: string
+    to?: string
+    /** 留空 = 统计全部网关 Key */
+    gateway_key_id?: string
+  } = {}) => request<UsagePayload>(`/api/usage${query(params)}`),
 }

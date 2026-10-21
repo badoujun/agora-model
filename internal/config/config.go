@@ -172,6 +172,24 @@ func (p *Provider) KnowsModel(exposed string) bool {
 	return ok
 }
 
+// HasUpstreamModel 报告该供应商是否勾选了某个**上游模型名**。
+//
+// 与 KnowsModel 的区别：KnowsModel 接受对外名/别名，本方法只认
+// models_selected 里的原始名字——网关 Key 的模型范围存的就是上游名，
+// 因此校验范围时用它（别名改动不应让已存的范围失效）。
+func (p *Provider) HasUpstreamModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	for _, m := range p.Models {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
 // ExposedModels 返回该供应商对外暴露的模型名列表（保持勾选顺序）。
 func (p *Provider) ExposedModels() []string {
 	out := make([]string, 0, len(p.Models))

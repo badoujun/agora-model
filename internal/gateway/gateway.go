@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,8 +61,12 @@ type Gateway struct {
 	keyStats   ProviderKeyStats
 	// lastSnap 记录最近一次"被请求路径观察到"的快照，用于在新快照生效时
 	// 复位被用户重新启用的 Key（见 observe）。
-	lastSnap  atomic.Pointer[config.Snapshot]
-	lastTouch atomic.Int64 // 网关 Key 使用时间的节流（Unix 秒）
+	lastSnap atomic.Pointer[config.Snapshot]
+	// keyTouch 是「网关 Key id → 上次写入 last_used_at 的 Unix 秒」的节流表。
+	//
+	// 必须按 Key 分开：多 Key 同时启用时，若共用一个全局时间戳，先到的 Key
+	// 会把窗口占掉，其余 Key 的 last_used_at 永远不更新。
+	keyTouch sync.Map // map[string]*atomic.Int64
 }
 
 // New 创建网关。
@@ -146,7 +151,8 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 				fmt.Sprintf("%s 仅支持 GET，收到 %s", config.ModelsPath, r.Method), "")
 			return
 		}
-		if !g.authorize(r) {
+		keyID, ok := g.authorize(r)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, codeInvalidAPIKey,
 				"网关 API Key 无效或缺失", "")
 			return
@@ -154,6 +160,9 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 
 		snap := g.holder.Get()
 		providers := snap.Providers()
+		// /v1/models 只列出调用者 Key 范围内的模型：否则 Agent 会拿到
+		// 一份包含无权模型的清单，选中后请求才被 403 拒绝。
+		scope := snap.GatewayKeyScope(keyID)
 
 		// 裸名：Providers 已按供应商名称升序，首个出现者即默认供应商。
 		// 没有可用 Key 的供应商不对外暴露模型（含被自动停用的场景）。
@@ -168,6 +177,9 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 				if seen[exposed] {
 					continue
 				}
+				if !scope.AllowsExposed(p, exposed) {
+					continue
+				}
 				seen[exposed] = true
 				data = append(data, modelEntry{ID: exposed, Object: "model", OwnedBy: p.Name})
 			}
@@ -178,6 +190,9 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 				continue
 			}
 			for _, exposed := range p.ExposedModels() {
+				if !scope.AllowsExposed(p, exposed) {
+					continue
+				}
 				data = append(data, modelEntry{ID: p.Name + "/" + exposed, Object: "model", OwnedBy: p.Name})
 			}
 		}
@@ -206,6 +221,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 			providerID   string
 			upstreamURL  string
 			keyHint      string
+			gatewayKeyID string
 			streamServed bool
 		)
 		defer func() {
@@ -216,6 +232,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 				Model:           model,
 				ProviderID:      providerID,
 				KeyHint:         keyHint,
+				GatewayKeyID:    gatewayKeyID,
 				UpstreamURL:     upstreamURL,
 				StatusCode:      rec.statusCode(),
 				LatencyMS:       time.Since(started).Milliseconds(),
@@ -232,14 +249,16 @@ func (g *Gateway) handler() http.HandlerFunc {
 			return
 		}
 
-		// 1) 入站鉴权
-		if !g.authorize(r) {
+		// 1) 入站鉴权（回传命中的网关 Key id，供模型范围判定与日志归属）
+		gkID, ok := g.authorize(r)
+		if !ok {
 			g.logger.Warn("网关鉴权失败",
 				"request_id", requestID, "path", config.ChatCompletionsPath, "client_ip", clientIP(r))
 			writeError(w, http.StatusUnauthorized, codeInvalidAPIKey,
 				"网关 API Key 无效或缺失", "")
 			return
 		}
+		gatewayKeyID = gkID
 
 		// 2) 读取请求体（含上限）
 		body, err := readBody(r, cfg.MaxBodyBytes)
@@ -262,12 +281,16 @@ func (g *Gateway) handler() http.HandlerFunc {
 		}
 
 		// 4) 路由决策
-		decision, err := route.Resolve(snap, model)
+		decision, err := route.ResolveScoped(snap, model, snap.GatewayKeyScope(gatewayKeyID))
 		if err != nil {
 			rec.noteError(err.Error())
 			switch {
 			case errors.Is(err, route.ErrModelNotFound):
 				writeError(w, http.StatusNotFound, codeModelNotFound, err.Error(), "model")
+			case errors.Is(err, route.ErrModelNotAllowed):
+				// 模型存在，但不在当前网关 Key 的模型范围内：403 权限问题，
+				// 不能报 404，否则用户会以为是配置缺失而去翻供应商页。
+				writeError(w, http.StatusForbidden, codeModelNotAllowed, err.Error(), "model")
 			case errors.Is(err, route.ErrProviderDisabled), errors.Is(err, route.ErrProviderNoKey):
 				writeError(w, http.StatusServiceUnavailable, codeNoAvailableProvider, err.Error(), "")
 			default:
@@ -321,7 +344,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 			stats, usage, serr := streamResponse(r.Context(), w, resp, cfg.SSEIdle(), started)
 			g.logCompletion(requestID, model, decision, resp.StatusCode, started, stats, serr)
 			if u, ok := usage.Result(); ok {
-				recordUsage(g.usageSink, decision.Provider.ID, usedKey.ID, decision.Model, resp.StatusCode, u, started)
+				recordUsage(g.usageSink, gatewayKeyID, decision.Provider.ID, usedKey.ID, decision.Model, resp.StatusCode, u, started)
 			}
 			return
 		}
@@ -331,7 +354,7 @@ func (g *Gateway) handler() http.HandlerFunc {
 		written, cerr := copyResponse(w, resp, &bodyBuf)
 		if cerr == nil && bodyBuf.Len() > 0 {
 			if u, ok := parseUsageNonStream(resp.Header.Get("Content-Type"), bodyBuf.Bytes()); ok {
-				recordUsage(g.usageSink, decision.Provider.ID, usedKey.ID, decision.Model, resp.StatusCode, u, started)
+				recordUsage(g.usageSink, gatewayKeyID, decision.Provider.ID, usedKey.ID, decision.Model, resp.StatusCode, u, started)
 			}
 		}
 		g.logger.Info("请求完成",
@@ -342,38 +365,50 @@ func (g *Gateway) handler() http.HandlerFunc {
 	}
 }
 
-// authorize 校验入站凭证：Phase 2 起查 gateway_keys 表，否则使用配置中的静态 Key。
-func (g *Gateway) authorize(r *http.Request) bool {
+// authorize 校验入站凭证，返回命中的网关 Key id。
+//
+// Phase 2 起查 gateway_keys 表（同时支持启用多个 Key），否则退化为
+// 配置中的静态 Key（此时没有 Key id，返回空串）。
+// 返回的 keyID 用于路由时的模型范围判定、请求日志与用量归属。
+func (g *Gateway) authorize(r *http.Request) (keyID string, ok bool) {
 	got := tokenFromRequest(r)
 	if got == "" {
-		return false
+		return "", false
 	}
 	if g.keys != nil {
-		keyID, ok, err := g.keys.VerifyGatewayKey(r.Context(), got)
+		id, ok, err := g.keys.VerifyGatewayKey(r.Context(), got)
 		if err != nil {
 			g.logger.Warn("网关 Key 校验失败", "err", err)
-			return false
+			return "", false
 		}
 		if ok {
-			g.touchKey(keyID)
+			g.touchKey(id)
 		}
-		return ok
+		return id, ok
 	}
 	want := g.holder.Get().Gateway().APIKey
-	return want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	if want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
+		return "", true
+	}
+	return "", false
 }
 
-// touchKey 记录网关 Key 的最后使用时间；节流到最多每分钟一次，且不阻塞请求。
+// touchKey 记录网关 Key 的最后使用时间；按 Key 各自节流到最多每分钟一次，
+// 且不阻塞请求。
+//
+// 节流必须按 Key 独立：多 Key 同时启用时共用一个时间戳会让先到的 Key 占掉
+// 整个窗口，其余 Key 的 last_used_at 永远不更新，控制台就看不到它们在被使用。
 func (g *Gateway) touchKey(keyID string) {
-	if keyID == "" {
+	if keyID == "" || g.keys == nil {
 		return
 	}
 	now := time.Now().Unix()
-	last := g.lastTouch.Load()
-	if now-last < 60 {
+	val, _ := g.keyTouch.LoadOrStore(keyID, &atomic.Int64{})
+	last := val.(*atomic.Int64)
+	if now-last.Load() < 60 {
 		return
 	}
-	if !g.lastTouch.CompareAndSwap(last, now) {
+	if !last.CompareAndSwap(last.Load(), now) {
 		return
 	}
 	go func() {

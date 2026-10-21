@@ -122,3 +122,40 @@ func TestPruneUsageMinute(t *testing.T) {
 		t.Errorf("新 minute 应保留，count=%d", count)
 	}
 }
+
+// TestSumUsageByGatewayKey 验证按网关 Key 汇总全部历史用量（跨日期/供应商/模型）。
+func TestSumUsageByGatewayKey(t *testing.T) {
+	st, _ := newTestStore(t)
+	ctx := context.Background()
+
+	if err := st.UpsertUsageDaily(ctx, []DailyBucket{
+		{Date: "2026-10-19", GatewayKeyID: "gk_a", ProviderID: "p1", Model: "m1",
+			Requests: 1, InputTokens: 100, CachedInputTokens: 30, OutputTokens: 50},
+		{Date: "2026-10-20", GatewayKeyID: "gk_a", ProviderID: "p2", Model: "m2",
+			Requests: 2, InputTokens: 200, CachedInputTokens: 80, OutputTokens: 20},
+		{Date: "2026-10-20", GatewayKeyID: "gk_b", ProviderID: "p1", Model: "m1",
+			Requests: 1, InputTokens: 10, CachedInputTokens: 0, OutputTokens: 5},
+	}); err != nil {
+		t.Fatalf("UpsertUsageDaily: %v", err)
+	}
+
+	totals, err := st.SumUsageByGatewayKey(ctx)
+	if err != nil {
+		t.Fatalf("SumUsageByGatewayKey: %v", err)
+	}
+
+	a, ok := totals["gk_a"]
+	if !ok {
+		t.Fatal("缺少 gk_a 的汇总")
+	}
+	if a.InputTokens != 300 || a.CachedInputTokens != 110 || a.OutputTokens != 70 {
+		t.Errorf("gk_a = %+v, want input=300 cached=110 output=70", a)
+	}
+	b, ok := totals["gk_b"]
+	if !ok {
+		t.Fatal("缺少 gk_b 的汇总")
+	}
+	if b.InputTokens != 10 || b.CachedInputTokens != 0 || b.OutputTokens != 5 {
+		t.Errorf("gk_b = %+v, want input=10 cached=0 output=5", b)
+	}
+}

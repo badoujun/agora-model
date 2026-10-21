@@ -654,8 +654,9 @@ func TestLogsEndpointAndFuzzyModelFilter(t *testing.T) {
 	if strings.Contains(raw, "sk-should-be-redacted") {
 		t.Fatal("日志中的疑似密钥必须脱敏")
 	}
-	if body["total"].(float64) != 2 {
-		t.Errorf("total = %v", body["total"])
+	// total 跟随筛选条件：否则「仅看失败」时翻页会翻到空页。
+	if body["total"].(float64) != 1 {
+		t.Errorf("failed=true 的 total = %v，期望 1（与列表条数一致）", body["total"])
 	}
 
 	// 模型筛选：忽略大小写 + 模糊匹配

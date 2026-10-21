@@ -710,12 +710,12 @@ func TestUsageRecordsServingKey(t *testing.T) {
 	}
 
 	type record struct {
-		provider, key, model string
+		gatewayKey, provider, key, model string
 	}
 	got := make(chan record, 4)
 	g := New(config.NewHolder(snap), testLogger()).WithUsageSink(
-		usageSinkFunc(func(providerID, keyID, model string, statusCode int, u Usage, ts time.Time) {
-			got <- record{provider: providerID, key: keyID, model: model}
+		usageSinkFunc(func(gatewayKeyID, providerID, keyID, model string, statusCode int, u Usage, ts time.Time) {
+			got <- record{gatewayKey: gatewayKeyID, provider: providerID, key: keyID, model: model}
 		}),
 	)
 	mux := http.NewServeMux()
@@ -737,10 +737,10 @@ func TestUsageRecordsServingKey(t *testing.T) {
 }
 
 // usageSinkFunc 让测试函数满足 UsageSink（避免依赖 logging.UsageSinkFunc 的签名细节）。
-type usageSinkFunc func(providerID, keyID, model string, statusCode int, u Usage, ts time.Time)
+type usageSinkFunc func(gatewayKeyID, providerID, keyID, model string, statusCode int, u Usage, ts time.Time)
 
-func (f usageSinkFunc) Record(providerID, keyID, model string, statusCode int, u Usage, ts time.Time) {
-	f(providerID, keyID, model, statusCode, u, ts)
+func (f usageSinkFunc) Record(gatewayKeyID, providerID, keyID, model string, statusCode int, u Usage, ts time.Time) {
+	f(gatewayKeyID, providerID, keyID, model, statusCode, u, ts)
 }
 
 // BenchmarkKeySelectionHotPath 记录纯内存选 Key 的开销（无锁、无 DB）。

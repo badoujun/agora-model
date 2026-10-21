@@ -15,15 +15,17 @@ import (
 // （基线 = 全部 token）。前端 mock 阶段没有用 percent 计算，但保留以便
 // 真实接入后切换。
 type usagePayload struct {
-	FirstUsedAt string               `json:"first_used_at"`
-	ActiveDays  int                  `json:"active_days"`
-	Granularity string               `json:"granularity"`
-	KPI         usageKPI             `json:"kpi"`
-	Models      []usageModelShare    `json:"models"`
-	Providers   []usageProviderShare `json:"providers"`
-	Daily       []usageDailyRow      `json:"daily"`
-	Heatmap     []usageHeatmapCell   `json:"heatmap"`
-	Trend       []usageTrendPoint    `json:"trend"`
+	FirstUsedAt string `json:"first_used_at"`
+	ActiveDays  int    `json:"active_days"`
+	Granularity string `json:"granularity"`
+	// GatewayKeyID 回显本次统计作用的网关 Key；空串表示「全部」。
+	GatewayKeyID string               `json:"gateway_key_id"`
+	KPI          usageKPI             `json:"kpi"`
+	Models       []usageModelShare    `json:"models"`
+	Providers    []usageProviderShare `json:"providers"`
+	Daily        []usageDailyRow      `json:"daily"`
+	Heatmap      []usageHeatmapCell   `json:"heatmap"`
+	Trend        []usageTrendPoint    `json:"trend"`
 }
 
 type usageKPI struct {
@@ -110,18 +112,20 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if granularity == "" {
 		granularity = "daily"
 	}
+	// gateway_key_id 为空 = 统计全部（含历史无归属行）；指定则只统计该 Key。
+	gatewayKeyID := strings.TrimSpace(q.Get("gateway_key_id"))
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
 	if from == "" {
-		from = s.earliestUsageDate(ctx)
+		from = s.earliestUsageDate(ctx, gatewayKeyID)
 		if from == "" || from > to {
 			from = shiftDays(to, -30)
 		}
 	}
 
-	daily, models, providers, err := s.aggregateUsageRange(ctx, from, to, s.providerDisplayNames(ctx))
+	daily, models, providers, err := s.aggregateUsageRange(ctx, from, to, gatewayKeyID, s.providerDisplayNames(ctx))
 	if err != nil {
 		s.fail(w, http.StatusInternalServerError, "读取 usage 数据失败", err)
 		return
@@ -129,7 +133,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 
 	// first_used_at / active_days 基于真实有数据的行计算，随后再补零，
 	// 否则补出来的空行会把 first_used_at 拉早到窗口起点。
-	firstUsed, activeDays := s.firstUsedAndActiveDays(ctx, daily, today)
+	firstUsed, activeDays := s.firstUsedAndActiveDays(ctx, daily, today, gatewayKeyID)
 
 	kpi := computeKPI(daily, today)
 	daily = fillDailyRange(daily, from, to)
@@ -137,15 +141,16 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	trend := buildTrend(daily)
 
 	writeJSON(w, http.StatusOK, usagePayload{
-		FirstUsedAt: firstUsed,
-		ActiveDays:  activeDays,
-		Granularity: granularity,
-		KPI:         kpi,
-		Models:      models,
-		Providers:   providers,
-		Daily:       daily,
-		Heatmap:     heatmap,
-		Trend:       trend,
+		FirstUsedAt:  firstUsed,
+		ActiveDays:   activeDays,
+		Granularity:  granularity,
+		GatewayKeyID: gatewayKeyID,
+		KPI:          kpi,
+		Models:       models,
+		Providers:    providers,
+		Daily:        daily,
+		Heatmap:      heatmap,
+		Trend:        trend,
 	})
 }
 
@@ -153,22 +158,29 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 // 拉出来，分别按 (date) 和 (provider, model) 聚合；同步按 (provider) 聚合供
 // 供应商占比。
 //
+// gatewayKeyID 非空时只统计该网关 Key 的行；空串表示全部（含历史无归属行）。
+//
 // 返回的 daily 已按日期升序；models / providers 按 total 降序。窗口内
 // total=0 的 (provider, model) 不出现在 models/providers（前端按总数排序，
 // 0 占比无意义）。
 //
 // providerNames 把 provider_id 映射为展示名；缺失时回退为 id 本身。
 // 统计表里存的是 provider_id，而前端要显示供应商名称。
-func (s *Server) aggregateUsageRange(ctx context.Context, from, to string, providerNames map[string]string) (
+func (s *Server) aggregateUsageRange(ctx context.Context, from, to, gatewayKeyID string, providerNames map[string]string) (
 	dailyOut []usageDailyRow,
 	models []usageModelShare,
 	providers []usageProviderShare,
 	err error,
 ) {
-	rows, qerr := s.store.DB().QueryContext(ctx,
-		`SELECT date, provider_id, model, requests, input_tokens, cached_input_tokens, output_tokens
+	query := `SELECT date, provider_id, model, requests, input_tokens, cached_input_tokens, output_tokens
 		 FROM model_usage_daily
-		 WHERE date >= ? AND date <= ?`, from, to)
+		 WHERE date >= ? AND date <= ?`
+	args := []any{from, to}
+	if gatewayKeyID != "" {
+		query += ` AND gateway_key_id = ?`
+		args = append(args, gatewayKeyID)
+	}
+	rows, qerr := s.store.DB().QueryContext(ctx, query, args...)
 	if qerr != nil {
 		return nil, nil, nil, qerr
 	}
@@ -453,11 +465,19 @@ func usageProviderName(names map[string]string, providerID string) string {
 	return providerID
 }
 
-// earliestUsageDate 返回 model_usage_daily 中最早的一天；无数据时返回空串。
-func (s *Server) earliestUsageDate(ctx context.Context) string {
+// earliestUsageDate 返回 model_usage_daily 中最早的一天（可按网关 Key 过滤）；无数据时返回空串。
+//
+// 「累计」窗口的起点要跟着当前筛选走：否则选中某个较新的 Key 时，
+// 起点会被其他 Key 的历史数据拉到很早，趋势图前段全空。
+func (s *Server) earliestUsageDate(ctx context.Context, gatewayKeyID string) string {
+	query := `SELECT MIN(date) FROM model_usage_daily`
+	var args []any
+	if gatewayKeyID != "" {
+		query += ` WHERE gateway_key_id = ?`
+		args = append(args, gatewayKeyID)
+	}
 	var first sql.NullString
-	if err := s.store.DB().QueryRowContext(ctx,
-		`SELECT MIN(date) FROM model_usage_daily`).Scan(&first); err != nil {
+	if err := s.store.DB().QueryRowContext(ctx, query, args...).Scan(&first); err != nil {
 		return ""
 	}
 	if !first.Valid {
@@ -469,8 +489,8 @@ func (s *Server) earliestUsageDate(ctx context.Context) string {
 // firstUsedAndActiveDays 返回窗口内的 first_used_at 与 active_days。
 //
 // first_used_at 优先取窗口内最早一天；若窗口内为空（罕见），fallback 到
-// 整个 model_usage_daily 表的 MIN(date)。active_days = total > 0 的天数。
-func (s *Server) firstUsedAndActiveDays(ctx context.Context, daily []usageDailyRow, today string) (string, int) {
+// 整张表的 MIN(date)（同样受网关 Key 过滤）。active_days = total > 0 的天数。
+func (s *Server) firstUsedAndActiveDays(ctx context.Context, daily []usageDailyRow, today, gatewayKeyID string) (string, int) {
 	firstUsed := ""
 	if len(daily) > 0 {
 		firstUsed = daily[0].Date
@@ -482,10 +502,8 @@ func (s *Server) firstUsedAndActiveDays(ctx context.Context, daily []usageDailyR
 		}
 	}
 	if firstUsed == "" {
-		var dbFirst sql.NullString
-		if err := s.store.DB().QueryRowContext(ctx,
-			`SELECT MIN(date) FROM model_usage_daily`).Scan(&dbFirst); err == nil && dbFirst.Valid {
-			firstUsed = dbFirst.String
+		if v := s.earliestUsageDate(ctx, gatewayKeyID); v != "" {
+			firstUsed = v
 		}
 	}
 	return firstUsed, active

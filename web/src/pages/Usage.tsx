@@ -4,6 +4,8 @@ import { BarChart3, CalendarRange } from 'lucide-react'
 import { api } from '@/lib/api'
 import type { UsageDailyRow, UsageModelShare } from '@/lib/types'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 import { formatToken } from '@/lib/usage-format'
 
@@ -533,13 +535,25 @@ export function UsagePage() {
   // 每个模块自己管窗口状态，互不影响
   const [modelsWindow, setModelsWindow] = useState<WindowState>({ preset: '30d' })
   const [trendWindow, setTrendWindow] = useState<WindowState>({ preset: '30d' })
+  // 统计范围：'' = 全部网关 Key，否则只统计该 Key
+  const [gatewayKeyId, setGatewayKeyId] = useState('')
   // 热力图 / 趋势图共用的悬浮弹窗（悬停时写坐标与当天数据，移出清空）
   const [hover, setHover] = useState<HoverState | null>(null)
   const clearHover = useCallback(() => setHover(null), [])
 
+  // 全量网关 Key（含已删除）：历史用量可能属于已删除的 Key，也要能查
+  const gatewayKeys = useQuery({
+    queryKey: ['gateway-keys', { includeDeleted: true }],
+    queryFn: () => api.listGatewayKeys({ includeDeleted: true }),
+  })
+
   const usage = useQuery({
-    queryKey: ['usage'],
-    queryFn: () => api.usage({ granularity: 'daily' }),
+    queryKey: ['usage', { gatewayKeyId }],
+    queryFn: () =>
+      api.usage({
+        granularity: 'daily',
+        gateway_key_id: gatewayKeyId || undefined,
+      }),
   })
 
   const data = usage.data
@@ -610,11 +624,32 @@ export function UsagePage() {
   return (
     <div className="flex flex-col gap-5">
       {/* 页面顶部 */}
-      <div>
+      <div className="flex flex-wrap items-end justify-between gap-3">
         <h1 className="flex items-center gap-2 text-xl font-semibold text-slate-900">
           <BarChart3 className="h-5 w-5" />
           使用统计
         </h1>
+        <div className="grid gap-1.5">
+          <Label htmlFor="usage-gateway-key">网关 API Key</Label>
+          <Select
+            id="usage-gateway-key"
+            className="w-64"
+            value={gatewayKeyId}
+            onChange={(event) => setGatewayKeyId(event.target.value)}
+          >
+            <option value="">全部网关 Key</option>
+            {(gatewayKeys.data?.items ?? []).map((key) => (
+              <option key={key.id} value={key.id}>
+                {key.name}
+                {key.note ? `（${key.note}）` : ''}
+                {key.deleted ? ' · 已删除' : key.enabled ? '' : ' · 已停用'}
+              </option>
+            ))}
+          </Select>
+          <p className="text-[11px] text-slate-500">
+            选择单个 Key 后，模型占比、活跃热力图、使用趋势与 KPI 都只统计它。
+          </p>
+        </div>
       </div>
 
       {/* 上下两部分各占 1/2 高度（外层用 grid 强制均分） */}

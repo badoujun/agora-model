@@ -53,14 +53,17 @@ type UsageRecorder struct {
 
 // usageEvent 是一条投递到 recorder 的「单次请求用量」事件。
 //
-// 内存里按 minute + (providerID, model) 分组合并；到 flush 时再批量
-// upsert 到 SQLite。字段与 logging.Usage 对齐，并附 provider_id / model / ts。
+// 内存里按 minute + (providerID, model) 分组合并（分钟明细不区分网关 Key），
+// 按 day + (gatewayKeyID, providerID, model) 分组写入日聚合表——控制台的
+// 「使用统计」需要按网关 Key 过滤，因此日维度必须带 Key 归属。
 type usageEvent struct {
-	ts         time.Time
-	providerID string
-	keyID      string
-	model      string
-	usage      logging.Usage
+	ts time.Time
+	// gatewayKeyID 是发起请求的网关 API Key（空表示静态 Key 或历史无归属）。
+	gatewayKeyID string
+	providerID   string
+	keyID        string
+	model        string
+	usage        logging.Usage
 }
 
 // slogLogger 是 logging.Logger 的最小接口，避免直接 import log/slog 进来的
@@ -108,7 +111,12 @@ func NewUsageRecorder(s *Store, logger slogLogger, opts UsageRecorderOptions) *U
 //
 // 仅 statusCode < 400 的请求计入（与 gateway 端 recordUsage 一致）。
 // zero usage 直接丢弃，避免给 daily 灌零。
-func (r *UsageRecorder) Record(providerID, keyID, model string, statusCode int, usage logging.Usage, ts time.Time) {
+// Record 满足 logging.UsageSink 接口。
+//
+// 仅 statusCode < 400 的请求计入（与 gateway 端 recordUsage 一致）。
+// zero usage 直接丢弃，避免给 daily 灌零。
+// gatewayKeyID 为空时仍然记录，写入的日聚合行归入「无归属」（历史数据口径）。
+func (r *UsageRecorder) Record(gatewayKeyID, providerID, keyID, model string, statusCode int, usage logging.Usage, ts time.Time) {
 	if statusCode >= 400 {
 		return
 	}
@@ -116,7 +124,14 @@ func (r *UsageRecorder) Record(providerID, keyID, model string, statusCode int, 
 		return
 	}
 	select {
-	case r.ch <- usageEvent{ts: ts, providerID: providerID, keyID: keyID, model: model, usage: usage}:
+	case r.ch <- usageEvent{
+		ts:           ts,
+		gatewayKeyID: gatewayKeyID,
+		providerID:   providerID,
+		keyID:        keyID,
+		model:        model,
+		usage:        usage,
+	}:
 	default:
 		r.dropped.Add(1)
 	}
@@ -234,22 +249,28 @@ func (r *UsageRecorder) flushBatch(ctx context.Context, batch []usageEvent) erro
 }
 
 // aggregateDay 按 (date, provider, model) 合并事件，返回 DailyBucket 列表。
+// aggregateDay 按 (date, gatewayKey, provider, model) 合并事件，返回 DailyBucket 列表。
+//
+// 带上网关 Key 维度后，同一个模型被不同 Key 调用会在日聚合表里各占一行，
+// 控制台据此既能统计「全部」，也能统计「单个 Key」。
 func aggregateDay(batch []usageEvent) []DailyBucket {
 	type key struct {
-		date       string
-		providerID string
-		model      string
+		date         string
+		gatewayKeyID string
+		providerID   string
+		model        string
 	}
 	merged := make(map[key]*DailyBucket)
 	for _, e := range batch {
 		date := e.ts.UTC().Format("2006-01-02")
-		k := key{date: date, providerID: e.providerID, model: e.model}
+		k := key{date: date, gatewayKeyID: e.gatewayKeyID, providerID: e.providerID, model: e.model}
 		b, ok := merged[k]
 		if !ok {
 			b = &DailyBucket{
-				Date:       date,
-				ProviderID: e.providerID,
-				Model:      e.model,
+				Date:         date,
+				GatewayKeyID: e.gatewayKeyID,
+				ProviderID:   e.providerID,
+				Model:        e.model,
 			}
 			merged[k] = b
 		}

@@ -31,6 +31,7 @@ var migrations = []migration{
 	{version: 4, name: "provider_website_and_gateway_key_cipher", statements: schemaV4},
 	{version: 5, name: "model_usage_daily_and_minute", statements: schemaV5},
 	{version: 6, name: "provider_keys_multi", statements: schemaV6},
+	{version: 7, name: "gateway_keys_multi_scope_and_usage_dimension", statements: schemaV7},
 }
 
 type migration struct {
@@ -345,4 +346,63 @@ var schemaV6 = []string{
 	`ALTER TABLE logs ADD COLUMN key_hint TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE providers DROP COLUMN api_key_cipher`,
 	`ALTER TABLE providers DROP COLUMN api_key_hint`,
+}
+
+// earliestGatewayKeyID 是「最早创建的那个网关 Key」的 id 子查询。
+//
+// 迁移 v7 用它把升级前的历史数据（日志、用量）统一归到一个 Key 上，
+// 使日志页与统计页在「全部」口径下依然连续可读；库里没有任何 Key 时
+// COALESCE 回落为空串，表示「无归属」。
+const earliestGatewayKeyID = `COALESCE((SELECT id FROM gateway_keys ORDER BY created_at ASC, id ASC LIMIT 1), '')`
+
+// schemaV7 把网关 Key 从「单条记录」升级为「多条记录 + 状态 + 备注 + 模型范围」，
+// 并给日志与用量补上网关 Key 维度：
+//   - gateway_keys：新增 note（用途/使用人备注）、deleted_at（软删除）、updated_at；
+//     启用状态复用既有的 enabled 列，天然支持同时启用多个 Key。
+//   - gateway_key_models：单个 Key 可调用的模型白名单，键为 (provider_id, 上游模型名)。
+//     存上游名而非对外别名，因为别名随时可改；没有行的 Key 表示不限制模型范围。
+//   - logs.gateway_key_id：记录是哪个网关 Key 发起的请求；历史行归到最早的 Key。
+//   - model_usage_daily：主键扩为 (date, gateway_key_id, provider_id, model)，
+//     使「使用统计」能按网关 Key 过滤。SQLite 不能改主键，只能重建表。
+//
+// 注意：本迁移之后不再支持降级到 0.5.0 及更早版本。
+var schemaV7 = []string{
+	`ALTER TABLE gateway_keys ADD COLUMN note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE gateway_keys ADD COLUMN deleted_at TEXT`,
+	`ALTER TABLE gateway_keys ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+	`UPDATE gateway_keys SET updated_at = created_at WHERE updated_at = ''`,
+
+	`ALTER TABLE logs ADD COLUMN gateway_key_id TEXT NOT NULL DEFAULT ''`,
+	`UPDATE logs SET gateway_key_id = ` + earliestGatewayKeyID + ` WHERE gateway_key_id = ''`,
+	`CREATE INDEX IF NOT EXISTS idx_logs_gateway_key ON logs(gateway_key_id, ts DESC)`,
+
+	`CREATE TABLE IF NOT EXISTS gateway_key_models (
+		gateway_key_id TEXT NOT NULL,
+		provider_id    TEXT NOT NULL,
+		model          TEXT NOT NULL,
+		PRIMARY KEY (gateway_key_id, provider_id, model)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_gateway_key_models_key ON gateway_key_models(gateway_key_id)`,
+
+	`DROP INDEX IF EXISTS idx_usage_daily_date`,
+	`ALTER TABLE model_usage_daily RENAME TO model_usage_daily_v6`,
+	`CREATE TABLE model_usage_daily (
+		date               TEXT    NOT NULL,
+		gateway_key_id     TEXT    NOT NULL,
+		provider_id        TEXT    NOT NULL,
+		model              TEXT    NOT NULL,
+		requests           INTEGER NOT NULL DEFAULT 0,
+		input_tokens       INTEGER NOT NULL DEFAULT 0,
+		cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens      INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (date, gateway_key_id, provider_id, model)
+	)`,
+	`INSERT INTO model_usage_daily
+		(date, gateway_key_id, provider_id, model, requests, input_tokens, cached_input_tokens, output_tokens)
+		SELECT date, ` + earliestGatewayKeyID + `, provider_id, model,
+			requests, input_tokens, cached_input_tokens, output_tokens
+		FROM model_usage_daily_v6`,
+	`DROP TABLE model_usage_daily_v6`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_daily_date ON model_usage_daily(date)`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_daily_gateway_key ON model_usage_daily(gateway_key_id, date)`,
 }

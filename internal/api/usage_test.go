@@ -135,7 +135,7 @@ func TestFirstUsedAndActiveDaysWithDaily(t *testing.T) {
 		{Date: "2026-10-02", Total: 0}, // 不计 active
 		{Date: "2026-10-03", Total: 50},
 	}
-	firstUsed, active := s.firstUsedAndActiveDays(context.Background(), daily, "2026-10-03")
+	firstUsed, active := s.firstUsedAndActiveDays(context.Background(), daily, "2026-10-03", "")
 	if firstUsed != "2026-10-01" {
 		t.Errorf("firstUsed = %q, want 2026-10-01", firstUsed)
 	}

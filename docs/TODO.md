@@ -453,7 +453,8 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 
 > 以下项已在 DESIGN 中明确"本期不做"，此处登记以备后续排期。
 
-- [ ] 多网关 Key（入站方向）：按 Agent 发放、单独吊销、最后使用时间统计（表结构已在 `gateway_keys` 预留，零改表）。
+- [x] ~~多网关 Key（入站方向）：按 Agent 发放、单独吊销、最后使用时间统计~~ —— **第 14 轮已交付**（见下方「Phase 9」）：
+  多个 Key 可同时启用、单独启停/软删除/重置明文、别名与备注、每个 Key 的模型范围；请求日志与使用统计都加了网关 Key 维度。
 - [ ] 模型名映射（`model_alias_json`）：解决「同一模型在两种协议下名称不同」（PRD 风险 R2）。
 - [ ] 日志保留策略：按天数/条数清理，防止 SQLite 无限增长（FR-7.5）。
 - [ ] `/v1/models` 的 Anthropic 格式内容协商（DESIGN §13 已论证低优先级）。
@@ -493,6 +494,50 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
   - `tools/mock-upstream/server.mjs`：新增 `usageFromQuery(req)` helper，4 个调用点（OpenAI 非流式 / 流式尾 chunk / Anthropic 流式 message_start + message_delta / Anthropic 非流式）注入 usage / input / output / cached query 参数。
   - **验收**：5 个 api 纯函数测试覆盖；go test ./... 通过；前端构建通过。
 
+---
+
+## Phase 9 · 多网关 Key（入站方向）· 已完成（2026-10）
+
+> **背景（第 14 轮需求）**：`gateway_keys` 表从 v1 起就是结构预留，但 UI 与 API 始终只暴露一条。
+> 本轮把它真正用起来：多个 Key 可同时启用，各自可启停、软删除、加别名与备注（用途 / 使用人），
+> 并可限定「能用哪些供应商的哪些模型」；请求日志与使用统计都补上网关 Key 维度。
+> 实测证据：
+> - `go test ./...` 全部通过；`go vet ./...` 通过；`npm --prefix web run build` 通过。
+> - 迁移演练：`TestMigrationV7AttributesHistoryToEarliestKey` / `TestMigrationV7WithoutAnyGatewayKey` 覆盖
+>   「历史日志与用量归属最早创建的 Key」与「库里一个 Key 都没有」两种边界。
+
+- [x] **T9.1｜迁移 v7** ｜ 2h
+  - `gateway_keys` 增 `note / deleted_at / updated_at`；`logs` 增 `gateway_key_id` 并把既有行归属到最早创建的 Key；
+  - 新表 `gateway_key_models(gateway_key_id, provider_id, model)`；`model_usage_daily` 重建为四列主键并搬迁旧数据。
+  - **验收**：`TestMigrationV7*` 通过；v6 库升级后旧数据全部带上网关 Key 维度。
+- [x] **T9.2｜Store 层多 Key CRUD 与范围** ｜ 3h
+  - `CreateGatewayKey / UpdateGatewayKey / DeleteGatewayKey / RevealGatewayKeyByID / ResetGatewayKeyByID / ListGatewayKeys`；
+  - 约束：`name` 必填 ≤64 rune、`note` ≤256、最后一个启用的 Key 不允许停用/删除（`ErrLastGatewayKey`）、
+    `VerifyGatewayKey` 排除已软删除的记录；
+  - `ActiveGatewayKey` 固化为「最早创建的启用 Key」（`ORDER BY created_at ASC, rowid ASC`，同秒创建也稳定）。
+  - **验收**：`TestGatewayKeyCRUDMulti` / `TestGatewayKeyNameAndNoteLimits` / `TestDeleteAndDisableProtectLastEnabledKey` 等通过。
+- [x] **T9.3｜模型范围参与路由** ｜ 3h
+  - `config.ModelScope` + `Snapshot.GatewayKeyScope(id)`（进快照，热路径零 DB 查询）；`route.ResolveScoped`；
+  - 裸模型名只在范围内的供应商里挑默认目标；显式 `供应商/模型` 越界返回 403 `model_not_allowed`；`/v1/models` 按范围过滤。
+  - **验收**：`TestScopedRouteRejectsModelOutsideScope` / `TestModelsListHonoursScope` / `TestUnscopedKeySeesEverything` 通过。
+- [x] **T9.4｜日志与统计的网关 Key 维度** ｜ 3h
+  - `logs.gateway_key_id` 写入 + `QueryLogs` 左连接回填名称；`LogFilter.GatewayKeyID` + `CountLogsFiltered`（total 跟随筛选）；
+  - `DailyBucket.GatewayKeyID` 与四列 UPSERT；`/api/usage?gateway_key_id=` 影响模型占比 / 热力图 / 趋势 / KPI；
+  - `touchKey` 改为按 Key 各自节流（60s），多 Key 的 `last_used_at` 不再互相吞掉。
+  - **验收**：`TestLogsFilterByGatewayKey` / `TestUsageFilterByGatewayKeyAPI` / `TestTouchKeyThrottlesPerGatewayKey` 通过。
+- [x] **T9.5｜控制面 API 与前端** ｜ 4h
+  - `/api/gateway-keys`（列表 / 新建 / 更新 / 删除 / reveal / reset）；`/api/settings` 的 `gateway_key_*` 兼容字段指向默认 Key，
+    旧的 `/api/gateway-key` 与 `/reset` 保留；
+  - 前端：设置页 Key 列表（别名 / 备注 / 启停 / 软删除 / 明文查看 / 重置 / 模型范围勾选）、
+    日志页「网关 Key」列 + 全量下拉筛选（含已删除）、统计页顶部「全部 / 单个 Key」下拉。
+  - **验收**：`TestGatewayKeysCRUD` / `TestGatewayKeyLastEnabledProtection` 通过；`npm --prefix web run build` 通过。
+- [x] **T9.6｜文档与版本** ｜ 1h
+  - README（多网关 Key / 模型范围 / 日志与统计维度）、DESIGN（DDL、约束表、API 表、§8.4/§8.5、ADR-006、§13）、
+    PRD（术语表、FR-3、FR-7.1/7.6、附录 A 第 14 轮）、本 TODO；`--reset-gateway-key` 文案改为「软删全部网关 Key 并新建一个」；
+  - 版本号升到 `0.6.0`。
+
+---
+
 ## 风险跟踪表（随进度更新）
 
 | 编号 | 风险 | 触发点 | 缓解措施 | 状态 |
@@ -503,7 +548,7 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
 | R4 | 反代缓冲导致流式失效 | 部署 | Nginx 配置文档 + SSE 心跳兜底 | 已设计 |
 | R5 | 上游 Key 集中存储 | 全程 | AES-256-GCM + 掩码 + 主密钥分离 | 已设计 |
 | R6 | 开发机无 Go 工具链 | Phase 0 | 已定案 Go 1.22+；由 T0.1 安装、T0.3 三平台矩阵验证 | 待处理（Phase 0） |
-| R7 | 对外只有一个网关 Key，无法按 Agent 分权/吊销 | 使用期 | v1 单 Key；`gateway_keys` 表预留多 Key 结构，未来零改表升级 | 已设计 |
+| R7 | 对外只有一个网关 Key，无法按 Agent 分权/吊销 | 使用期 | **第 14 轮已关闭**：改为多网关 Key（同时启用、单独启停/软删除/重置明文、别名备注、模型范围），日志与统计均可按 Key 归集 | 已关闭 |
 | R8 | 上游 `/models` 不可靠 | 运行期 | 手动覆盖/排除 + 保留旧缓存 + 陈旧标记 | 已设计 |
 | R9 | 目标 Windows 下限 | Phase 0 | 已确认仅需 Windows 10 / 11 + Linux（不含 Win7/8、Server 2012、32 位）；Go 1.22+ 直接覆盖 | 已关闭 |
 | R10 | `HTTP_PROXY` 导致 SSRF 校验失效 | 实现期 | 默认 `Transport.Proxy = nil`；需要代理时显式配置 | 已设计 |

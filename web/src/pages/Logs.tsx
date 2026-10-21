@@ -32,12 +32,18 @@ export function LogsPage() {
   const [failedOnly, setFailedOnly] = useState(true)
   const [model, setModel] = useState('')
   const [providerId, setProviderId] = useState('')
+  const [gatewayKeyId, setGatewayKeyId] = useState('')
   const [limit, setLimit] = useState(50)
   const [offset, setOffset] = useState(0)
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [expanded, setExpanded] = useState<string | null>(null)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.listProviders })
+  // 全量网关 Key（含已删除）：历史日志可能属于某个已删除的 Key，也要能筛。
+  const gatewayKeys = useQuery({
+    queryKey: ['gateway-keys', { includeDeleted: true }],
+    queryFn: () => api.listGatewayKeys({ includeDeleted: true }),
+  })
 
   const providerNames = useMemo(() => {
     const map = new Map<string, string>()
@@ -48,12 +54,13 @@ export function LogsPage() {
   }, [providers.data])
 
   const logs = useQuery({
-    queryKey: ['logs', { failedOnly, model, providerId, limit, offset }],
+    queryKey: ['logs', { failedOnly, model, providerId, gatewayKeyId, limit, offset }],
     queryFn: () =>
       api.listLogs({
         failed: failedOnly ? 'true' : undefined,
         model: model.trim() || undefined,
         provider_id: providerId || undefined,
+        gateway_key_id: gatewayKeyId || undefined,
         limit,
         offset,
       }),
@@ -118,6 +125,27 @@ export function LogsPage() {
               </Select>
             </div>
             <div className="grid gap-1.5">
+              <Label htmlFor="log-gateway-key">网关 Key</Label>
+              <Select
+                id="log-gateway-key"
+                className="w-52"
+                value={gatewayKeyId}
+                onChange={(event) => {
+                  setGatewayKeyId(event.target.value)
+                  setOffset(0)
+                }}
+              >
+                <option value="">全部</option>
+                {(gatewayKeys.data?.items ?? []).map((key) => (
+                  <option key={key.id} value={key.id}>
+                    {key.name}
+                    {key.note ? `（${key.note}）` : ''}
+                    {key.deleted ? ' · 已删除' : key.enabled ? '' : ' · 已停用'}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <div className="grid gap-1.5">
               <Label htmlFor="log-limit">每页</Label>
               <Select
                 id="log-limit"
@@ -157,6 +185,7 @@ export function LogsPage() {
                   <TableHead>协议</TableHead>
                   <TableHead>模型</TableHead>
                   <TableHead>供应商</TableHead>
+                  <TableHead>网关 Key</TableHead>
                   <TableHead>凭证</TableHead>
                   <TableHead>状态</TableHead>
                   <TableHead>延迟</TableHead>
@@ -176,6 +205,9 @@ export function LogsPage() {
                     <TableCell className="font-mono text-xs">{item.model || '—'}</TableCell>
                     <TableCell className="text-xs">
                       {providerNames.get(item.provider_id) || item.provider_id || '—'}
+                    </TableCell>
+                    <TableCell className="text-xs">
+                      {item.gateway_key_name || item.gateway_key_id || '—'}
                     </TableCell>
                     <TableCell className="font-mono text-xs text-slate-500">{item.key_hint || '—'}</TableCell>
                     <TableCell>{statusBadge(item.status_code)}</TableCell>
