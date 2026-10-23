@@ -144,7 +144,7 @@ func TestKeyRoundRobinAlternatesAuthorization(t *testing.T) {
 	srv, _, _ := buildGatewayWithKeys(t, p)
 
 	for i := 0; i < 4; i++ {
-		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("第 %d 次请求状态码 = %d（%s）", i+1, resp.StatusCode, body)
 		}
@@ -166,7 +166,7 @@ func TestKeyFailoverOn401DisablesFailedKey(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-bad", "k2": "sk-good"}, "m")
 	srv, _, stats := buildGatewayWithKeys(t, p)
 
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusOK || body != `{"ok":true}` {
 		t.Fatalf("首个 Key 401 后应自动切换：状态码 = %d，body = %s", resp.StatusCode, body)
 	}
@@ -184,7 +184,7 @@ func TestKeyFailoverOn401DisablesFailedKey(t *testing.T) {
 
 	// 第二个请求不应再使用被停用的 k1
 	before := len(rec.auths())
-	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil); resp.StatusCode != http.StatusOK {
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("后续请求应仍然成功，状态码 = %d", resp.StatusCode)
 	}
 	auths := rec.auths()[before:]
@@ -202,7 +202,7 @@ func TestKeyRateLimitDisablesFailedKeyLikePaymentRequired(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-limited", "k2": "sk-good"}, "m")
 	srv, _, stats := buildGatewayWithKeys(t, p)
 
-	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("429 后应切换到下一个 Key，状态码 = %d", resp.StatusCode)
 	}
@@ -220,7 +220,7 @@ func TestKeyRateLimitDisablesFailedKeyLikePaymentRequired(t *testing.T) {
 
 	// 后续请求不应再使用被停用的 k1
 	before := len(rec.auths())
-	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil); resp.StatusCode != http.StatusOK {
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("后续请求应仍然成功，状态码 = %d", resp.StatusCode)
 	}
 	auths := rec.auths()[before:]
@@ -239,7 +239,7 @@ func TestSingleKeyRateLimitOnlyCoolsDown(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1"}, "m")
 	srv, g, stats := buildGatewayWithKeys(t, p)
 
-	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("单 Key 429 应原样透传，得到 %d", resp.StatusCode)
 	}
@@ -266,7 +266,7 @@ func TestKeyAllFailedPassesLastUpstreamErrorThrough(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1", "k2": "sk-2"}, "m")
 	srv, _, stats := buildGatewayWithKeys(t, p)
 
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("全部 Key 失败时应透传最后一次上游状态码，得到 %d", resp.StatusCode)
 	}
@@ -285,7 +285,7 @@ func TestKeyAllFailedPassesLastUpstreamErrorThrough(t *testing.T) {
 	}
 
 	// 最后一个 Key 仍在（冷却中）：下一次请求继续尝试它，并原样返回上游错误
-	resp, body = doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body = doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("最后一次上游错误应持续透传，得到 %d（%s）", resp.StatusCode, body)
 	}
@@ -306,7 +306,7 @@ func TestAllKeysDisabledReturns503(t *testing.T) {
 	}
 	srv, _, _ := buildGatewayWithKeys(t, p)
 
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("没有可用 Key 时应返回 503，得到 %d（%s）", resp.StatusCode, body)
 	}
@@ -334,7 +334,7 @@ func TestSingleKeyFailureOnlyCoolsDown(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1"}, "m")
 	srv, g, stats := buildGatewayWithKeys(t, p)
 
-	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("单 Key 失败应原样透传 401，得到 %d", resp.StatusCode)
 	}
@@ -348,7 +348,7 @@ func TestSingleKeyFailureOnlyCoolsDown(t *testing.T) {
 
 	// 上游恢复：冷却中的 Key 仍会被兜底尝试（可用性优先）
 	fail.Store(false)
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("上游恢复后应立即可用，得到 %d（%s）", resp.StatusCode, body)
 	}
@@ -363,7 +363,7 @@ func TestKeyServerErrorIsNotRetried(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1", "k2": "sk-2"}, "m")
 	srv, _, stats := buildGatewayWithKeys(t, p)
 
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("5xx 应原样透传（不重试），得到 %d", resp.StatusCode)
 	}
@@ -387,12 +387,12 @@ func TestKeyRateLimitedKeySkippedOnNextRequest(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1", "k2": "sk-2"}, "m")
 	srv, _, _ := buildGatewayWithKeys(t, p)
 
-	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil); resp.StatusCode != http.StatusOK {
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
 	// 第一次请求：k1(429) -> k2(200)；第二次请求应直接用 k2（k1 已被自动停用）
 	before := len(rec.auths())
-	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil); resp.StatusCode != http.StatusOK {
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
 	auths := rec.auths()[before:]
@@ -411,7 +411,7 @@ func TestKeyReEnableAfterNewSnapshot(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1", "k2": "sk-2"}, "m")
 	srv, g, _ := buildGatewayWithKeys(t, p)
 
-	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil); resp.StatusCode != http.StatusOK {
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
 	if g.keyRuntime.usable(p.APIKeys[0]) {
@@ -446,7 +446,7 @@ func TestKeyStatsTouchRecordedOnSuccess(t *testing.T) {
 	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1"}, "m")
 	srv, _, stats := buildGatewayWithKeys(t, p)
 
-	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil); resp.StatusCode != http.StatusOK {
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
 	touched, _, _ := stats.snapshot()
@@ -532,7 +532,7 @@ func TestKeyFailuresRecordedInRequestLog(t *testing.T) {
 		p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-limited", "k2": "sk-good-key"}, "m")
 		srv, writer := buildGatewayWithLogs(t, p)
 
-		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("首个 Key 429 后应切换成功，状态码 = %d", resp.StatusCode)
 		}
@@ -567,7 +567,7 @@ func TestKeyFailuresRecordedInRequestLog(t *testing.T) {
 		p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-unpaid", "k2": "sk-limited"}, "m")
 		srv, writer := buildGatewayWithLogs(t, p)
 
-		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 		if resp.StatusCode != http.StatusTooManyRequests {
 			t.Fatalf("全部失败时应透传最后一次上游状态码 429，得到 %d", resp.StatusCode)
 		}
@@ -655,7 +655,7 @@ func TestKeySelectionConcurrent(t *testing.T) {
 		wg2.Add(1)
 		go func() {
 			defer wg2.Done()
-			req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"p/m"}`))
 			if err != nil {
 				errs <- err.Error()
 				return
@@ -723,7 +723,7 @@ func TestUsageRecordsServingKey(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil); resp.StatusCode != http.StatusOK {
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
 	select {

@@ -141,8 +141,8 @@ type modelEntry struct {
 
 // modelsHandler 返回聚合后的模型列表（DESIGN §5.5）。
 //
-//   - 裸模型名：owned_by 为按名称排序后第一个提供该模型的供应商（即默认路由目标）；
-//   - 命名空间形式 供应商名/模型名：每个提供该模型的供应商各列一条，便于显式指定；
+//   - 只返回命名空间形式 供应商名/模型名：每个提供该模型的供应商各列一条，
+//     便于调用方显式指定；不再返回裸模型名（裸名无法用于调用）；
 //   - 模型对外名即配置的别名（未配置别名时等于上游模型名）。
 func (g *Gateway) modelsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -164,27 +164,8 @@ func (g *Gateway) modelsHandler() http.HandlerFunc {
 		// 一份包含无权模型的清单，选中后请求才被 403 拒绝。
 		scope := snap.GatewayKeyScope(keyID)
 
-		// 裸名：Providers 已按供应商名称升序，首个出现者即默认供应商。
 		// 没有可用 Key 的供应商不对外暴露模型（含被自动停用的场景）。
-
-		seen := make(map[string]bool)
 		data := make([]modelEntry, 0, 16)
-		for _, p := range providers {
-			if !p.HasUsableKey() {
-				continue
-			}
-			for _, exposed := range p.ExposedModels() {
-				if seen[exposed] {
-					continue
-				}
-				if !scope.AllowsExposed(p, exposed) {
-					continue
-				}
-				seen[exposed] = true
-				data = append(data, modelEntry{ID: exposed, Object: "model", OwnedBy: p.Name})
-			}
-		}
-		// 命名空间形式
 		for _, p := range providers {
 			if !p.HasUsableKey() {
 				continue
@@ -285,6 +266,10 @@ func (g *Gateway) handler() http.HandlerFunc {
 		if err != nil {
 			rec.noteError(err.Error())
 			switch {
+			case errors.Is(err, route.ErrModelNotNamespaced):
+				// 模型名格式不符合契约（缺少 供应商名/ 前缀）：客户端改请求即可，
+				// 属于参数错误而不是 404。
+				writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error(), "model")
 			case errors.Is(err, route.ErrModelNotFound):
 				writeError(w, http.StatusNotFound, codeModelNotFound, err.Error(), "model")
 			case errors.Is(err, route.ErrModelNotAllowed):

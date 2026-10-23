@@ -486,17 +486,14 @@ func TestModelsList(t *testing.T) {
 		byModel[entry["model"].(string)] = entry
 	}
 
-	seedRow, ok := byModel["seed-model"]
+	seedRow, ok := byModel["seed/seed-model"]
 	if !ok {
-		t.Fatalf("缺少 seed-model: %v", items)
+		t.Fatalf("缺少 seed/seed-model: %v", items)
 	}
 	if seedRow["provider_name"] != "seed" {
 		t.Errorf("provider_name = %v", seedRow["provider_name"])
 	}
-	if seedRow["default"] != true {
-		t.Errorf("名称最小者应为默认路由: %v", seedRow)
-	}
-	aliasRow, ok := byModel["共享别名"]
+	aliasRow, ok := byModel["别名供应商/共享别名"]
 	if !ok {
 		t.Fatalf("缺少别名条目: %v", items)
 	}
@@ -506,20 +503,19 @@ func TestModelsList(t *testing.T) {
 	if aliasRow["alias"] != "共享别名" {
 		t.Errorf("别名条目应标注别名: %v", aliasRow)
 	}
-	// 别名是独立的对外模型名，只有这一个供应商提供它 → 它就是该名的默认路由
-	if aliasRow["default"] != true {
-		t.Errorf("唯一提供者的对外模型名应标记默认: %v", aliasRow)
-	}
-	extraRow, ok := byModel["extra-model"]
-	if !ok {
+	if _, ok := byModel["别名供应商/extra-model"]; !ok {
 		t.Fatalf("缺少 extra-model: %v", items)
 	}
-	if extraRow["default"] != true {
-		t.Errorf("唯一提供者的模型应标记默认: %v", extraRow)
+	// 裸模型名不应再出现在列表里
+	if _, hasBare := byModel["seed-model"]; hasBare {
+		t.Errorf("不应返回裸模型名: %v", byModel)
+	}
+	if _, hasDefault := seedRow["default"]; hasDefault {
+		t.Errorf("不再有默认路由概念，不应返回 default 字段: %v", seedRow)
 	}
 }
 
-func TestModelsListDefaultUsesProviderNameOrder(t *testing.T) {
+func TestModelsListUsesNamespaceIdentifiers(t *testing.T) {
 	h := newHarness(t, "")
 	client := newClient(t)
 
@@ -541,24 +537,25 @@ func TestModelsListDefaultUsesProviderNameOrder(t *testing.T) {
 		t.Fatalf("列表状态码 = %d", code)
 	}
 	items, _ := body["items"].([]any)
-	defaults := map[string]bool{}
 	seen := map[string]bool{}
 	for _, raw := range items {
 		entry := raw.(map[string]any)
-		if entry["model"] != "shared-model" {
-			continue
-		}
-		name := entry["provider_name"].(string)
-		seen[name] = true
-		if entry["default"] == true {
-			defaults[name] = true
+		seen[entry["model"].(string)] = true
+	}
+	if !seen["alpha 供应商/shared-model"] || !seen["zeta 供应商/shared-model"] {
+		t.Fatalf("每个供应商都应以 供应商名/模型名 形式出现: %v", seen)
+	}
+	if seen["shared-model"] {
+		t.Fatalf("不应返回裸模型名: %v", seen)
+	}
+	shared := 0
+	for id := range seen {
+		if strings.HasSuffix(id, "/shared-model") {
+			shared++
 		}
 	}
-	if len(seen) != 2 {
-		t.Fatalf("两个供应商都应出现在列表中: %v", seen)
-	}
-	if !defaults["alpha 供应商"] || defaults["zeta 供应商"] {
-		t.Fatalf("默认路由应按供应商名称升序选择，得到 %v", defaults)
+	if shared != 2 {
+		t.Fatalf("两个供应商各应有一条命名空间条目: %v", seen)
 	}
 }
 

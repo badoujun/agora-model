@@ -152,7 +152,7 @@ func (p *Provider) ExposedModel(model string) string {
 	return model
 }
 
-// RealModel 把对外模型名（裸名或别名）解析为上游真实模型名。
+// RealModel 把对外模型名（原名或别名）解析为上游真实模型名。
 func (p *Provider) RealModel(exposed string) (string, bool) {
 	exposed = strings.TrimSpace(exposed)
 	if exposed == "" {
@@ -166,7 +166,7 @@ func (p *Provider) RealModel(exposed string) (string, bool) {
 	return "", false
 }
 
-// KnowsModel 报告该供应商是否对外提供某模型（裸名或别名）。
+// KnowsModel 报告该供应商是否对外提供某模型（原名或别名）。
 func (p *Provider) KnowsModel(exposed string) bool {
 	_, ok := p.RealModel(exposed)
 	return ok

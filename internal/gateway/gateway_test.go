@@ -113,7 +113,7 @@ func TestAuthFailureStyle(t *testing.T) {
 	})
 
 	t.Run("x-api-key 亦可认证", func(t *testing.T) {
-		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "", `{"model":"m"}`,
+		resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "", `{"model":"p/m"}`,
 			map[string]string{"x-api-key": gatewayKey})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
@@ -183,7 +183,7 @@ func TestModelNotFound(t *testing.T) {
 	defer upstream.Close()
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", upstream.URL, "known"))
 
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"unknown"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/unknown"}`, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("状态码 = %d, 期望 404", resp.StatusCode)
 	}
@@ -217,6 +217,8 @@ func (c *captured) snapshot() captured {
 	return captured{method: c.method, path: c.path, header: c.header, body: c.body}
 }
 
+// TestPassthroughHeaderRewriteAndByteFidelity 覆盖透传语义：除命名空间前缀
+// 必须从 model 字段剥离外，其余字段与响应体保持原样。
 func TestPassthroughHeaderRewriteAndByteFidelity(t *testing.T) {
 	var cap captured
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +233,7 @@ func TestPassthroughHeaderRewriteAndByteFidelity(t *testing.T) {
 
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", upstream.URL, "m"))
 
-	payload := `{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0.25}`
+	payload := `{"model":"p/m","messages":[{"role":"user","content":"hi"}],"temperature":0.25}`
 	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, payload,
 		map[string]string{"openai-beta": "assistants=v2", "x-custom": "kept"})
 
@@ -249,8 +251,18 @@ func TestPassthroughHeaderRewriteAndByteFidelity(t *testing.T) {
 	if got.method != http.MethodPost || got.path != "/v1/chat/completions" {
 		t.Errorf("上游收到 %s %s", got.method, got.path)
 	}
-	if string(got.body) != payload {
-		t.Errorf("请求体应零改写\n实际: %s\n期望: %s", got.body, payload)
+	var sent map[string]any
+	if err := json.Unmarshal(got.body, &sent); err != nil {
+		t.Fatalf("上游请求体不是 JSON: %v", err)
+	}
+	if sent["model"] != "m" {
+		t.Errorf("上游 model 应剥离子命名空间前缀，得到 %v", sent["model"])
+	}
+	if sent["temperature"] != 0.25 {
+		t.Errorf("model 之外的字段应原样保留，temperature = %v", sent["temperature"])
+	}
+	if msgs, ok := sent["messages"].([]any); !ok || len(msgs) != 1 {
+		t.Errorf("messages 应原样透传，得到 %v", sent["messages"])
 	}
 	if auth := got.header.Get("Authorization"); auth != "Bearer sk-upstream-p" {
 		t.Errorf("Authorization = %q, 期望供应商凭证", auth)
@@ -278,7 +290,7 @@ func TestUpstreamErrorPassthrough(t *testing.T) {
 	defer upstream.Close()
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", upstream.URL, "m"))
 
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("状态码 = %d, 期望 429（原样透传）", resp.StatusCode)
 	}
@@ -293,7 +305,7 @@ func TestBodyTooLarge(t *testing.T) {
 	srv := buildGateway(t, config.Gateway{MaxBodyBytes: 1024}, providerFor("p", upstream.URL, "m"))
 
 	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"m","pad":"`+strings.Repeat("x", 2048)+`"}`, nil)
+		`{"model":"p/m","pad":"`+strings.Repeat("x", 2048)+`"}`, nil)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("状态码 = %d, 期望 413", resp.StatusCode)
 	}
@@ -308,7 +320,7 @@ func TestUpstreamUnreachable(t *testing.T) {
 	upstream.Close() // 关闭后端口不可达
 
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", deadURL, "m"))
-	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("状态码 = %d, 期望 502", resp.StatusCode)
 	}
@@ -333,7 +345,7 @@ func TestExtraBodyAndHeadersMerged(t *testing.T) {
 	srv := buildGateway(t, config.Gateway{}, provider)
 
 	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"m","messages":[],"temperature":0.9}`, nil)
+		`{"model":"p/m","messages":[],"temperature":0.9}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
@@ -377,7 +389,7 @@ func TestSSEKeepAliveAndByteFidelity(t *testing.T) {
 	srv := buildGateway(t, config.Gateway{SSEIdleSeconds: 1}, providerFor("p", upstream.URL, "m"))
 
 	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"m","stream":true}`, nil)
+		`{"model":"p/m","stream":true}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d", resp.StatusCode)
 	}
@@ -413,7 +425,7 @@ func TestClientDisconnectCancelsUpstream(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/chat/completions",
-		strings.NewReader(`{"model":"m","stream":true}`))
+		strings.NewReader(`{"model":"p/m","stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,20 +491,21 @@ func TestModelsEndpointUsesProviderNamesAndAliases(t *testing.T) {
 		ownedBy[id] = owner
 	}
 
-	if ownedBy["shared"] != "供应商A" {
-		t.Errorf("裸模型名 shared 的 owned_by = %q, 期望名称最小的 供应商A", ownedBy["shared"])
-	}
-	if ownedBy["别名A"] != "供应商A" {
-		t.Errorf("别名应作为对外模型名，得到 %v", ownedBy)
-	}
-	if _, hasOrigin := ownedBy["only-a"]; hasOrigin {
-		t.Errorf("配置了别名后不应再暴露上游原名: %v", ownedBy)
-	}
-	if ownedBy["only-b"] != "供应商B" {
-		t.Errorf("only-b 的 owned_by = %q, 期望 供应商B", ownedBy["only-b"])
-	}
+	// 列表只返回命名空间形式；裸模型名不再出现。
 	if ownedBy["供应商A/shared"] != "供应商A" || ownedBy["供应商B/shared"] != "供应商B" {
 		t.Errorf("命名空间条目缺失或归属错误: %v", ownedBy)
+	}
+	if _, hasBare := ownedBy["shared"]; hasBare {
+		t.Errorf("不应再返回裸模型名: %v", ownedBy)
+	}
+	if ownedBy["供应商A/别名A"] != "供应商A" {
+		t.Errorf("别名应作为对外模型名出现在命名空间条目里: %v", ownedBy)
+	}
+	if _, hasOrigin := ownedBy["供应商A/only-a"]; hasOrigin {
+		t.Errorf("配置了别名后不应再暴露上游原名: %v", ownedBy)
+	}
+	if ownedBy["供应商B/only-b"] != "供应商B" {
+		t.Errorf("only-b 的 owned_by = %q, 期望 供应商B", ownedBy["供应商B/only-b"])
 	}
 
 	resp, _ = doRequest(t, http.MethodPost, srv.URL+"/v1/models", gatewayKey, `{}`, nil)
@@ -555,28 +568,42 @@ func TestNamespaceRoutingDisabledProviderReturns503(t *testing.T) {
 	}
 }
 
-func TestSlashModelNameIsNotTreatedAsNamespace(t *testing.T) {
-	var cap captured
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		cap.set(r, body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
+func TestSlashModelNameRequiresNamespace(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer upstream.Close()
 
 	p := providerFor("p", upstream.URL, "meta-llama/Llama-3-70B")
 	srv := buildGateway(t, config.Gateway{}, p)
 
-	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+	// 含斜杠但前缀不是供应商名：不再按整体模型名透传，必须显式命名空间。
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
 		`{"model":"meta-llama/Llama-3-70B","messages":[]}`, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("含斜杠的真实模型名应正常转发，状态码 = %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("未命名空间的模型名应返回 400，状态码 = %d（%s）", resp.StatusCode, body)
 	}
-	var payload map[string]any
-	_ = json.Unmarshal(cap.snapshot().body, &payload)
-	if payload["model"] != "meta-llama/Llama-3-70B" {
-		t.Fatalf("模型名不应被改写，得到 %v", payload["model"])
+	errObj := decodeJSON(t, body)["error"].(map[string]any)
+	if errObj["code"] != "invalid_request_error" {
+		t.Errorf("code = %v, 期望 invalid_request_error", errObj["code"])
+	}
+	if !strings.Contains(errObj["message"].(string), "供应商名/模型名") {
+		t.Errorf("错误信息应说明命名空间要求: %v", errObj["message"])
+	}
+}
+
+func TestBareModelNameRejected(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	srv := buildGateway(t, config.Gateway{}, providerFor("p", upstream.URL, "m"))
+
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
+		`{"model":"m","messages":[]}`, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("裸模型名应返回 400，状态码 = %d（%s）", resp.StatusCode, body)
+	}
+	errObj := decodeJSON(t, body)["error"].(map[string]any)
+	if errObj["code"] != "invalid_request_error" || errObj["param"] != "model" {
+		t.Errorf("错误体应指向 model 参数: %v", errObj)
 	}
 }
 
@@ -612,7 +639,7 @@ func TestPrepareBodyInjectsStreamOptionsOnStream(t *testing.T) {
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", up.URL, "m"))
 
 	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"m","stream":true,"messages":[]}`, nil)
+		`{"model":"p/m","stream":true,"messages":[]}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
 	}
@@ -642,7 +669,7 @@ func TestPrepareBodyNoInjectOnNonStream(t *testing.T) {
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", up.URL, "m"))
 
 	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"m","stream":false,"messages":[]}`, nil)
+		`{"model":"p/m","stream":false,"messages":[]}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
 	}
@@ -662,7 +689,7 @@ func TestPrepareBodyDoesNotOverrideExistingStreamOptions(t *testing.T) {
 	srv := buildGateway(t, config.Gateway{}, providerFor("p", up.URL, "m"))
 
 	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]}`, nil)
+		`{"model":"p/m","stream":true,"stream_options":{"include_usage":false},"messages":[]}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
 	}
@@ -688,7 +715,7 @@ func TestPrepareBodyStreamOptionAndExtraBodyCoexist(t *testing.T) {
 	srv := buildGateway(t, config.Gateway{}, provider)
 
 	resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey,
-		`{"model":"m","stream":true,"messages":[]}`, nil)
+		`{"model":"p/m","stream":true,"messages":[]}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
 	}

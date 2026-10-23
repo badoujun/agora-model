@@ -35,7 +35,7 @@ import (
 // version 是程序版本号（语义化版本）。发布构建可用
 // -ldflags "-X main.version=<tag>" 注入 git tag；未注入时用这里的内置版本号，
 // 保证控制台左上角始终显示可读的版本号而不是构建哈希。
-var version = "0.6.0"
+var version = "0.7.0"
 
 // slogToRecorderLogger 把 *slog.Logger 适配到 store.UsageRecorder 期望的 slogLogger 接口。
 //

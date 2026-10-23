@@ -55,7 +55,7 @@ func TestScopedRouteRejectsModelOutsideScope(t *testing.T) {
 
 	t.Run("范围内模型放行", func(t *testing.T) {
 		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "gw-ok",
-			`{"model":"allowed"}`, nil)
+			`{"model":"a/allowed"}`, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("状态码 = %d（%s），期望 200", resp.StatusCode, body)
 		}
@@ -63,7 +63,7 @@ func TestScopedRouteRejectsModelOutsideScope(t *testing.T) {
 
 	t.Run("范围外模型返回 403 permission_error", func(t *testing.T) {
 		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "gw-ok",
-			`{"model":"denied"}`, nil)
+			`{"model":"a/denied"}`, nil)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("状态码 = %d（%s），期望 403", resp.StatusCode, body)
 		}
@@ -86,7 +86,7 @@ func TestScopedRouteRejectsModelOutsideScope(t *testing.T) {
 
 	t.Run("不存在的模型仍是 404", func(t *testing.T) {
 		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "gw-ok",
-			`{"model":"missing"}`, nil)
+			`{"model":"a/missing"}`, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("状态码 = %d（%s），期望 404", resp.StatusCode, body)
 		}
@@ -117,11 +117,11 @@ func TestModelsListHonoursScope(t *testing.T) {
 	for _, m := range payload.Data {
 		ids[m.ID] = true
 	}
-	if !ids["allowed"] || !ids["a/allowed"] {
+	if !ids["a/allowed"] {
 		t.Errorf("范围内的模型应在清单里: %v", ids)
 	}
-	if ids["denied"] || ids["a/denied"] {
-		t.Errorf("范围外的模型不应出现在清单里: %v", ids)
+	if len(ids) != 1 || ids["a/denied"] || ids["allowed"] || ids["denied"] {
+		t.Errorf("只应出现范围内的命名空间条目: %v", ids)
 	}
 }
 
@@ -135,7 +135,7 @@ func TestUnscopedKeySeesEverything(t *testing.T) {
 
 	srv := buildScopedGateway(t, "gk_free", nil, providerFor("a", upstream.URL, "allowed", "denied"))
 	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", "gw-ok",
-		`{"model":"denied"}`, nil)
+		`{"model":"a/denied"}`, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("未配置范围的 Key 应可调用全部模型：状态码 = %d（%s）", resp.StatusCode, body)
 	}

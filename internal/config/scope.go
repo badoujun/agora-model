@@ -27,7 +27,7 @@ func (s ModelScope) Allows(providerID, upstreamModel string) bool {
 	return ok
 }
 
-// AllowsExposed 报告是否允许调用某供应商对外暴露的模型名（裸名或别名）。
+// AllowsExposed 报告是否允许调用某供应商对外暴露的模型名（原名或别名）。
 //
 // 供应商未声明该模型时返回 false——调用方应先用 RealModel 判断存在性。
 func (s ModelScope) AllowsExposed(p *Provider, exposed string) bool {

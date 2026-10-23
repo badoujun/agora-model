@@ -139,14 +139,13 @@ export interface TestResult {
 }
 
 export interface ModelItem {
-  /** 对外模型名（配置了别名时是别名） */
+  /** 对外模型标识：供应商名/对外模型名（配置了别名时是 供应商名/别名） */
   model: string
   /** 转发给上游时使用的真实模型名 */
   upstream_model: string
   alias?: string
   provider_id: string
   provider_name: string
-  default: boolean
 }
 
 export interface LogItem {

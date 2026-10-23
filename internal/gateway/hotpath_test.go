@@ -83,7 +83,7 @@ func TestHotPathServesAfterDatabaseClosed(t *testing.T) {
 	defer srv.Close()
 
 	for i := 0; i < 3; i++ {
-		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"m"}`, nil)
+		resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"供应商/m"}`, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("第 %d 次请求状态码 = %d（%s）：热路径不应依赖数据库", i+1, resp.StatusCode, body)
 		}

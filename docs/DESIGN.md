@@ -170,8 +170,9 @@ agora-model/
 
 ### ADR-004：模型寻址（`provider/model` 命名空间）
 
-- **决定**：裸模型名按 `priority` 聚合寻址；`provider/model` 显式寻址；仅在斜杠前缀命中**已存在的 provider id** 时按命名空间解析。
-- **理由**：不引入「别名表」这一新概念，配置面零增长；斜杠歧义规则保护了 `meta-llama/Llama-3-70B` 这类含斜杠的真实模型名。
+- **决定**：只接受显式命名空间寻址：`provider/model` 中的前缀必须命中已存在的供应商名称；裸模型名返回 400 `invalid_request_error`。
+- **理由**：不再维护「默认供应商」这一隐式路由，同名模型的行为完全可预测；`/v1/models` 与调用契约保持一致，客户端拿到的 `id` 可直接回填。
+- **代价**：含斜杠的真实模型名（如 `meta-llama/Llama-3-70B`）不能直接透传，需要为其配置别称后用 `供应商名/别称` 调用。
 
 ### ADR-005：SSE 保活方式
 
@@ -333,7 +334,7 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | 自动停用 | `401/402/403` 会把该 Key 置为 `enabled=0, auto_disabled=1` 并记录原因；用户在 UI 上重新启用即清除标记 |
 | 顺序稳定 | 排序键为 `(provider_id, position, created_at, id)`；`position` 由保存时提交顺序决定 |
 | 多网关 Key（v7） | 一个网关可同时启用任意多条 Key；`name`（别名）必填且 ≤64 rune，`note` ≤256；停用/删除最后一个启用的 Key 会被拒绝（避免所有 Agent 立刻锁死）；删除为软删除，记录保留供历史日志与统计显示名称 |
-| 网关 Key 模型范围（v7） | `gateway_key_models` 存「供应商 + 上游模型名」白名单；**没有行的 Key = 不限制**。范围参与路由：裸模型名只在范围内的供应商里挑目标，显式命名空间越界返回 403 `model_not_allowed`；`/v1/models` 同样按范围过滤 |
+| 网关 Key 模型范围（v7） | `gateway_key_models` 存「供应商 + 上游模型名」白名单；**没有行的 Key = 不限制**。范围参与路由：显式命名空间越界返回 403 `model_not_allowed`；`/v1/models` 同样按范围过滤 |
 | 网关 Key 只存哈希 | 入站校验只需比对 `sha256`（常量时间），明文以 AES-256-GCM 密文另存一份供控制台查看/复制，仅在创建/重置时也返回一次 |
 | 至少一个协议 URL | 保存时校验：`openai_base_url`、`anthropic_base_url` 至少有一个非空（含 override） |
 | 默认不启用内网 | `allow_internal = 0` 时拒绝解析到 loopback/private/link-local 的 URL |
@@ -429,10 +430,10 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 
 | HTTP | `code` | 触发条件 | Anthropic `error.type` |
 | --- | --- | --- | --- |
-| 400 | `invalid_request_error` | JSON 无法解析、缺少 `model` 字段 | `invalid_request_error` |
+| 400 | `invalid_request_error` | JSON 无法解析、缺少 `model` 字段、模型名不是 `供应商名/模型名` 形式 | `invalid_request_error` |
 | 401 | `invalid_api_key` | 网关 Key 缺失/错误/已吊销 | `authentication_error` |
 | 400 | `upstream_protocol_not_configured` | 该供应商未配置对应协议的 URL | `invalid_request_error` |
-| 404 | `model_not_found` | 模型不在任何启用供应商的可用模型中 | `not_found_error` |
+| 404 | `model_not_found` | 模型不在任何启用供应商的可用模型中（命名空间前缀存在，但该供应商未提供此模型） | `not_found_error` |
 | 403 | `model_not_allowed` | 模型存在，但**当前网关 Key 的模型范围不包含它**（显式 `供应商/模型` 越界） | `permission_error` |
 | 404 | `not_found` | 未知路径 | `not_found_error` |
 | 413 | `payload_too_large` | 请求体超 `MAX_BODY_BYTES` | `invalid_request_error` |
@@ -449,16 +450,16 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 {
   "object": "list",
   "data": [
-    { "id": "gpt-4o",               "object": "model", "owned_by": "provider-a" },
-    { "id": "provider-a/gpt-4o",    "object": "model", "owned_by": "provider-a" },
-    { "id": "provider-b/gpt-4o",    "object": "model", "owned_by": "provider-b" },
-    { "id": "claude-sonnet-4-5",    "object": "model", "owned_by": "provider-a" }
+    { "id": "provider-a/gpt-4o",            "object": "model", "owned_by": "provider-a" },
+    { "id": "provider-b/gpt-4o",            "object": "model", "owned_by": "provider-b" },
+    { "id": "provider-a/claude-sonnet-4-5", "object": "model", "owned_by": "provider-a" }
   ]
 }
 ```
 
-- 裸模型名仅供「默认路由」查询，`owned_by` = `priority` 最小的供应商。
-- 命名空间形式列出**每一个**支持该模型的供应商，便于用户显式指定（对应 PRD FR-4.5）。
+- 只返回命名空间形式 `供应商名/模型名`：每个提供该模型的供应商各列一条；不返回裸模型名。
+- 调用 `/v1/chat/completions` 时必须使用这里返回的 `id`；裸模型名或前缀不是供应商名的模型名返回 400 `invalid_request_error`。
+- 模型配置别称时，`id` 的模型名部分即别称（上游原名不再对外暴露）。
 - 认证方式与 §5.2 一致；返回 `Cache-Control: no-store`。
 
 ---
@@ -760,7 +761,7 @@ func streamSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, 
 
 - **并发**：每供应商独立 goroutine；整体等待 `WaitGroup` 或直接异步，不阻塞启动（启动时异步执行，首次请求前模型列表可能为空——此时路由回退为「手动模型 + 允许未列出的模型名」？**决定**：不做宽松透传，未在 available 中的模型返回 404，避免"假聚合"（审查第 4 条）。用户可在 Web UI 手动补模型。）
 - **失败隔离**：单供应商失败仅记录，不影响其他供应商；Web UI 展示 `last_fetch_error`。
-- **去重与 `owned_by`**：同一 `model_id` 出现在多个供应商时，裸名归 `priority` 最小者；命名空间形式全部列出。
+- **去重与 `owned_by`**：同一 `model_id` 出现在多个供应商时，列表按 `供应商名/模型名` 各列一条，`owned_by` 即该供应商；不再生成裸名条目。
 - **一致性**：`model_cache` 的读在内存快照中进行（启动加载 + 变更后重建），请求路径不查库。
 - **实现细节（Phase 3 落地）**：
   - 拉取响应兼容三种形态：`{"data":[{"id":…}]}`、`{"data":["…"]}`、顶层数组；
@@ -921,9 +922,8 @@ order := keyRuntime.order(p.ID, keys, 3)   // 轮询起点 + 健康过滤，仅 
 
 ### 8.3 模型列表页
 
-- 表格：模型 ID · 来源供应商 · 是否默认（priority 最小）· 来源类型（自动/手动）· 抓取时间。
-- 开关「显示命名空间形式」：切换裸名视图 / `provider/model` 全量视图。
-- 操作：全局刷新、手动添加（选供应商 + 填模型 ID）、移除手动模型、排除某供应商的某模型。
+- 表格：模型（`供应商名/模型名`）· 上游模型 · 供应商 · 别称标记。
+- 不再提供裸名/命名空间切换，也不展示「默认路由」；页面上展示的模型标识可直接用于调用。
 - 空状态引导：若聚合为空，提示「请在供应商页配置供应商并点击拉取模型」。
 
 ### 8.4 网关设置页
@@ -1021,7 +1021,7 @@ order := keyRuntime.order(p.ID, keys, 3)   // 轮询起点 + 健康过滤，仅 
 
 | 层次 | 内容 | 工具/方式 |
 | --- | --- | --- |
-| 单元测试 | 路由解析（含 `provider/model` 歧义、无可用 Key、404）、URL 校验、加解密与掩码、头部改写规则、模型名重写、多 Key 轮询/冷却/自动停用、热路径零 DB | Go `testing`，表驱动 + `-race` + 基准 |
+| 单元测试 | 路由解析（裸名/未知前缀 400、无可用 Key、404）、URL 校验、加解密与掩码、头部改写规则、模型名重写、多 Key 轮询/冷却/自动停用、热路径零 DB | Go `testing`，表驱动 + `-race` + 基准 |
 | 契约测试 | `/v1/chat/completions`、`/v1/messages`、`/v1/models` 的请求/响应与错误体风格 | `httptest.Server` 冒充上游 |
 | 流式测试 | 上游分块吐出 SSE + 静默 20s，断言：客户端收到心跳注释、内容字节与上游一致、总时长不受影响 | 自建 mock 上游 + 断言首字节延迟 |
 | 取消测试 | 客户端中途关闭连接，断言上游 mock 观察到 ctx 取消、网关 goroutine 数回落 | `runtime.NumGoroutine` 差值与 mock 信号 |

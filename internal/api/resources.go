@@ -705,29 +705,23 @@ func (s *Server) loadProvider(ctx context.Context, id string) (config.Provider, 
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	type entry struct {
-		Model        string `json:"model"`
+		Model        string `json:"model"` // 供应商名/对外模型名（唯一对外标识）
 		Upstream     string `json:"upstream_model"`
 		Alias        string `json:"alias,omitempty"`
 		ProviderID   string `json:"provider_id"`
 		ProviderName string `json:"provider_name"`
-		Default      bool   `json:"default"`
 	}
 
 	snap := s.holder.Get()
-	defaults := map[string]bool{} // 对外模型名 -> 是否已确定默认供应商
 	items := make([]entry, 0, 32)
 	for _, p := range snap.Providers() {
 		for _, model := range p.Models {
 			exposed := p.ExposedModel(model)
 			item := entry{
-				Model:        exposed,
+				Model:        p.Name + "/" + exposed,
 				Upstream:     model,
 				ProviderID:   p.ID,
 				ProviderName: p.Name,
-			}
-			if !defaults[exposed] {
-				defaults[exposed] = true
-				item.Default = true
 			}
 			if exposed != model {
 				item.Alias = exposed

@@ -63,7 +63,7 @@ func NewSnapshotWithScopes(f File, keyScopes map[string]ModelScope) (*Snapshot, 
 			s.ordered = append(s.ordered, &p)
 		}
 	}
-	// 默认路由顺序：按供应商名称升序（同名已被 Normalize 拒绝）
+	// 展示顺序：按供应商名称升序（同名已被 Normalize 拒绝）
 	sort.SliceStable(s.ordered, func(i, j int) bool {
 		return s.ordered[i].Name < s.ordered[j].Name
 	})
@@ -91,7 +91,7 @@ func (s *Snapshot) HasProvider(id string) bool {
 	return ok
 }
 
-// Providers 返回启用的供应商，按名称升序（即默认路由优先级）。
+// Providers 返回启用的供应商，按名称升序（即 /v1/models 的展示顺序）。
 func (s *Snapshot) Providers() []*Provider { return s.ordered }
 
 // GatewayKeyScope 返回某个网关 Key 的模型范围；没有配置范围时返回 nil。
