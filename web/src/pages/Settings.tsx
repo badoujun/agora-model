@@ -11,6 +11,7 @@ import {
   Upload,
 } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import { formatTime } from '@/lib/utils'
 import { useToast } from '@/components/ui/toast'
 import { Button } from '@/components/ui/button'
@@ -140,13 +141,12 @@ export function SettingsPage() {
   })
 
   const copy = async (label: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopied(label)
-      window.setTimeout(() => setCopied(null), 1500)
-    } catch {
+    if (!(await copyText(text))) {
       toast.show('复制失败，请手动选中文本复制', 'error')
+      return
     }
+    setCopied(label)
+    window.setTimeout(() => setCopied(null), 1500)
   }
 
   const data = settings.data

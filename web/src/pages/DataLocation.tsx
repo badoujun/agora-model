@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Check, Copy, HardDrive } from 'lucide-react'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import { useToast } from '@/components/ui/toast'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -14,13 +15,12 @@ export function DataLocationPage() {
   const locations = useQuery({ queryKey: ['data-locations'], queryFn: api.getDataLocations })
 
   const copy = async (label: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopied(label)
-      window.setTimeout(() => setCopied(null), 1500)
-    } catch {
+    if (!(await copyText(text))) {
       toast.show('复制失败，请手动选中文本复制', 'error')
+      return
     }
+    setCopied(label)
+    window.setTimeout(() => setCopied(null), 1500)
   }
 
   const data = locations.data

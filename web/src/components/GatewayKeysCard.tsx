@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Copy, KeyRound, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import type { GatewayKeyDTO, GatewayKeyScope, ModelItem } from '@/lib/types'
 import { formatTime } from '@/lib/utils'
 import { formatToken } from '@/lib/usage-format'
@@ -290,13 +291,12 @@ export function GatewayKeysCard({
   })
 
   const copy = async (id: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopiedId(id)
-      window.setTimeout(() => setCopiedId(null), 1500)
-    } catch {
+    if (!(await copyText(text))) {
       toast.show('复制失败，请手动选中文本复制', 'error')
+      return
     }
+    setCopiedId(id)
+    window.setTimeout(() => setCopiedId(null), 1500)
   }
 
   /** 查看明文：已取过则直接显示，否则按需请求（旧记录只存哈希时 409）。 */
