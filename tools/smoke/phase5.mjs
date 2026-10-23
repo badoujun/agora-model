@@ -174,7 +174,7 @@ runSmoke(async (rec) => {
     const openai = await httpRequest(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: auth,
-      body: '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}',
+      body: '{"model":"验收供应商/mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}',
     });
     const anthropic = await httpRequest(`${base}/v1/messages`, {
       method: 'POST',
@@ -188,20 +188,25 @@ runSmoke(async (rec) => {
     // 3) 模型选择
     const models = await httpRequest(`${base}/v1/models`, { headers: auth });
     const modelJson = models.body;
-    const dedup = (modelJson.match(/"id":"mock-gpt-4o","object":"model","owned_by":"[^"]+"/g) ?? []).length;
+    const dedup = (modelJson.match(/"id":"[^"]+\/mock-gpt-4o","object":"model","owned_by":"[^"]+"/g) ?? []).length;
     rec.assertThat(
       '③ /v1/models 返回已勾选模型（含 owned_by）',
       models.code === 200 && modelJson.includes('"object":"list"') && modelJson.includes('"owned_by"'),
       `code=${models.code}`,
     );
-    rec.assertThat('③ 同名模型只出现一次裸名条目', dedup === 1, `出现次数=${dedup}`);
-    rec.assertThat('③ owned_by 为供应商名称', modelJson.includes('"owned_by":"seed"'));
+    rec.assertThat('③ 两个供应商各列一条命名空间条目', dedup === 2, `出现次数=${dedup}`);
+    rec.assertThat('③ 不再返回裸模型名', !modelJson.includes('"id":"mock-gpt-4o"'), modelJson);
+    rec.assertThat(
+      '③ owned_by 为供应商名称',
+      modelJson.includes('"owned_by":"seed"') && modelJson.includes('"owned_by":"验收供应商"'),
+      modelJson,
+    );
 
     // 4) 长任务不中断（上游静默 20s，网关心跳兜底）
     const stream = await httpRequest(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...auth, 'x-mock-silence': '20', 'x-mock-chunks': '3' },
-      body: '{"model":"mock-gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}',
+      body: '{"model":"验收供应商/mock-gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}',
       timeoutMs: 60000,
     });
     rec.assertThat('④ 上游静默 20s 仍能完成（SSE 心跳兜底）', stream.body.includes('[DONE]') && stream.body.includes(': keep-alive'));
@@ -210,7 +215,7 @@ runSmoke(async (rec) => {
     await httpRequest(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...auth, 'x-mock-silence': '5' },
-      body: '{"model":"mock-gpt-4o","stream":true,"messages":[]}',
+      body: '{"model":"验收供应商/mock-gpt-4o","stream":true,"messages":[]}',
       timeoutMs: 60000,
     });
     await sleep(1000);
@@ -221,7 +226,7 @@ runSmoke(async (rec) => {
     const failing = await httpRequest(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...auth, 'x-mock-status': '401' },
-      body: '{"model":"mock-gpt-4o","messages":[]}',
+      body: '{"model":"验收供应商/mock-gpt-4o","messages":[]}',
     });
     await sleep(800);
     const logs = await httpRequest(`${base}/api/logs?limit=20`, { headers: auth });
@@ -278,7 +283,7 @@ runSmoke(async (rec) => {
         httpRequest(`${base}/v1/chat/completions`, {
           method: 'POST',
           headers: { ...auth, 'x-mock-chunks': '3', 'x-mock-gap': '10' },
-          body: '{"model":"mock-gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}',
+          body: '{"model":"验收供应商/mock-gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}',
           timeoutMs: 30000,
         }).then((res) => res.code),
       ),
@@ -321,7 +326,7 @@ runSmoke(async (rec) => {
     const migratedChat = await httpRequest(`http://127.0.0.1:${portB}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...json, authorization: `Bearer ${keyB}` },
-      body: '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}',
+      body: '{"model":"验收供应商/mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}',
     });
     rec.assertThat('迁移后 Agent 可直接使用（同模型名仍可用）', migratedChat.code === 200, `code=${migratedChat.code}`);
   } finally {

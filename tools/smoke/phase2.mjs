@@ -63,7 +63,7 @@ runSmoke(async (rec) => {
 `,
   );
 
-  const body = '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}';
+  const body = '{"model":"mock/mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}';
   const base = `http://127.0.0.1:${port}`;
   const jsonHeader = { 'content-type': 'application/json' };
 

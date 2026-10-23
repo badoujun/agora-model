@@ -54,9 +54,10 @@ runSmoke(async (rec) => {
     allow_internal: true,
     enabled: true,
   });
-  const aliasModel = '{"model":"我的模型","messages":[{"role":"user","content":"hi"}]}';
+  const aliasModel = '{"model":"mock 供应商/我的模型","messages":[{"role":"user","content":"hi"}]}';
   const nsModel = '{"model":"mock 供应商/mock-claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}';
   const unknownNS = '{"model":"nope/nope-model","messages":[{"role":"user","content":"hi"}]}';
+  const unknownModel = '{"model":"mock 供应商/nope-model","messages":[{"role":"user","content":"hi"}]}';
 
   const base = `http://127.0.0.1:${port}`;
   const mockBase = `http://127.0.0.1:${mockPort}`;
@@ -110,20 +111,20 @@ runSmoke(async (rec) => {
     const ids = modelIds(models);
     rec.assertThat(
       '勾选的模型出现在 /v1/models',
-      ids.includes('我的模型') && ids.includes('mock-claude-sonnet-4-5'),
+      ids.includes('mock 供应商/我的模型') && ids.includes('mock 供应商/mock-claude-sonnet-4-5'),
       `ids=${ids.join(',')}`,
     );
-    rec.assertThat('未勾选的上游模型不出现', !ids.includes('mock-deepseek-v3'));
-    rec.assertThat('配置别名后不再暴露上游原名', !ids.includes('mock-gpt-4o'));
+    rec.assertThat('未勾选的上游模型不出现', !ids.includes('mock 供应商/mock-deepseek-v3'));
+    rec.assertThat('配置别名后不再暴露上游原名', !ids.includes('mock 供应商/mock-gpt-4o'));
     rec.assertThat(
-      '列出命名空间形式（供应商名/模型名）',
-      ids.includes('mock 供应商/我的模型') && ids.includes('mock 供应商/mock-claude-sonnet-4-5'),
+      '只提供命名空间形式（无裸名条目）',
+      !ids.includes('我的模型') && !ids.includes('mock-claude-sonnet-4-5') && !ids.includes('mock-gpt-4o'),
       `ids=${ids.join(',')}`,
     );
     rec.assertThat('不包含失败供应商的模型', !ids.includes('dead 供应商/mock-gpt-4o'));
 
-    const aliasEntry = (models.json?.data ?? []).find((item) => item.id === '我的模型');
-    rec.assertThat('裸名条目 owned_by 为供应商名称', aliasEntry?.owned_by === 'mock 供应商', `owned_by=${aliasEntry?.owned_by}`);
+    const aliasEntry = (models.json?.data ?? []).find((item) => item.id === 'mock 供应商/我的模型');
+    rec.assertThat('命名空间条目的 owned_by 为供应商名称', aliasEntry?.owned_by === 'mock 供应商', `owned_by=${aliasEntry?.owned_by}`);
 
     const alias = await httpRequest(`${base}/v1/chat/completions`, { method: 'POST', headers: auth, body: aliasModel });
     rec.assertThat('用别名请求可直接透传（Agent 立即可用）', alias.code === 200 && alias.body.includes('mock'), `code=${alias.code}`);
@@ -140,7 +141,10 @@ runSmoke(async (rec) => {
     rec.assertThat('命名空间前缀已从转发给上游的 model 中剥离', Boolean(lastNS), `上游收到 model=${lastNS?.model}`);
 
     const unknown = await httpRequest(`${base}/v1/chat/completions`, { method: 'POST', headers: auth, body: unknownNS });
-    rec.assertThat('未知命名空间前缀退回普通模型名 → 404', unknown.code === 404, `code=${unknown.code}`);
+    rec.assertThat('未知命名空间前缀 → 400', unknown.code === 400, `code=${unknown.code}`);
+
+    const missing = await httpRequest(`${base}/v1/chat/completions`, { method: 'POST', headers: auth, body: unknownModel });
+    rec.assertThat('供应商未提供的模型 → 404', missing.code === 404, `code=${missing.code}`);
   } finally {
     await stopAll();
   }

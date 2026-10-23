@@ -158,13 +158,13 @@ runSmoke(async (rec) => {
     rec.assertThat('POST /api/providers/{id}/test 连接测试通过', test.code === 200 && test.body.includes('"ok":true'), `code=${test.code}`);
 
     const models = await httpRequest(`${base}/api/models`, { headers: authHeader });
-    rec.assertThat('GET /api/models 含勾选的模型', models.body.includes('"model":"mock-deepseek-v3"'));
+    rec.assertThat('GET /api/models 含勾选的模型', models.body.includes('"model":"界面新增供应商/mock-deepseek-v3"'));
     rec.assertThat('GET /api/models 标注供应商名称', models.body.includes('"provider_name":"界面新增供应商"'));
 
     const chat = await httpRequest(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: authHeader,
-      body: '{"model":"mock-deepseek-v3","messages":[{"role":"user","content":"hi"}]}',
+      body: '{"model":"界面新增供应商/mock-deepseek-v3","messages":[{"role":"user","content":"hi"}]}',
     });
     rec.assertThat('用界面新增的供应商直接完成透传（Agent 立即可用）', chat.code === 200 && chat.body.includes('mock'), `code=${chat.code}`);
 

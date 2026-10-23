@@ -59,14 +59,15 @@ runSmoke(async (rec) => {
 `,
   );
 
-  const bodyOpenAI = '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}';
-  const bodyOpenAIStream = '{"model":"mock-gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}';
+  const bodyOpenAI = '{"model":"mock/mock-gpt-4o","messages":[{"role":"user","content":"hi"}]}';
+  const bodyOpenAIStream = '{"model":"mock/mock-gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}';
+  const bodyBare = '{"model":"mock-gpt-4o","messages":[]}';
   const bodyNoModel = '{"messages":[]}';
-  const bodyUnknown = '{"model":"nope-1","messages":[]}';
-  const bodySlow = '{"model":"slow-model","messages":[]}';
-  const bodyDead = '{"model":"dead-model","messages":[]}';
-  const bodyExtra = '{"model":"extra-model","messages":[]}';
-  const bodyBig = `{"model":"mock-gpt-4o","pad":"${'x'.repeat(2048)}"}`;
+  const bodyUnknown = '{"model":"mock/nope-1","messages":[]}';
+  const bodySlow = '{"model":"mock-slow/slow-model","messages":[]}';
+  const bodyDead = '{"model":"dead/dead-model","messages":[]}';
+  const bodyExtra = '{"model":"mock-extra/extra-model","messages":[]}';
+  const bodyBig = `{"model":"mock/mock-gpt-4o","pad":"${'x'.repeat(2048)}"}`;
 
   const base = `http://127.0.0.1:${gatewayPort}`;
   const mockBase = `http://127.0.0.1:${mockPort}`;
@@ -99,6 +100,13 @@ runSmoke(async (rec) => {
 
     res = await httpRequest(`${base}/v1/chat/completions`, { method: 'POST', headers: openAIHeaders, body: bodyNoModel });
     rec.assertThat('缺少 model → 400', res.code === 400, `code=${res.code}`);
+
+    res = await httpRequest(`${base}/v1/chat/completions`, { method: 'POST', headers: openAIHeaders, body: bodyBare });
+    rec.assertThat(
+      '裸模型名 → 400 invalid_request_error',
+      res.code === 400 && res.body.includes('invalid_request_error'),
+      `code=${res.code}`,
+    );
 
     res = await httpRequest(`${base}/v1/chat/completions`, { method: 'POST', headers: openAIHeaders, body: bodyUnknown });
     rec.assertThat(
