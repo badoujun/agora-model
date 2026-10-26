@@ -138,6 +138,40 @@ export interface TestResult {
   keys?: KeyTestResult[]
 }
 
+/** 单 Key 连通性测试的请求体（草稿版在 DraftFetchInput 基础上补模型与消息）。 */
+export interface ConnectivityTestInput extends Partial<DraftFetchInput> {
+  /** 已勾选模型名（对外名/别名均可，后端会解析回上游名） */
+  model: string
+  /** 测试消息；留空后端用默认文案 */
+  message?: string
+}
+
+/** 单 Key 连通性测试的用量（与「使用统计」口径一致）。 */
+export interface ConnectivityTestUsage {
+  input_tokens: number
+  cached_input_tokens: number
+  output_tokens: number
+}
+
+/** 单 Key 连通性测试的结果：一次真实模型调用的完整诊断信息。 */
+export interface ConnectivityTestResult {
+  ok: boolean
+  status_code?: number
+  latency_ms: number
+  first_byte_ms: number
+  request_id: string
+  /** 实际发给上游的模型名 */
+  model: string
+  message: string
+  /** 上游原始响应体（可能被截断） */
+  response_raw?: string
+  response_truncated?: boolean
+  usage?: ConnectivityTestUsage
+  key_id?: string
+  key_hint?: string
+  checked_at: string
+}
+
 export interface ModelItem {
   /** 对外模型标识：供应商名/对外模型名（配置了别名时是 供应商名/别名） */
   model: string

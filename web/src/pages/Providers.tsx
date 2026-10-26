@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  Activity,
   Check,
   CloudDownload,
   Download,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
 import type {
+  ConnectivityTestInput,
   DraftFetchInput,
   KeyStatsDTO,
   PresetDTO,
@@ -31,6 +33,7 @@ import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { ConnectivityDialog } from '@/pages/ProviderConnectivityDialog'
 import {
   Table,
   TableBody,
@@ -253,6 +256,8 @@ export function ProvidersPage() {
   const [openedFromPreset, setOpenedFromPreset] = useState(false)
   // 正在单独测试的 Key 行下标（null 表示没有进行中的测试）
   const [testingKeyIndex, setTestingKeyIndex] = useState<number | null>(null)
+  // 正在做连通性测试的 Key 行下标（null 表示弹窗未打开）
+  const [connectivityIndex, setConnectivityIndex] = useState<number | null>(null)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.listProviders })
   const presets = useQuery({
@@ -456,6 +461,12 @@ export function ProvidersPage() {
   const enabledKeyRows = form.keys.filter((row) => row.enabled)
   const hasUsableKeyDraft = enabledKeyRows.some((row) => row.apiKey.trim() !== '')
 
+  // 连通性测试只允许选已勾选的模型（后端也会校验）
+  const testableModels = useMemo(
+    () => form.modelOrder.filter((model) => form.selected[model]),
+    [form.modelOrder, form.selected],
+  )
+
   /** 单独测试某一行 Key：已保存的走单 Key 接口，未保存的走草稿接口。 */
   const testKeyRow = async (index: number) => {
     const row = form.keys[index]
@@ -482,6 +493,45 @@ export function ProvidersPage() {
     } finally {
       setTestingKeyIndex(null)
     }
+  }
+
+  /** 打开某一行 Key 的连通性测试弹窗（真实调用，会消耗 token）。 */
+  const openConnectivity = (index: number) => {
+    setFormError('')
+    const row = form.keys[index]
+    if (!row) return
+    if (!row.keyId && row.apiKey.trim() === '') {
+      setFormError(`第 ${index + 1} 个 API Key 还没有填写明文，无法测试`)
+      return
+    }
+    if (testableModels.length === 0) {
+      setFormError('还没有勾选任何模型：请先拉取并勾选模型，再做连通性测试')
+      return
+    }
+    setConnectivityIndex(index)
+  }
+
+  /**
+   * 连通性测试：已保存的 Key 走单 Key 接口（明文不出库），
+   * 未保存的行走草稿接口（只带该行明文）。
+   */
+  const sendConnectivity = async (input: { model: string; message: string }) => {
+    const index = connectivityIndex
+    const row = index === null ? undefined : form.keys[index]
+    if (!row) throw new Error('找不到要测试的 API Key')
+    const payload: ConnectivityTestInput = {
+      model: input.model,
+      message: input.message,
+    }
+    if (row.keyId && form.id) {
+      return api.testKeyConnectivity(form.id, row.keyId, payload)
+    }
+    const draft = toDraftInput(form, index ?? 0)
+    return api.testDraftConnectivity({
+      ...draft,
+      model: input.model,
+      message: input.message,
+    })
   }
 
   /** 拉取模型与保存是两个独立动作：先做与后端一致的本地校验。 */
@@ -949,6 +999,21 @@ export function ProvidersPage() {
                         variant="ghost"
                         size="sm"
                         type="button"
+                        onClick={() => openConnectivity(index)}
+                        disabled={testableModels.length === 0}
+                        title={
+                          testableModels.length === 0
+                            ? '先拉取并勾选至少一个模型，才能做连通性测试'
+                            : '用该 Key 真实调用一次模型（会产生 token 消耗，计入用量与请求日志）'
+                        }
+                      >
+                        <Activity className="h-4 w-4" />
+                        连通性测试
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        type="button"
                         className="text-red-600 hover:bg-red-50"
                         onClick={() => removeKeyRow(index)}
                       >
@@ -1173,8 +1238,30 @@ export function ProvidersPage() {
           {formError ? <p className="text-sm text-red-600">{formError}</p> : null}
         </div>
       </Dialog>
+
+      {connectivityIndex !== null && form.keys[connectivityIndex] ? (
+        <ConnectivityDialog
+          key={`conn-${connectivityIndex}-${form.keys[connectivityIndex].keyId ?? 'new'}`}
+          open
+          onClose={() => setConnectivityIndex(null)}
+          providerName={form.name.trim() || form.id || '（未命名供应商）'}
+          keyHint={connectivityKeyHint(form.keys[connectivityIndex])}
+          models={testableModels}
+          aliases={form.aliases}
+          onSend={sendConnectivity}
+        />
+      ) : null}
     </div>
   )
+}
+
+/** 连通性弹窗里展示的 Key 掩码：已保存用库内掩码，未保存用明文现算（与后端 crypto.Mask 同规则）。 */
+function connectivityKeyHint(row: KeyRow): string {
+  if (row.hint) return row.hint
+  const key = row.apiKey.trim()
+  if (key === '') return ''
+  if (key.length <= 8) return '*'.repeat(key.length)
+  return `${key.slice(0, 3)}****${key.slice(-4)}`
 }
 
 // PresetDropdown 是工具栏上的「从预设…」按钮：展开后列出预设，点击即把字段预填进主 dialog。

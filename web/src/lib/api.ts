@@ -1,4 +1,6 @@
 import type {
+  ConnectivityTestInput,
+  ConnectivityTestResult,
   DataLocationsPayload,
   DraftFetchInput,
   GatewayKeyDTO,
@@ -109,6 +111,19 @@ export const api = {
   /** 草稿（尚未保存）凭证的连接测试 */
   testDraftKey: (body: DraftFetchInput) =>
     request<TestResult>('/api/providers/test-key', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  /** 单 Key 连通性测试：真实调用一次 chat/completions（消耗 token，计入用量与日志） */
+  testKeyConnectivity: (id: string, keyId: string, body: ConnectivityTestInput) =>
+    request<ConnectivityTestResult>(
+      `/api/providers/${encodeURIComponent(id)}/keys/${encodeURIComponent(keyId)}/connectivity`,
+      { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) },
+    ),
+  /** 草稿（尚未保存）凭证的连通性测试：明文只用于本次调用，不落库 */
+  testDraftConnectivity: (body: ConnectivityTestInput) =>
+    request<ConnectivityTestResult>('/api/providers/connectivity', {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify(body),

@@ -35,7 +35,7 @@ import (
 // version 是程序版本号（语义化版本）。发布构建可用
 // -ldflags "-X main.version=<tag>" 注入 git tag；未注入时用这里的内置版本号，
 // 保证控制台左上角始终显示可读的版本号而不是构建哈希。
-var version = "0.7.1"
+var version = "0.8.0"
 
 // slogToRecorderLogger 把 *slog.Logger 适配到 store.UsageRecorder 期望的 slogLogger 接口。
 //
@@ -360,6 +360,10 @@ func runServer(ctx context.Context, logger *slog.Logger, opts options) error {
 		AdminPassword: adminPassword, LocalOnly: localOnly,
 		Paths:   dataPaths(dir, dbFile, opts.LogFile),
 		Presets: presetStore,
+		// 控制台的诊断调用（单 Key 连通性测试）也要进日志与用量统计，
+		// 与网关转发口径一致：日志页可见、统计页可查。
+		LogSink:   recorder,
+		UsageSink: usageRecorder,
 	}).Register(mux)
 
 	// 8) 内嵌前端（构建后自动可用；未构建时只提供 API）

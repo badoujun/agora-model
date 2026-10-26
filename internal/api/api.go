@@ -14,6 +14,7 @@ import (
 
 	"agora-model/internal/config"
 	"agora-model/internal/crypto"
+	"agora-model/internal/logging"
 	"agora-model/internal/models"
 	"agora-model/internal/presets"
 	"agora-model/internal/store"
@@ -34,6 +35,10 @@ type Options struct {
 	Paths DataPaths
 	// Presets 提供「国内常用供应商」预设列表；为空时 /api/provider-presets 返回 503。
 	Presets *presets.Store
+	// LogSink 接收控制台诊断调用（如单 Key 连通性测试）的请求日志；可为空。
+	LogSink LogSink
+	// UsageSink 接收控制台诊断调用产生的 token 用量；可为空。
+	UsageSink logging.UsageSink
 }
 
 // DataPaths 描述本程序在磁盘上产生的数据位置。
@@ -64,6 +69,8 @@ type Server struct {
 	client    *http.Client
 	fetcher   *models.Fetcher
 	presets   *presets.Store
+	logSink   LogSink
+	usageSink logging.UsageSink
 }
 
 // New 创建控制面服务。
@@ -84,6 +91,8 @@ func New(opts Options) *Server {
 		auth:      NewAuthenticator(opts.AdminPassword),
 		fetcher:   models.NewFetcher(),
 		presets:   opts.Presets,
+		logSink:   opts.LogSink,
+		usageSink: opts.UsageSink,
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
@@ -115,6 +124,9 @@ func (s *Server) Register(mux *http.ServeMux) {
 	// 尚未保存的供应商（草稿）也可以直接拉取模型候选 / 测试凭证
 	mux.HandleFunc("POST /api/providers/fetch-models", s.guard(s.handleFetchDraftModels))
 	mux.HandleFunc("POST /api/providers/test-key", s.guard(s.handleTestDraftKey))
+	// 单 Key 连通性测试：真实发起一次 chat/completions（会消耗 token，计入用量与请求日志）
+	mux.HandleFunc("POST /api/providers/{id}/keys/{key_id}/connectivity", s.guard(s.handleTestProviderConnectivity))
+	mux.HandleFunc("POST /api/providers/connectivity", s.guard(s.handleTestDraftConnectivity))
 
 	// 模型
 	mux.HandleFunc("GET /api/models", s.guard(s.handleListModels))

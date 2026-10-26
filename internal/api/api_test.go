@@ -29,6 +29,28 @@ type upstreamStub struct {
 	fail   bool
 	models []string
 	chat   bool
+	// chatBody / chatStatus 控制 chat/completions 的响应（为空时用内置的最小响应）。
+	chatBody   string
+	chatStatus int
+	// lastChat 是最近一次 chat/completions 的请求体（用于断言 model / messages / max_tokens）。
+	lastChat map[string]any
+	// chatAuth 是最近一次 chat/completions 的 Authorization 头。
+	chatAuth string
+}
+
+// setChat 设置 chat/completions 的固定响应体与状态码（0 表示 200）。
+func (u *upstreamStub) setChat(body string, status int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.chatBody = body
+	u.chatStatus = status
+}
+
+// lastChatRequest 返回最近一次 chat 请求体与 Authorization 头。
+func (u *upstreamStub) lastChatRequest() (map[string]any, string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.lastChat, u.chatAuth
 }
 
 func (u *upstreamStub) setFail(v bool) {
@@ -47,6 +69,8 @@ func (u *upstreamStub) handler(w http.ResponseWriter, r *http.Request) {
 	u.mu.Lock()
 	fail := u.fail
 	models := append([]string(nil), u.models...)
+	chatBody := u.chatBody
+	chatStatus := u.chatStatus
 	u.mu.Unlock()
 
 	if fail {
@@ -64,10 +88,22 @@ func (u *upstreamStub) handler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": items})
 	case "/v1/chat/completions":
+		raw, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		_ = json.Unmarshal(raw, &payload)
 		u.mu.Lock()
 		u.chat = true
+		u.lastChat = payload
+		u.chatAuth = r.Header.Get("Authorization")
 		u.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		if chatStatus != 0 && chatStatus != http.StatusOK {
+			w.WriteHeader(chatStatus)
+		}
+		if chatBody != "" {
+			_, _ = w.Write([]byte(chatBody))
+			return
+		}
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -86,6 +122,59 @@ type harness struct {
 	reloadCount int
 	// apiServer 仅在新 harnessWithPresets 中设置（用于直接调用 Server 上的私有方法做测试）
 	apiServer *Server
+	// logSink / usageSink 收集控制面诊断调用写出的日志与用量（默认注入内存版）。
+	logSink   *fakeLogSink
+	usageSink *fakeUsageSink
+}
+
+// fakeLogSink 收集 Enqueue 进来的日志条目（替代异步的 logging.Recorder）。
+type fakeLogSink struct {
+	mu      sync.Mutex
+	entries []logging.Entry
+}
+
+func (f *fakeLogSink) Enqueue(e logging.Entry) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries, e)
+}
+
+func (f *fakeLogSink) all() []logging.Entry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]logging.Entry(nil), f.entries...)
+}
+
+// fakeUsageRecord 是一条被 Record 的用量事件。
+type fakeUsageRecord struct {
+	gatewayKeyID string
+	providerID   string
+	keyID        string
+	model        string
+	statusCode   int
+	usage        logging.Usage
+}
+
+// fakeUsageSink 收集 Record 进来的用量事件。
+type fakeUsageSink struct {
+	mu      sync.Mutex
+	records []fakeUsageRecord
+}
+
+func (f *fakeUsageSink) Record(gatewayKeyID, providerID, keyID, model string, statusCode int,
+	usage logging.Usage, _ time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records = append(f.records, fakeUsageRecord{
+		gatewayKeyID: gatewayKeyID, providerID: providerID, keyID: keyID,
+		model: model, statusCode: statusCode, usage: usage,
+	})
+}
+
+func (f *fakeUsageSink) all() []fakeUsageRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeUsageRecord(nil), f.records...)
 }
 
 // newHarness 构造一个带真实 SQLite 的控制面测试服务（含 mock 上游）。
@@ -138,7 +227,8 @@ func newHarness(t *testing.T, adminPassword string) *harness {
 	}
 	holder := config.NewHolder(snap)
 
-	h := &harness{t: t, store: st, master: master, holder: holder, upstream: upstream, upstreamURL: upstreamSrv.URL, dataDir: dir}
+	h := &harness{t: t, store: st, master: master, holder: holder, upstream: upstream,
+		upstreamURL: upstreamSrv.URL, dataDir: dir, logSink: &fakeLogSink{}, usageSink: &fakeUsageSink{}}
 	mux := http.NewServeMux()
 	New(Options{
 		Store:  st,
@@ -156,6 +246,8 @@ func newHarness(t *testing.T, adminPassword string) *harness {
 			DBPath:        filepath.Join(dir, "agora.db"),
 			MasterKeyPath: filepath.Join(dir, "master.key"),
 		},
+		LogSink:   h.logSink,
+		UsageSink: h.usageSink,
 	}).Register(mux)
 
 	h.srv = httptest.NewServer(mux)

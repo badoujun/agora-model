@@ -36,31 +36,11 @@ func (noopUsageSink) Record(string, string, string, string, int, Usage, time.Tim
 //	  "prompt_tokens_details": { "cached_tokens": int } } }
 //
 // 返回值 ok=false 表示 body 不是合法 JSON 或不含 usage 字段。
+//
+// 实现委托给 logging.ParseOpenAIUsage：控制台的「单 Key 连通性测试」也要
+// 用同一口径统计 token，放在 logging 包可避免两处解析逻辑分叉。
 func parseOpenAIUsageNonStream(body []byte) (Usage, bool) {
-	var envelope struct {
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			PromptDetails    struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return Usage{}, false
-	}
-	if envelope.Usage.PromptTokens == 0 && envelope.Usage.CompletionTokens == 0 {
-		return Usage{}, false
-	}
-	cached := envelope.Usage.PromptDetails.CachedTokens
-	if cached > envelope.Usage.PromptTokens {
-		cached = envelope.Usage.PromptTokens
-	}
-	return Usage{
-		InputTokens:       envelope.Usage.PromptTokens,
-		CachedInputTokens: cached,
-		OutputTokens:      envelope.Usage.CompletionTokens,
-	}, true
+	return logging.ParseOpenAIUsage(body)
 }
 
 // openAIUsageAccumulator 聚合流式响应里的 token 统计。

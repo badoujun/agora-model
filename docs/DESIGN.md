@@ -484,6 +484,8 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | `POST` | `/api/providers/{id}/test` | 连接测试：按顺序探测启用的 Key，首个成功即返回，响应含每个 Key 的明细 |
 | `POST` | `/api/providers/{id}/keys/{key_id}/test` | 只测试某个 Key（含已停用的 Key，用于判断能否重新启用） |
 | `POST` | `/api/providers/test-key` | 未保存表单里的单个/多个 Key 的草稿测试（不落库） |
+| `POST` | `/api/providers/{id}/keys/{key_id}/connectivity` | 单 Key **连通性测试**：用该 Key 真实调用一次 `chat/completions`，回传上游原始响应与 usage；计入请求日志（协议 `connectivity`）与 token 用量 |
+| `POST` | `/api/providers/connectivity` | 未保存表单里的 Key 做连通性测试（明文只用于本次调用，不落库） |
 | `POST` | `/api/providers/{id}/fetch-models` | 立即拉取该供应商模型列表 |
 | `POST` | `/api/providers/fetch-models` | **未保存的供应商**按表单信息拉取候选模型（不落库，供「保存 / 拉取」分离使用） |
 | `GET` | `/api/models` | 聚合模型列表（含来源、是否默认、是否手动、抓取时间） |
