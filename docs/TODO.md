@@ -411,8 +411,8 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
   - `DisableProviderKey`（`WHERE enabled=1` 幂等保护）、`RecordProviderKeyFailure`、`TouchProviderKey`
   - **验收**：`TestSaveProviderReplacesKeySet` / `TestDisableProviderKeyOnlyWhenEnabled` 通过
 - [x] **T7.3｜数据面：轮询 + 自动停用（内存热路径）** ｜ 5h
-  - `gateway/keyruntime.go`：`sync.Map` 轮询计数 + 原子健康状态；健康优先、冷却兜底、去重
-  - `gateway/failover.go`：401/402/403/429 自动停用并切换（最后一个可用 Key 只冷却不停用）、5xx/断连不重试、最后一次错误原样透传；每次失败（含最后一次）写入请求日志 `error_msg`
+  - `gateway/keyruntime.go`：`sync.Map` 轮询计数 + 原子健康状态；健康优先、去重（第 16 轮移除了冷却机制）
+  - `gateway/failover.go`：401/402/403/429 自动停用并切换、5xx/断连不重试、最后一次错误原样透传；每次失败（含最后一次）写入请求日志 `error_msg`（第 16 轮起最后一个可用 Key 也自动停用，见 T16）
   - `store.ProviderKeyStatsRecorder`：异步落库失败计数/自动停用；落库后防抖重建快照
   - `observe`：新快照里重新出现的 Key 视为「用户已重新启用」，复位运行时标记
   - **验收**：`TestKeyRoundRobinAlternatesAuthorization` / `TestKeyFailoverOn401DisablesFailedKey` /
@@ -535,6 +535,36 @@ T4.1 → T4.2 → T4.3 → T4.4 → T4.5 → T4.6 → T4.7 → T4.8 → T4.9
   - README（多网关 Key / 模型范围 / 日志与统计维度）、DESIGN（DDL、约束表、API 表、§8.4/§8.5、ADR-006、§13）、
     PRD（术语表、FR-3、FR-7.1/7.6、附录 A 第 14 轮）、本 TODO；`--reset-gateway-key` 文案改为「软删全部网关 Key 并新建一个」；
   - 版本号升到 `0.6.0`。
+
+## Phase 10 · 凭证停用策略调整（第 16 轮）· 已完成（2026-10）
+
+> **需求变更（第 16 轮）**：去掉「最后一个可用 Key 只冷却」的保护；一个供应商的全部 Key
+> 自动停用后，联动停用该供应商；恢复完全人工（无冷却、无后台自动重启）。
+
+- [x] **T10.1｜数据面：移除冷却保护** ｜ 2h
+  - 删除 `cooldownLastKey` / `markCooldown` / `keyState.disabledUntil` / `canAutoDisable`；
+  - `401/402/403/429` 一律自动停用（含最后一个可用 Key）；`order()` 简化为单轮健康过滤；
+  - 失败动作文案增加「已联动停用供应商」。
+  - **验收**：`TestSingleKeyFailureDisablesKey` / `TestSingleKeyRateLimitDisablesKey` /
+    `TestKeyAllFailedPassesLastUpstreamErrorThrough` 通过。
+- [x] **T10.2｜落库阶段联动停用供应商** ｜ 3h
+  - `disableProviderIfExhaustedTx`：`NOT EXISTS (SELECT 1 FROM provider_keys WHERE provider_id=? AND enabled=1)`
+    原子判定，并发下不会漏判；
+  - `Store.DisableProviderKey` 与 `ProviderKeyStatsRecorder.flushBatch` 共用；落库后复用
+    `SetOnDisabled` 回调重建快照。
+  - **验收**：`TestProviderKeyStatsRecorderDisablesProviderWhenAllKeysDisabled` /
+    `TestDisableProviderKeyOnlyWhenEnabled` 通过。
+- [x] **T10.3｜保存校验与恢复路径** ｜ 1h
+  - `SaveProvider`：仅当供应商启用时才要求至少一个启用的 Key；供应商停用时允许全部 Key 停用；
+  - 恢复顺序：先启用 Key，再启用供应商（无冷却、无自动重启）。
+  - **验收**：`TestProviderEnableRequiresEnabledKey` 通过。
+- [x] **T10.4｜前端** ｜ 1h
+  - 列表区分显示供应商「自动停用」；编辑页文案与提交校验同步；启用供应商但无可用 Key 时给出提示。
+  - **验收**：`npm --prefix web run typecheck` 通过。
+- [x] **T10.5｜测试与文档** ｜ 2h
+  - 单 Key 失败停用、全部失败停用并联动、保存校验、联动 SQL；`go test ./...` 与
+    `go test -race ./internal/gateway/... ./internal/store/...` 通过；
+  - README / DESIGN §4.2、§7.10、§10.2、§11 / PRD 第 16 轮 / 本 TODO。
 
 ---
 

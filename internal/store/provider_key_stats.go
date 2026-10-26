@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,22 +33,67 @@ func (s *Store) RecordProviderKeyFailure(ctx context.Context, keyID, reason stri
 	return err
 }
 
-// DisableProviderKey 把某个 Key 自动停用（凭证无效 / 欠费 / 无权限）。
+// DisableProviderKey 把某个 Key 自动停用（凭证无效 / 欠费 / 无权限 / 限速）。
 //
 // WHERE enabled = 1 让「用户在界面上刚重新启用」的 Key 不会被随后到达的
-// 同一次失败写回停用状态。
+// 同一次失败写回停用状态。停用后若该供应商已没有任何启用的 Key，
+// 一并停用供应商（恢复必须由人工重新启用）。
 func (s *Store) DisableProviderKey(ctx context.Context, keyID, reason string) error {
 	if keyID == "" {
 		return nil
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	reason = truncate(reason, 200)
-	_, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE provider_keys SET enabled = 0, auto_disabled = 1, disabled_reason = ?,
 		   failure_count = failure_count + 1, last_failure_at = ?, last_error = ?
 		 WHERE id = ? AND enabled = 1`,
-		reason, now, reason, keyID)
-	return err
+		reason, now, reason, keyID); err != nil {
+		return err
+	}
+
+	var providerID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT provider_id FROM provider_keys WHERE id = ?`, keyID).Scan(&providerID); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	if _, err := disableProviderIfExhaustedTx(ctx, tx, providerID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// disableProviderIfExhaustedTx 在某供应商已没有任何启用的 Key 时停用该供应商。
+//
+// 判定放在数据库里用 NOT EXISTS 完成，而不是依赖数据面的内存状态：
+// 并发请求各自停用不同 Key 时，只要最后一个 Key 的停用落库，
+// 任何一个批次的检查都会命中，不会出现"Key 全停用但供应商仍启用"的泄漏。
+// 返回 true 表示本次调用确实停用了供应商。
+func disableProviderIfExhaustedTx(ctx context.Context, tx *sql.Tx, providerID string) (bool, error) {
+	if providerID == "" {
+		return false, nil
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE providers SET enabled = 0, updated_at = ?
+		 WHERE id = ? AND enabled = 1
+		   AND NOT EXISTS (SELECT 1 FROM provider_keys WHERE provider_id = ? AND enabled = 1)`,
+		time.Now().UTC().Format(time.RFC3339), providerID, providerID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // ProviderKeyStatsOptions 配置凭证健康状态记录的批量参数。
@@ -72,10 +119,12 @@ func DefaultProviderKeyStatsOptions() ProviderKeyStatsOptions {
 }
 
 type keyStatsEvent struct {
-	keyID   string
-	reason  string
-	failure bool
-	disable bool
+	// providerID 仅在 disable 事件里使用：落库时据此检查供应商是否已无可用 Key。
+	providerID string
+	keyID      string
+	reason     string
+	failure    bool
+	disable    bool
 }
 
 // ProviderKeyStatsRecorder 以「异步 + 批量」方式写入凭证健康状态
@@ -151,11 +200,11 @@ func (r *ProviderKeyStatsRecorder) RecordProviderKeyFailure(keyID, reason string
 }
 
 // DisableProviderKey 记录一次「自动停用」。
-func (r *ProviderKeyStatsRecorder) DisableProviderKey(keyID, reason string) {
+func (r *ProviderKeyStatsRecorder) DisableProviderKey(providerID, keyID, reason string) {
 	if keyID == "" {
 		return
 	}
-	r.enqueue(keyStatsEvent{keyID: keyID, reason: reason, failure: true, disable: true})
+	r.enqueue(keyStatsEvent{providerID: providerID, keyID: keyID, reason: reason, failure: true, disable: true})
 }
 
 // SetOnDisabled 注册自动停用落库后的回调（必须是非阻塞的）。
@@ -258,6 +307,9 @@ func (r *ProviderKeyStatsRecorder) flushBatch(ctx context.Context, batch []keySt
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	touched := make(map[string]bool, len(batch))
+	// 本批次里被自动停用的 Key 所属供应商：本批的 Key 状态全部落库后，
+	// 再逐个检查「是否已没有任何启用的 Key」，是则一并停用供应商。
+	disabledProviders := make(map[string]bool, 2)
 	for _, e := range batch {
 		switch {
 		case e.disable:
@@ -267,6 +319,9 @@ func (r *ProviderKeyStatsRecorder) flushBatch(ctx context.Context, batch []keySt
 				 WHERE id = ? AND enabled = 1`,
 				truncate(e.reason, 200), now, truncate(e.reason, 200), e.keyID); err != nil {
 				return err
+			}
+			if e.providerID != "" {
+				disabledProviders[e.providerID] = true
 			}
 		case e.failure:
 			if _, err := tx.ExecContext(ctx,
@@ -285,6 +340,15 @@ func (r *ProviderKeyStatsRecorder) flushBatch(ctx context.Context, batch []keySt
 				`UPDATE provider_keys SET last_used_at = ? WHERE id = ?`, now, e.keyID); err != nil {
 				return err
 			}
+		}
+	}
+	for providerID := range disabledProviders {
+		stopped, err := disableProviderIfExhaustedTx(ctx, tx, providerID)
+		if err != nil {
+			return err
+		}
+		if stopped {
+			r.logger.Warn("供应商的全部 API Key 已不可用，已联动停用该供应商", "provider_id", providerID)
 		}
 	}
 	if err := tx.Commit(); err != nil {

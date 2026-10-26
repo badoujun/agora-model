@@ -412,8 +412,12 @@ func (s *Store) SaveProvider(ctx context.Context, master []byte, p config.Provid
 		}
 		keep[row.ID] = true
 	}
-	if enabledCount == 0 {
-		return ProviderRecord{}, fmt.Errorf("供应商 %s 至少需要启用一个 API Key（如需整体停用请停用供应商）", p.ID)
+	// 「先有启用的 Key，才能启用供应商」：
+	// 供应商停用时允许其全部 Key 停用（自动停用后的自然状态即可保存），
+	// 但一旦供应商要处于启用状态，就必须至少有一个启用的 Key。
+	if enabledCount == 0 && rec.Enabled {
+		return ProviderRecord{}, fmt.Errorf(
+			"供应商 %s 启用时至少需要一个启用的 API Key：请先勾选并保存要启用的 Key，再启用供应商", p.ID)
 	}
 	for _, old := range oldKeys {
 		if keep[old.ID] {

@@ -512,8 +512,8 @@ export function ProvidersPage() {
       setFormError('请至少添加一个 API Key')
       return
     }
-    if (enabledKeyRows.length === 0) {
-      setFormError('请至少启用一个 API Key（如需整体停用请停用供应商）')
+    if (form.enabled && enabledKeyRows.length === 0) {
+      setFormError('启用供应商时至少需要一个启用的 API Key：请先勾选要启用的 Key（可点「全部启用」），再启用供应商')
       return
     }
     for (let i = 0; i < form.keys.length; i += 1) {
@@ -742,6 +742,14 @@ export function ProvidersPage() {
                     <TableCell>
                       {provider.enabled ? (
                         <Badge variant="success">启用</Badge>
+                      ) : provider.keys.length > 0 &&
+                        provider.keys.every((key) => !key.enabled && key.auto_disabled) ? (
+                        <Badge
+                          variant="danger"
+                          title="全部 API Key 已被网关自动停用，供应商因此被联动停用。请在编辑页先启用至少一个 Key，再启用供应商。"
+                        >
+                          自动停用
+                        </Badge>
                       ) : (
                         <Badge>停用</Badge>
                       )}
@@ -866,13 +874,20 @@ export function ProvidersPage() {
               <div>
                 <p className="text-sm font-medium text-slate-800">API Key（可配置多个，按顺序轮询）</p>
                 <p className="text-xs text-slate-500">
-                  共 {form.keys.length} 个，启用 {enabledKeyRows.length} 个。上游返回 401/402/403 时，
-                  网关会自动停用该 Key 并切换到下一个；429 只冷却 60 秒。数量不设上限。
+                  共 {form.keys.length} 个，启用 {enabledKeyRows.length} 个。上游返回 401/402/403/429 时，
+                  网关会自动停用该 Key 并切换到下一个；全部 Key 都被停用后，该供应商也会被自动停用，
+                  需人工重新启用。数量不设上限。
                 </p>
               </div>
               <div className="flex items-center gap-2">
                 {form.keys.some((row) => !row.enabled) ? (
-                  <Button variant="outline" size="sm" type="button" onClick={reEnableAllKeys}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    type="button"
+                    onClick={reEnableAllKeys}
+                    title="把全部 Key 标记为启用（含已自动停用的）；若供应商已被联动停用，还需勾选下方「启用」并保存"
+                  >
                     <RotateCcw className="h-4 w-4" />
                     全部启用
                   </Button>
@@ -1089,6 +1104,9 @@ export function ProvidersPage() {
                 onCheckedChange={(checked) => setForm({ ...form, enabled: checked })}
               />
               <Label htmlFor="p-enabled">启用</Label>
+              {form.enabled && enabledKeyRows.length === 0 ? (
+                <span className="text-xs text-red-600">需先启用至少一个 API Key</span>
+              ) : null}
             </div>
             <div className="flex items-center gap-2">
               <Switch

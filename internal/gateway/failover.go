@@ -121,16 +121,13 @@ func (g *Gateway) sendWithFailover(ctx context.Context, in *http.Request, d rout
 			reason = keyFailureReason(status, drainBody(resp))
 		}
 
-		action := ""
-		if g.canAutoDisable(d.Provider.UsableKeys(), key) {
-			g.keyRuntime.markAutoDisabled(key)
-			g.recordKeyFailure(key.ID, reason, true)
-			action = "已自动停用"
-		} else {
-			// 最后一个可用 Key：只冷却，避免让供应商彻底没有可用凭证
-			g.keyRuntime.markCooldown(key, cooldownLastKey)
-			g.recordKeyFailure(key.ID, reason, false)
-			action = "是最后一个可用 Key，已冷却未停用"
+		// 凭证类失败一律自动停用，包括该供应商最后一个可用 Key：
+		// Key 全部停用后供应商会被一并停用（落库阶段完成），恢复完全由人工触发。
+		g.keyRuntime.markAutoDisabled(key)
+		g.recordKeyFailure(d.Provider.ID, key.ID, reason)
+		action := "已自动停用"
+		if g.keyRuntime.exhausted(d.Provider.UsableKeys()) {
+			action = "已自动停用（该供应商已无可用 Key，已联动停用供应商）"
 		}
 		failures = append(failures, keyFailure{
 			keyHint: crypto.Mask(key.Key), status: status, reason: reason, action: action,
@@ -149,23 +146,6 @@ func (g *Gateway) sendWithFailover(ctx context.Context, in *http.Request, d rout
 		return nil, config.ProviderKey{}, failures, lastErr
 	}
 	return nil, config.ProviderKey{}, failures, errNoUsableKey
-}
-
-// canAutoDisable 报告停用 key 之后是否还有别的可用 Key。
-//
-// 返回 false 表示 key 是当前唯一可用的凭证：此时停用会让供应商彻底无法服务，
-// 因此改为冷却（上游恢复后仍可继续使用）。
-func (g *Gateway) canAutoDisable(keys []config.ProviderKey, key config.ProviderKey) bool {
-	target := keyIdentity(key)
-	for _, k := range keys {
-		if keyIdentity(k) == target {
-			continue
-		}
-		if g.keyRuntime.usable(k) {
-			return true
-		}
-	}
-	return false
 }
 
 // attempt 用指定 Key 构造并发送一次上游请求（body 可安全复用）。
@@ -221,13 +201,9 @@ func (g *Gateway) recordKeySuccess(keyID string) {
 	}
 }
 
-func (g *Gateway) recordKeyFailure(keyID, reason string, disable bool) {
+func (g *Gateway) recordKeyFailure(providerID, keyID, reason string) {
 	if g.keyStats == nil || keyID == "" {
 		return
 	}
-	if disable {
-		g.keyStats.DisableProviderKey(keyID, reason)
-		return
-	}
-	g.keyStats.RecordProviderKeyFailure(keyID, reason)
+	g.keyStats.DisableProviderKey(providerID, keyID, reason)
 }

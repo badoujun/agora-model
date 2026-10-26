@@ -214,6 +214,52 @@ func TestProviderMultiKeyValidation(t *testing.T) {
 	}
 }
 
+// TestProviderEnableRequiresEnabledKey 覆盖「先有启用的 Key，才能启用供应商」：
+// 停用的供应商允许全部 Key 停用（自动停用后的自然状态），但启用供应商时必须
+// 至少有一个启用的 Key。
+func TestProviderEnableRequiresEnabledKey(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	id, body := createMultiKeyProvider(t, h, client, "多Key", []map[string]any{
+		{"label": "主账号", "api_key": "sk-main-1111aaaa", "enabled": true},
+	})
+	keyID := body["keys"].([]any)[0].(map[string]any)["id"].(string)
+
+	// 供应商停用 + 唯一 Key 停用：允许保存（自动停用后就是这个状态）
+	code, updated, raw := h.do(client, http.MethodPut, "/api/providers/"+id, map[string]any{
+		"enabled": false,
+		"keys":    []map[string]any{{"id": keyID, "label": "主账号", "enabled": false}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("停用供应商且全部 Key 停用应可保存，得到 %d（%s）", code, raw)
+	}
+	if updated["enabled"] != false {
+		t.Errorf("供应商应保持停用: %v", updated["enabled"])
+	}
+
+	// 只启用供应商、Key 仍全部停用：拒绝
+	code, _, raw = h.do(client, http.MethodPut, "/api/providers/"+id, map[string]any{"enabled": true})
+	if code != http.StatusBadRequest {
+		t.Fatalf("没有启用的 Key 时启用供应商应被拒绝，得到 %d（%s）", code, raw)
+	}
+	if !strings.Contains(raw, "至少需要一个启用的 API Key") {
+		t.Errorf("错误信息应提示先启用 Key: %s", raw)
+	}
+
+	// 先启用 Key，再启用供应商：成功
+	code, updated, raw = h.do(client, http.MethodPut, "/api/providers/"+id, map[string]any{
+		"enabled": true,
+		"keys":    []map[string]any{{"id": keyID, "label": "主账号", "enabled": true}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("先启用 Key 再启用供应商应成功，得到 %d（%s）", code, raw)
+	}
+	if updated["enabled"] != true {
+		t.Errorf("供应商应恢复启用: %v", updated["enabled"])
+	}
+}
+
 func TestProviderKeyAutoDisabledVisibleAndReEnable(t *testing.T) {
 	h := newHarness(t, "")
 	client := newClient(t)

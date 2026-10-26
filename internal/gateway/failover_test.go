@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,7 +39,7 @@ func (f *fakeKeyStats) RecordProviderKeyFailure(keyID, reason string) {
 	f.failures[keyID]++
 }
 
-func (f *fakeKeyStats) DisableProviderKey(keyID, reason string) {
+func (f *fakeKeyStats) DisableProviderKey(providerID, keyID, reason string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failures[keyID]++
@@ -229,9 +228,9 @@ func TestKeyRateLimitDisablesFailedKeyLikePaymentRequired(t *testing.T) {
 	}
 }
 
-// TestSingleKeyRateLimitOnlyCoolsDown 验证 429 也与 402 一样保留
-// "最后一个可用 Key 只冷却不停用"的保护，避免把供应商彻底打死。
-func TestSingleKeyRateLimitOnlyCoolsDown(t *testing.T) {
+// TestSingleKeyRateLimitDisablesKey 验证 429 与 402 同等处理：
+// 即使供应商只有一个 Key，也会被自动停用（不再有"只冷却"的保护）。
+func TestSingleKeyRateLimitDisablesKey(t *testing.T) {
 	rec := &authRecorder{status: map[string]int{"Bearer sk-1": http.StatusTooManyRequests}}
 	upstream := httptest.NewServer(http.HandlerFunc(rec.handler))
 	defer upstream.Close()
@@ -244,11 +243,17 @@ func TestSingleKeyRateLimitOnlyCoolsDown(t *testing.T) {
 		t.Fatalf("单 Key 429 应原样透传，得到 %d", resp.StatusCode)
 	}
 	_, _, disabled := stats.snapshot()
-	if len(disabled) != 0 {
-		t.Fatalf("唯一的 Key 不应被自动停用：%v", disabled)
+	if disabled["k1"] == "" {
+		t.Fatalf("唯一的 Key 也应被自动停用：%v", disabled)
 	}
 	if g.keyRuntime.usable(p.APIKeys[0]) {
-		t.Fatal("429 后该 Key 应处于冷却中")
+		t.Fatal("429 后该 Key 不应再被视为可用")
+	}
+
+	// 全部 Key 停用后，后续请求返回 503（供应商停用由落库层联动完成）
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("Key 全部停用后应返回 503，得到 %d（%s）", resp.StatusCode, body)
 	}
 }
 
@@ -275,19 +280,19 @@ func TestKeyAllFailedPassesLastUpstreamErrorThrough(t *testing.T) {
 	}
 	_, failures, disabled := stats.snapshot()
 	if disabled["k1"] == "" {
-		t.Fatalf("还有其它可用 Key 时，失败的 Key 应被自动停用：%v", disabled)
+		t.Fatalf("失败的 Key 应被自动停用：%v", disabled)
 	}
-	if disabled["k2"] != "" {
-		t.Fatalf("最后一个可用 Key 不应被自动停用（只冷却）：%v", disabled)
+	if disabled["k2"] == "" {
+		t.Fatalf("最后一个可用 Key 也应被自动停用：%v", disabled)
 	}
 	if failures["k1"] == 0 || failures["k2"] == 0 {
 		t.Fatalf("两个 Key 的失败都应计数：%v", failures)
 	}
 
-	// 最后一个 Key 仍在（冷却中）：下一次请求继续尝试它，并原样返回上游错误
+	// 全部 Key 已停用：下一次请求直接 503，不再打上游
 	resp, body = doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("最后一次上游错误应持续透传，得到 %d（%s）", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("全部 Key 停用后应返回 503，得到 %d（%s）", resp.StatusCode, body)
 	}
 }
 
@@ -315,19 +320,12 @@ func TestAllKeysDisabledReturns503(t *testing.T) {
 	}
 }
 
-// TestSingleKeyFailureOnlyCoolsDown 覆盖"只有一个 Key"时的保护：
-// 不自动停用（否则供应商彻底不可用），但客户端仍看到原始 401；上游恢复后立即可用。
-func TestSingleKeyFailureOnlyCoolsDown(t *testing.T) {
-	var fail atomic.Bool
-	fail.Store(true)
+// TestSingleKeyFailureDisablesKey 覆盖"只有一个 Key"的情况：
+// 401 会直接停用该 Key（不再只冷却），客户端仍看到原始 401；后续请求 503。
+func TestSingleKeyFailureDisablesKey(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if fail.Load() {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"message":"invalid key"}}`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid key"}}`))
 	}))
 	defer upstream.Close()
 
@@ -339,18 +337,17 @@ func TestSingleKeyFailureOnlyCoolsDown(t *testing.T) {
 		t.Fatalf("单 Key 失败应原样透传 401，得到 %d", resp.StatusCode)
 	}
 	_, _, disabled := stats.snapshot()
-	if len(disabled) != 0 {
-		t.Fatalf("唯一的 Key 不应被自动停用：%v", disabled)
+	if disabled["k1"] == "" {
+		t.Fatalf("唯一的 Key 也应被自动停用：%v", disabled)
 	}
 	if g.keyRuntime.usable(p.APIKeys[0]) {
-		t.Fatal("失败后该 Key 应处于冷却中")
+		t.Fatal("失败后该 Key 不应再被视为可用")
 	}
 
-	// 上游恢复：冷却中的 Key 仍会被兜底尝试（可用性优先）
-	fail.Store(false)
+	// 恢复必须由人工触发：重新启用 Key 前持续 503
 	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("上游恢复后应立即可用，得到 %d（%s）", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("Key 停用后应返回 503，得到 %d（%s）", resp.StatusCode, body)
 	}
 }
 
@@ -576,8 +573,8 @@ func TestKeyFailuresRecordedInRequestLog(t *testing.T) {
 		if entry.StatusCode != http.StatusTooManyRequests {
 			t.Errorf("请求日志状态码 = %d，期望 429", entry.StatusCode)
 		}
-		// 第一次（402，已自动停用）与最后一次（429，最后一个可用 Key 只冷却）都要记录
-		for _, want := range []string{"HTTP 402", "insufficient balance", "已自动停用", "HTTP 429", "已冷却未停用"} {
+		// 第一次（402）与最后一次（429）都会被自动停用，且最后一次触发供应商联动停用
+		for _, want := range []string{"HTTP 402", "insufficient balance", "已自动停用", "HTTP 429", "已联动停用供应商"} {
 			if !strings.Contains(entry.ErrorMsg, want) {
 				t.Errorf("请求日志 error_msg 缺少 %q：%q", want, entry.ErrorMsg)
 			}
@@ -592,9 +589,9 @@ func TestDescribeKeyFailures(t *testing.T) {
 	}
 	got := describeKeyFailures([]keyFailure{
 		{keyHint: "sk-****aaaa", status: http.StatusTooManyRequests, reason: "HTTP 429", action: "已自动停用"},
-		{keyHint: "sk-****bbbb", status: http.StatusPaymentRequired, action: "是最后一个可用 Key，已冷却未停用"},
+		{keyHint: "sk-****bbbb", status: http.StatusPaymentRequired, action: "已自动停用（该供应商已无可用 Key，已联动停用供应商）"},
 	})
-	want := "Key sk-****aaaa: HTTP 429（已自动停用）；Key sk-****bbbb: HTTP 402（是最后一个可用 Key，已冷却未停用）"
+	want := "Key sk-****aaaa: HTTP 429（已自动停用）；Key sk-****bbbb: HTTP 402（已自动停用（该供应商已无可用 Key，已联动停用供应商））"
 	if got != want {
 		t.Errorf("失败摘要 = %q，期望 %q", got, want)
 	}
@@ -623,8 +620,9 @@ func TestKeySelectionConcurrent(t *testing.T) {
 			for j := 0; j < perWorker; j++ {
 				order := rt.order("p", keys, maxKeyAttempts)
 				if len(order) == 0 {
-					selErrs <- "候选为空"
-					return
+					// 并发下其它 goroutine 可能刚好把所有 Key 标记为自动停用、
+					// 尚未 forget：候选为空是合法结果（调用方会回 503）。
+					continue
 				}
 				// 候选里不应出现重复 Key
 				seen := map[string]bool{}
@@ -635,9 +633,9 @@ func TestKeySelectionConcurrent(t *testing.T) {
 					}
 					seen[k.ID] = true
 				}
-				// 模拟失败/恢复标记，验证无数据竞争（其他 goroutine 也可能同时改状态，
+				// 模拟自动停用/恢复标记，验证无数据竞争（其他 goroutine 也可能同时改状态，
 				// 因此这里不假设候选数量恒为 3）
-				rt.markCooldown(order[0], time.Millisecond)
+				rt.markAutoDisabled(order[0])
 				rt.forget(order[0])
 			}
 		}()

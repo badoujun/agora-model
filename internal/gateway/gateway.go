@@ -28,15 +28,16 @@ import (
 var errBodyTooLarge = errors.New("请求体过大")
 
 // errNoUsableKey 表示供应商没有任何可用的 API Key（全部停用/被自动停用）。
-var errNoUsableKey = errors.New("供应商没有可用的 API Key（可能已全部被自动停用）")
+var errNoUsableKey = errors.New("供应商没有可用的 API Key（已全部停用或自动停用，请在供应商页重新启用）")
 
 // ProviderKeyStats 是凭证健康状态的下游接收方（由 store.ProviderKeyStatsRecorder 实现）。
 //
-// 三个方法都必须是非阻塞的：数据面只在内存里做原子标记，落库交给异步 recorder。
+// 两个方法都必须是非阻塞的：数据面只在内存里做原子标记，落库交给异步 recorder。
+// DisableProviderKey 带 providerID：落库时若该供应商已没有任何启用的 Key，
+// 会一并停用供应商（见 store.ProviderKeyStatsRecorder.flushBatch）。
 type ProviderKeyStats interface {
 	TouchProviderKey(keyID string)
-	RecordProviderKeyFailure(keyID, reason string)
-	DisableProviderKey(keyID, reason string)
+	DisableProviderKey(providerID, keyID, reason string)
 }
 
 // KeyStore 是网关 Key 的校验与使用记录接口（由 store 实现）。
@@ -55,7 +56,7 @@ type Gateway struct {
 	keys      KeyStore
 	recorder  *logging.Recorder
 	usageSink UsageSink
-	// keyRuntime 是供应商 Key 的进程内健康状态（轮询起点/冷却/自动停用），
+	// keyRuntime 是供应商 Key 的进程内健康状态（轮询起点/自动停用），
 	// 请求路径只读它和配置快照，不碰数据库（DESIGN §7.10）。
 	keyRuntime *keyRuntime
 	keyStats   ProviderKeyStats

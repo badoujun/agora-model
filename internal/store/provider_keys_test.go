@@ -178,8 +178,15 @@ func TestSaveProviderReplacesKeySet(t *testing.T) {
 		AllowInternal: true,
 		APIKeys:       []config.ProviderKey{{ID: mainID, Enabled: &disabled}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "至少需要启用一个") {
+	if err == nil || !strings.Contains(err.Error(), "至少需要一个启用的 API Key") {
 		t.Fatalf("全部停用应被拒绝，得到 %v", err)
+	}
+
+	// 供应商停用时允许全部 Key 停用（自动停用后的自然状态，保存其它字段不应被卡住）
+	p.Enabled = &disabled
+	_, err = st.SaveProvider(ctx, master, p)
+	if err != nil {
+		t.Fatalf("供应商停用时允许全部 Key 停用，得到 %v", err)
 	}
 }
 
@@ -209,6 +216,14 @@ func TestDisableProviderKeyOnlyWhenEnabled(t *testing.T) {
 	}
 	if rec.DisabledReason != "HTTP 401: invalid" || rec.LastError != "HTTP 401: invalid" {
 		t.Errorf("原因未记录: %+v", rec)
+	}
+	// 唯一的 Key 停用后，供应商应被联动停用（providers.enabled = 0）
+	providerRec, err := st.GetProvider(ctx, "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providerRec.Enabled {
+		t.Error("全部 Key 被自动停用后，供应商应被联动停用")
 	}
 
 	// 重复停用：WHERE enabled=1 使计数不再增长（幂等保护）
@@ -345,7 +360,7 @@ func TestProviderKeyStatsRecorderFlush(t *testing.T) {
 	rec.RecordProviderKeyFailure(backupID, "HTTP 429: slow down")
 	disabledCalled := make(chan struct{}, 1)
 	rec.SetOnDisabled(func() { disabledCalled <- struct{}{} })
-	rec.DisableProviderKey(mainID, "HTTP 401: invalid key")
+	rec.DisableProviderKey("p1", mainID, "HTTP 401: invalid key")
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -385,6 +400,80 @@ func TestProviderKeyStatsRecorderFlush(t *testing.T) {
 	written, dropped := rec.Stats()
 	if dropped != 0 || written < 3 {
 		t.Errorf("recorder 统计 = written %d / dropped %d", written, dropped)
+	}
+}
+
+// TestProviderKeyStatsRecorderDisablesProviderWhenAllKeysDisabled 覆盖联动停用：
+// 最后一个 Key 停用落库后，供应商也应被停用；只要还有启用的 Key 则保持启用。
+func TestProviderKeyStatsRecorderDisablesProviderWhenAllKeysDisabled(t *testing.T) {
+	st, master := newTestStore(t)
+	ctx := context.Background()
+	enabled := true
+
+	p := sampleProvider("p1")
+	p.APIKeys = []config.ProviderKey{
+		{Label: "主账号", Key: "sk-main", Enabled: &enabled},
+		{Label: "备用", Key: "sk-backup", Enabled: &enabled},
+	}
+	saved, err := st.SaveProvider(ctx, master, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainID, backupID := saved.Keys[0].ID, saved.Keys[1].ID
+
+	rec := NewProviderKeyStatsRecorder(st, nil, ProviderKeyStatsOptions{FlushEvery: 10 * time.Millisecond})
+	cancelCtx, cancel := context.WithCancel(ctx)
+	rec.Start(cancelCtx)
+	defer func() {
+		cancel()
+		rec.Wait(2 * time.Second)
+	}()
+
+	// 只停用一个 Key：还有启用的 Key，供应商保持启用
+	rec.DisableProviderKey("p1", mainID, "HTTP 401: invalid key")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("等待第一个 Key 落库超时")
+		}
+		k, err := st.GetProviderKey(ctx, "p1", mainID)
+		if err == nil && !k.Enabled {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if providerRec, _ := st.GetProvider(ctx, "p1"); !providerRec.Enabled {
+		t.Fatal("仍有启用的 Key 时，供应商不应被停用")
+	}
+
+	// 停用最后一个 Key：供应商应被联动停用
+	rec.DisableProviderKey("p1", backupID, "HTTP 402: insufficient balance")
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("等待最后一个 Key 落库超时")
+		}
+		k, err := st.GetProviderKey(ctx, "p1", backupID)
+		if err == nil && !k.Enabled {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	providerRec, err := st.GetProvider(ctx, "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providerRec.Enabled {
+		t.Fatal("全部 Key 停用后，供应商应被联动停用")
+	}
+
+	// 重新启用 Key 后，供应商需要人工启用（保存时先有启用的 Key 才能启用供应商）
+	p.APIKeys = []config.ProviderKey{{ID: backupID, Label: "备用", Enabled: &enabled}}
+	if _, err := st.SaveProvider(ctx, master, p); err != nil {
+		t.Fatalf("先启用 Key 再启用供应商应成功: %v", err)
+	}
+	providerRec, _ = st.GetProvider(ctx, "p1")
+	if !providerRec.Enabled {
+		t.Error("保存后供应商应恢复启用")
 	}
 }
 
