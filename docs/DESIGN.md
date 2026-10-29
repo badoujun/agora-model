@@ -331,7 +331,7 @@ CREATE INDEX IF NOT EXISTS idx_cache_model    ON model_cache(model_id);
 | --- | --- |
 | 多凭证（v6） | 凭证单独存 `provider_keys` 表：一个 `providers` 行可以有任意多个 Key（数量不设上限），`position` 决定轮询/展示顺序 |
 | Key 不可回读 | 只存密文与掩码提示；修改采用覆盖语义（按 id 提交表示沿用原密文） |
-| 自动停用 | `401/402/403/429` 会把该 Key 置为 `enabled=0, auto_disabled=1` 并记录原因；用户在 UI 上重新启用即清除标记。供应商的**全部 Key** 都被自动停用时，供应商本身也会被置为 `enabled=0`（无冷却、无自动重启，恢复必须人工完成） |
+| 自动停用 | `401/402/403/429/431` 会把该 Key 置为 `enabled=0, auto_disabled=1` 并记录原因；用户在 UI 上重新启用即清除标记。供应商的**全部 Key** 都被自动停用时，供应商本身也会被置为 `enabled=0`（无冷却、无自动重启，恢复必须人工完成） |
 | 顺序稳定 | 排序键为 `(provider_id, position, created_at, id)`；`position` 由保存时提交顺序决定 |
 | 多网关 Key（v7） | 一个网关可同时启用任意多条 Key；`name`（别名）必填且 ≤64 rune，`note` ≤256；停用/删除最后一个启用的 Key 会被拒绝（避免所有 Agent 立刻锁死）；删除为软删除，记录保留供历史日志与统计显示名称 |
 | 网关 Key 模型范围（v7） | `gateway_key_models` 存「供应商 + 上游模型名」白名单；**没有行的 Key = 不限制**。范围参与路由：显式命名空间越界返回 403 `model_not_allowed`；`/v1/models` 同样按范围过滤 |
@@ -830,7 +830,7 @@ func Encrypt(master, plaintext []byte, aad string) ([]byte, error) {
 | 2xx 非流式 | 可选（设置项 `log_success`，默认关） | 只累加计数，避免写放大 |
 | 2xx 流式 | 可选（同上） | 记录总字节与总时长 |
 | 4xx / 5xx | **必记** | 含上游错误体前 1KB（脱敏后） |
-| 凭证级失败（401/402/403/429） | **必记**（即使最终成功也记） | `error_msg` 追加每个失败 Key 的掩码、状态码/原因与网关动作 |
+| 凭证级失败（401/402/403/429/431） | **必记**（即使最终成功也记） | `error_msg` 追加每个失败 Key 的掩码、状态码/原因与网关动作 |
 | 上游连接失败 / 超时 | **必记** | `status_code` 记 502/504 |
 | 客户端断开 | **必记** | `status_code` = 499 |
 | 管理 API 操作（增删改、Key 重置、登录） | **必记** | 审计用途，写入进程日志 + 可选 `logs`（`inbound_protocol = "admin"`） |
@@ -864,7 +864,7 @@ order := keyRuntime.order(p.ID, keys, 3)   // 轮询起点 + 健康过滤，仅 
 
 | 上游结果 | 行为 |
 | --- | --- |
-| `401 / 402 / 403 / 429` | 内存中立即停用该 Key（后续请求不再选它）→ 异步落库 `enabled=0, auto_disabled=1, disabled_reason` → 换下一个 Key；已是最后一次时把该响应原样透传。**不再有「最后一个可用 Key 只冷却」的保护**：即使它是供应商的最后一个可用 Key 也照常停用 |
+| `401 / 402 / 403 / 429 / 431` | 内存中立即停用该 Key（后续请求不再选它）→ 异步落库 `enabled=0, auto_disabled=1, disabled_reason` → 换下一个 Key；已是最后一次时把该响应原样透传。**不再有「最后一个可用 Key 只冷却」的保护**：即使它是供应商的最后一个可用 Key 也照常停用 |
 | 全部 Key 自动停用 | 落库阶段检查该供应商是否已没有任何启用的 Key，是则一并停用供应商（`providers.enabled=0`），随后重建快照；后续请求返回 503 `no_available_provider`，重启后仍保持停用 |
 | 连接失败 / 超时 | 换下一个 Key（不改 Key 状态）；客户端断开或整体超时则立即停止重试 |
 | `5xx`、其它 4xx | 原样透传，**不重试**（避免重复计费与半截流） |

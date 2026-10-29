@@ -924,7 +924,7 @@ export function ProvidersPage() {
               <div>
                 <p className="text-sm font-medium text-slate-800">API Key（可配置多个，按顺序轮询）</p>
                 <p className="text-xs text-slate-500">
-                  共 {form.keys.length} 个，启用 {enabledKeyRows.length} 个。上游返回 401/402/403/429 时，
+                  共 {form.keys.length} 个，启用 {enabledKeyRows.length} 个。上游返回 401/402/403/429/431 时，
                   网关会自动停用该 Key 并切换到下一个；全部 Key 都被停用后，该供应商也会被自动停用，
                   需人工重新启用。数量不设上限。
                 </p>

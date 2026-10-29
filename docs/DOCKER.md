@@ -210,5 +210,5 @@ docker compose logs --tail=50 agoramodel
 
 ```bash
 curl http://127.0.0.1:9090/healthz
-# {"status":"ok","version":"0.8.0"}
+# {"status":"ok","version":"0.8.1"}
 ```

@@ -257,6 +257,79 @@ func TestSingleKeyRateLimitDisablesKey(t *testing.T) {
 	}
 }
 
+// TestKeySuspension431DisablesFailedKey 覆盖上游用 431 表示账号封停的情况：
+// 该 Key 与 401/403 同级处理——立即自动停用并切换到下一个 Key。
+func TestKeySuspension431DisablesFailedKey(t *testing.T) {
+	rec := &authRecorder{status: map[string]int{"Bearer sk-suspended": http.StatusRequestHeaderFieldsTooLarge},
+		body: map[string]string{"Bearer sk-suspended": `{"error":{"message":"Account Suspension","type":"invalid_request_error","code":"431"}}`}}
+	upstream := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer upstream.Close()
+
+	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-suspended", "k2": "sk-good"}, "m")
+	srv, _, stats := buildGatewayWithKeys(t, p)
+
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
+	if resp.StatusCode != http.StatusOK || body != `{"ok":true}` {
+		t.Fatalf("431 后应切换到下一个 Key：状态码 = %d，body = %s", resp.StatusCode, body)
+	}
+
+	_, failures, disabled := stats.snapshot()
+	if disabled["k1"] == "" {
+		t.Fatalf("431 应与 401/403 一样自动停用 Key：disabled=%v failures=%v", disabled, failures)
+	}
+	if !strings.Contains(disabled["k1"], "431") {
+		t.Errorf("停用原因应包含状态码，得到 %q", disabled["k1"])
+	}
+	if failures["k1"] != 1 {
+		t.Errorf("431 也应计入失败次数，得到 %d", failures["k1"])
+	}
+	if len(rec.auths()) != 2 {
+		t.Fatalf("应尝试两个 Key，实际 %v", rec.auths())
+	}
+
+	// 后续请求不应再使用被停用的 k1
+	before := len(rec.auths())
+	if resp, _ := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("后续请求应仍然成功，状态码 = %d", resp.StatusCode)
+	}
+	auths := rec.auths()[before:]
+	if len(auths) != 1 || auths[0] != "Bearer sk-good" {
+		t.Fatalf("被自动停用的 Key 不应再参与轮询，实际 %v", auths)
+	}
+}
+
+// TestSingleKeySuspension431PassesThrough 验证唯一 Key 遇到 431 时：
+// Key 照常停用，上游 431 原样透传，后续请求转为 503。
+func TestSingleKeySuspension431PassesThrough(t *testing.T) {
+	rec := &authRecorder{status: map[string]int{"Bearer sk-1": http.StatusRequestHeaderFieldsTooLarge},
+		body: map[string]string{"Bearer sk-1": `{"error":{"message":"Account Suspension"}}`}}
+	upstream := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer upstream.Close()
+
+	p := keyProviderFor("p", upstream.URL, map[string]string{"k1": "sk-1"}, "m")
+	srv, g, stats := buildGatewayWithKeys(t, p)
+
+	resp, body := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("单 Key 431 应原样透传，得到 %d（%s）", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "Account Suspension") {
+		t.Fatalf("应透传上游错误体，得到 %s", body)
+	}
+	_, _, disabled := stats.snapshot()
+	if disabled["k1"] == "" {
+		t.Fatalf("唯一的 Key 也应被自动停用：%v", disabled)
+	}
+	if g.keyRuntime.usable(p.APIKeys[0]) {
+		t.Fatal("431 后该 Key 不应再被视为可用")
+	}
+
+	resp, body = doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", gatewayKey, `{"model":"p/m"}`, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("Key 全部停用后应返回 503，得到 %d（%s）", resp.StatusCode, body)
+	}
+}
+
 func TestKeyAllFailedPassesLastUpstreamErrorThrough(t *testing.T) {
 	rec := &authRecorder{status: map[string]int{
 		"Bearer sk-1": http.StatusUnauthorized,

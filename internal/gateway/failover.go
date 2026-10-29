@@ -68,8 +68,8 @@ func describeKeyFailures(failures []keyFailure) string {
 //
 // 规则（DESIGN §7.10）：
 //   - 健康 Key 优先，按轮询起点旋转；不足 maxKeyAttempts 个时用冷却中的 Key 补齐；
-//   - 401/402/403/429：该 Key 立即自动停用（内存生效 + 异步落库），换下一个 Key；
-//     若它是该供应商最后一个可用 Key，则只冷却 60 秒（避免把供应商彻底打死）；
+//   - 401/402/403/429/431：该 Key 立即自动停用（内存生效 + 异步落库），换下一个 Key；
+//     该供应商已无可用 Key 时联动停用供应商（无冷却、无自动重启，恢复须人工）；
 //   - 连接失败：换下一个 Key（不改变 Key 状态）；
 //   - 客户端断开/整体超时：立即停止重试；
 //   - 最后一次仍是凭证失败时，把该上游响应原样交给调用方透传。
@@ -165,12 +165,17 @@ func (g *Gateway) attempt(ctx context.Context, in *http.Request, d route.Result,
 //
 // 429 与 401/402/403 同等对待：该 Key 的额度/限速已不可用，继续轮询它没有意义，
 // 因此同样自动停用（用户可在供应商页重新启用）。
+//
+// 431 也一并纳入：部分上游用 431 Request Header Fields Too Large 表示
+// 账号被封停（响应体形如 {"error":{"message":"Account Suspension"}}），
+// 本质上是该凭证不可再用，与 401/403 同级处理。
 func isKeyFailureStatus(status int) bool {
 	switch status {
 	case http.StatusUnauthorized, // 401 凭证无效
-		http.StatusPaymentRequired, // 402 欠费
-		http.StatusForbidden,       // 403 无权限
-		http.StatusTooManyRequests: // 429 限速/配额耗尽
+		http.StatusPaymentRequired,             // 402 欠费
+		http.StatusForbidden,                   // 403 无权限
+		http.StatusTooManyRequests,             // 429 限速/配额耗尽
+		http.StatusRequestHeaderFieldsTooLarge: // 431 账号封停（部分上游如此返回）
 		return true
 	}
 	return false
