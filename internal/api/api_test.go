@@ -844,6 +844,97 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 }
 
+// TestImportRestoresDisabledProviderAndKeys 覆盖「导出时 Key 已全部自动停用」的恢复场景：
+// 停用的供应商及其 Key（enabled=false）都应完整导入并在控制台正常显示，
+// 快照重建也不能因为该供应商没有可用 Key 而失败。
+func TestImportRestoresDisabledProviderAndKeys(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+	ctx := context.Background()
+
+	payload := map[string]any{
+		"providers": []any{
+			map[string]any{
+				"id": "p_disabled", "name": "全是停用 Key", "openai_base_url": h.upstreamURL + "/v1",
+				"enabled": false, "allow_internal": true,
+				"models_selected": []string{"m-legacy"},
+				"keys": []any{
+					map[string]any{"label": "旧一", "api_key": "sk-disabled-1", "enabled": false},
+					map[string]any{"label": "旧二", "api_key": "sk-disabled-2", "enabled": false},
+				},
+			},
+			map[string]any{
+				"id": "p_ok", "name": "正常供应商", "openai_base_url": h.upstreamURL + "/v1",
+				"enabled":         true,
+				"allow_internal":  true,
+				"models_selected": []string{"m1"},
+				"keys":            []any{map[string]any{"api_key": "sk-enabled", "enabled": true}},
+			},
+		},
+	}
+	code, body, raw := h.do(client, http.MethodPost, "/api/import", payload)
+	if code != http.StatusOK {
+		t.Fatalf("导入状态码 = %d（%s）", code, raw)
+	}
+	if body["imported"].(float64) != 2 {
+		t.Errorf("imported = %v, 期望 2", body["imported"])
+	}
+
+	rec, err := h.store.GetProvider(ctx, "p_disabled")
+	if err != nil {
+		t.Fatalf("停用的供应商应被导入: %v", err)
+	}
+	if rec.Enabled {
+		t.Error("供应商的停用状态应保留")
+	}
+	if len(rec.Keys) != 2 {
+		t.Fatalf("停用的 Key 应全部导入，实际 %d 个", len(rec.Keys))
+	}
+	for _, k := range rec.Keys {
+		if k.Enabled {
+			t.Errorf("Key %q 的停用状态应保留", k.Label)
+		}
+	}
+	if rec.Keys[0].Label != "旧一" || rec.Keys[1].Label != "旧二" {
+		t.Errorf("Key 顺序/备注名应保留: %+v", rec.Keys)
+	}
+
+	// 控制台列表要能正常显示停用的供应商及其全部 Key。
+	code, body, raw = h.do(client, http.MethodGet, "/api/providers", nil)
+	if code != http.StatusOK {
+		t.Fatalf("供应商列表状态码 = %d（%s）", code, raw)
+	}
+	items, _ := body["items"].([]any)
+	found := false
+	for _, it := range items {
+		item := it.(map[string]any)
+		if item["id"] != "p_disabled" {
+			continue
+		}
+		found = true
+		if item["enabled"].(bool) {
+			t.Error("列表中的供应商应显示为停用")
+		}
+		keys, _ := item["keys"].([]any)
+		if len(keys) != 2 {
+			t.Fatalf("列表应展示全部 Key，实际 %d 个", len(keys))
+		}
+		for _, k := range keys {
+			if k.(map[string]any)["enabled"].(bool) {
+				t.Error("列表中的 Key 应显示为停用")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("供应商列表应包含停用的供应商")
+	}
+
+	// 导入内部已重建过快照；这里再显式重建一次，锁住「零可用 Key 不阻断快照」的行为。
+	if _, err := buildSnapshot(ctx, h.store, h.master); err != nil {
+		t.Fatalf("存在全部 Key 停用的供应商时快照重建不应失败: %v", err)
+	}
+}
+
 func TestProviderListIncludesFetchStatusAndCandidates(t *testing.T) {
 	h := newHarness(t, "")
 	client := newClient(t)

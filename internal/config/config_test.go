@@ -458,4 +458,16 @@ func TestNormalizeRequiresEnabledKeyForBootstrap(t *testing.T) {
 	if _, err := f.NormalizeAllowEmpty(); err != nil {
 		t.Fatalf("运行时快照不应拒绝全部 Key 停用: %v", err)
 	}
+
+	// 从数据库装载时只解密启用的 Key：全部停用的供应商在运行时快照里是空凭证集合。
+	// 这类供应商已经联动停用（DESIGN §7.10），不应让快照重建失败。
+	empty := File{Providers: []Provider{{
+		ID: "a", Name: "a", OpenAIBaseURL: "http://x/v1", Enabled: boolPtr(false),
+	}}}
+	if _, err := empty.NormalizeAllowEmpty(); err != nil {
+		t.Fatalf("运行时快照不应拒绝没有可用 Key 的停用供应商: %v", err)
+	}
+	if _, err := empty.Normalize(); err == nil {
+		t.Fatal("引导配置仍应拒绝没有 Key 的供应商")
+	}
 }

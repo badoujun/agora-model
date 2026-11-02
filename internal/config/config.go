@@ -456,8 +456,13 @@ func (f File) normalize(requireProviders bool) (File, error) {
 		if err := p.ValidateModelSelection(); err != nil {
 			return File{}, err
 		}
-		if err := p.ValidateKeys(); err != nil {
-			return File{}, err
+		// 运行时快照只装载启用的 Key：某供应商的 Key 全部被自动停用后，它会以
+		// 空凭证集合出现在这里（供应商随之联动停用，见 DESIGN §7.10）。宽松模式
+		// 必须放行，否则一次自动停用就会让快照重建失败；引导配置仍要求至少一个 Key。
+		if len(p.APIKeys) > 0 || requireProviders {
+			if err := p.ValidateKeys(); err != nil {
+				return File{}, err
+			}
 		}
 		if requireProviders {
 			// 引导配置由人手写：要求每个供应商确实有可用凭证，避免把空配置带进库。
