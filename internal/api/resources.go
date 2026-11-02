@@ -68,6 +68,9 @@ type providerDTO struct {
 	CandidateModels []string `json:"candidate_models,omitempty"`
 	LastFetchAt     string   `json:"last_fetch_at,omitempty"`
 	LastFetchError  string   `json:"last_fetch_error,omitempty"`
+	// Warning 用于「配置已写入数据库，但运行时快照重建失败」这类部分成功：
+	// 不把操作报成失败（避免用户重复提交），但必须让控制台看到对外视图未生效。
+	Warning string `json:"warning,omitempty"`
 }
 
 // providerKeyInput 是创建/更新请求里的单个凭证。
@@ -256,10 +259,12 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	_ = s.applyReload(ctx)
+	warning := s.reloadAfterProviderChange(ctx, "创建供应商")
 
 	refreshed, _ := s.store.GetProvider(ctx, rec.ID)
-	writeJSON(w, http.StatusCreated, toDTO(refreshed, nil, nil))
+	dto := toDTO(refreshed, nil, nil)
+	dto.Warning = warning
+	writeJSON(w, http.StatusCreated, dto)
 }
 
 func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
@@ -282,7 +287,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	_ = s.applyReload(ctx)
+	warning := s.reloadAfterProviderChange(ctx, "更新供应商")
 
 	rec, err := s.store.GetProvider(ctx, id)
 	if err != nil {
@@ -290,7 +295,9 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidates, _, _ := s.store.LoadCandidateModels(ctx, id)
-	writeJSON(w, http.StatusOK, toDTO(rec, candidates, s.keyUsage(ctx, id)))
+	dto := toDTO(rec, candidates, s.keyUsage(ctx, id))
+	dto.Warning = warning
+	writeJSON(w, http.StatusOK, dto)
 }
 
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
@@ -306,8 +313,25 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "删除供应商失败", err)
 		return
 	}
-	_ = s.applyReload(ctx)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	warning := s.reloadAfterProviderChange(ctx, "删除供应商")
+	resp := map[string]any{"ok": true}
+	if warning != "" {
+		resp["warning"] = warning
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// reloadAfterProviderChange 在供应商写入数据库后重建运行时快照。
+//
+// 此时变更已经落库，把请求整体报成失败会让用户以为没保存而反复重试；但若像
+// 以前那样静默丢弃错误，数据面会一直沿用旧快照（对外模型列表不更新），现场
+// 也无从排查。这里记录日志并把提示交给调用方随成功响应一起返回。
+func (s *Server) reloadAfterProviderChange(ctx context.Context, action string) string {
+	if err := s.applyReload(ctx); err != nil {
+		s.logger.Error("重建配置快照失败：对外模型列表仍使用旧配置", "action", action, "err", err)
+		return fmt.Sprintf("变更已写入，但运行时快照重建失败：%v；对外模型列表可能未及时更新，请检查数据面日志", err)
+	}
+	return ""
 }
 
 func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
@@ -715,6 +739,11 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	snap := s.holder.Get()
 	items := make([]entry, 0, 32)
 	for _, p := range snap.Providers() {
+		// 与对外 /v1/models 保持一致：没有可用 Key 的供应商无法转发，
+		// 不应出现在可调用模型清单里，否则调用方选中后才被拒绝。
+		if !p.HasUsableKey() {
+			continue
+		}
 		for _, model := range p.Models {
 			exposed := p.ExposedModel(model)
 			item := entry{

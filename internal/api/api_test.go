@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -648,6 +649,136 @@ func TestModelsListUsesNamespaceIdentifiers(t *testing.T) {
 	}
 	if shared != 2 {
 		t.Fatalf("两个供应商各应有一条命名空间条目: %v", seen)
+	}
+}
+
+// TestSnapshotFollowsAutoDisableAndNewProviders 复现线上故障：
+// 一个供应商的 Key 全部被自动停用（供应商联动停用）后，快照重建不能失败；
+// 它必须从对外模型列表消失，而之后新增的供应商必须立即出现。
+func TestSnapshotFollowsAutoDisableAndNewProviders(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+	ctx := context.Background()
+
+	// 即将因上游封停而被自动停用的供应商。
+	code, body, raw := h.do(client, http.MethodPost, "/api/providers", map[string]any{
+		"name":            "SC-OLD",
+		"openai_base_url": h.upstreamURL + "/v1",
+		"api_key":         "sk-old-aaaaaaaaaaaa",
+		"models_selected": []string{"old-model"},
+		"allow_internal":  true,
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("创建旧供应商状态码 = %d（%s）", code, raw)
+	}
+	oldID, _ := body["id"].(string)
+	keys, _ := body["keys"].([]any)
+	if oldID == "" || len(keys) != 1 {
+		t.Fatalf("创建结果缺少 id/keys: %v", body)
+	}
+	keyID := keys[0].(map[string]any)["id"].(string)
+
+	// 模拟网关收到 431 后自动停用唯一 Key：同一事务里供应商应联动停用。
+	if err := h.store.DisableProviderKey(ctx, keyID, "HTTP 431: Account Suspension"); err != nil {
+		t.Fatalf("自动停用 Key 失败: %v", err)
+	}
+	rec, err := h.store.GetProvider(ctx, oldID)
+	if err != nil {
+		t.Fatalf("读取旧供应商失败: %v", err)
+	}
+	if rec.Enabled {
+		t.Fatal("最后一个 Key 停用后供应商应联动停用")
+	}
+
+	// v0.8.1 在这里会因「没有启用的 Key」拒绝构建快照，导致快照永久冻结。
+	snap, err := buildSnapshot(ctx, h.store, h.master)
+	if err != nil {
+		t.Fatalf("存在全 Key 停用的供应商时快照重建失败: %v", err)
+	}
+	if _, ok := snap.Provider(oldID); !ok {
+		t.Fatal("停用供应商仍应保留在快照的 id 索引中（供历史解析）")
+	}
+	for _, p := range snap.Providers() {
+		if p.ID == oldID {
+			t.Fatal("停用的供应商不应出现在启用供应商列表里")
+		}
+	}
+
+	// 新增供应商（对应线上的 SCNet）：随后的快照重建必须让它和它的模型可见。
+	code, _, raw = h.do(client, http.MethodPost, "/api/providers", map[string]any{
+		"name":            "SCNet",
+		"openai_base_url": h.upstreamURL + "/v1",
+		"api_key":         "sk-new-bbbbbbbbbbbb",
+		"models_selected": []string{"new-model"},
+		"allow_internal":  true,
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("创建新供应商状态码 = %d（%s）", code, raw)
+	}
+
+	code, body, raw = h.do(client, http.MethodGet, "/api/models", nil)
+	if code != http.StatusOK {
+		t.Fatalf("模型列表状态码 = %d（%s）", code, raw)
+	}
+	seen := map[string]bool{}
+	for _, item := range body["items"].([]any) {
+		seen[item.(map[string]any)["model"].(string)] = true
+	}
+	if !seen["SCNet/new-model"] {
+		t.Fatalf("新增供应商的模型应立即出现在列表里: %v", seen)
+	}
+	if seen["SC-OLD/old-model"] {
+		t.Fatalf("已停用的供应商不应继续出现在列表里: %v", seen)
+	}
+}
+
+// TestModelsListSkipsProvidersWithoutUsableKey 锁定管理端列表与 /v1/models 的口径：
+// 启用了供应商但没有可用 Key 时，它无法转发，也不应出现在可调用模型清单里。
+func TestModelsListSkipsProvidersWithoutUsableKey(t *testing.T) {
+	h := newHarness(t, "")
+	client := newClient(t)
+
+	enabled, keyDisabled := true, false
+	snap, err := config.NewSnapshotWithScopes(config.File{Providers: []config.Provider{{
+		ID:            "p_no_key",
+		Name:          "无可用 Key",
+		OpenAIBaseURL: "http://upstream.example/v1",
+		Models:        []string{"m1"},
+		Enabled:       &enabled,
+		APIKeys:       []config.ProviderKey{{Label: "停用", Key: "sk-disabled", Enabled: &keyDisabled}},
+	}}}, nil)
+	if err != nil {
+		t.Fatalf("构建快照失败: %v", err)
+	}
+	h.holder.Store(snap)
+
+	code, body, raw := h.do(client, http.MethodGet, "/api/models", nil)
+	if code != http.StatusOK {
+		t.Fatalf("模型列表状态码 = %d（%s）", code, raw)
+	}
+	if items, _ := body["items"].([]any); len(items) != 0 {
+		t.Fatalf("没有可用 Key 的供应商不应出现在模型列表里: %v", items)
+	}
+}
+
+// TestReloadFailureIsReported 锁定：供应商已写入时，快照重建失败不能静默——
+// 必须记录错误并把提示带回控制台，否则对外模型列表会一直显示旧配置。
+func TestReloadFailureIsReported(t *testing.T) {
+	h := newHarness(t, "")
+	s := New(Options{
+		Store:  h.store,
+		Master: h.master,
+		Holder: h.holder,
+		Reload: func(context.Context) (*config.Snapshot, error) {
+			return nil, errors.New("模拟快照重建失败")
+		},
+	})
+	msg := s.reloadAfterProviderChange(context.Background(), "创建供应商")
+	if !strings.Contains(msg, "模拟快照重建失败") {
+		t.Fatalf("重建失败应返回给控制台的提示，得到 %q", msg)
+	}
+	if !strings.Contains(msg, "对外模型列表可能未及时更新") {
+		t.Fatalf("提示应说明对外视图未生效，得到 %q", msg)
 	}
 }
 

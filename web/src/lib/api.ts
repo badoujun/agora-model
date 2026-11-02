@@ -99,7 +99,9 @@ export const api = {
       body: JSON.stringify(body),
     }),
   deleteProvider: (id: string) =>
-    request<{ ok: boolean }>(`/api/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    request<{ ok: boolean; warning?: string }>(`/api/providers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
   testProvider: (id: string) =>
     request<TestResult>(`/api/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
   /** 只测试某一个已保存的凭证（含已停用的 Key） */

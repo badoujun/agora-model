@@ -55,6 +55,8 @@ export interface ProviderDTO {
   candidate_models?: string[]
   last_fetch_at?: string
   last_fetch_error?: string
+  /** 配置已写入但运行时快照重建失败时的提示（对外模型列表可能未更新） */
+  warning?: string
 }
 
 /** 创建/更新请求里的单个凭证；id 为空表示新增（必须给明文）。 */

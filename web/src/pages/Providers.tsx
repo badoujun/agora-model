@@ -279,21 +279,23 @@ export function ProvidersPage() {
     onSuccess: async (saved, variables) => {
       await invalidateAll()
       setDialogOpen(false)
-      toast.show(
-        variables.id
-          ? `已保存供应商「${saved.name || saved.id}」`
-          : `已创建「${saved.name || saved.id}」${saved.model_count === 0 ? '：还没有启用模型，可在编辑页拉取并勾选' : ''}`,
-        'success',
-      )
+      const base = variables.id
+        ? `已保存供应商「${saved.name || saved.id}」`
+        : `已创建「${saved.name || saved.id}」${saved.model_count === 0 ? '：还没有启用模型，可在编辑页拉取并勾选' : ''}`
+      // 写入成功但快照重建失败时对外模型列表仍是旧配置，必须显式提示。
+      toast.show(base + (saved.warning ? `；${saved.warning}` : ''), saved.warning ? 'error' : 'success')
     },
     onError: (err: Error) => setFormError(err instanceof ApiError ? err.message : String(err)),
   })
 
   const remove = useMutation({
     mutationFn: api.deleteProvider,
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       await invalidateAll()
-      toast.show('已删除供应商', 'success')
+      toast.show(
+        result.warning ? `已删除供应商；${result.warning}` : '已删除供应商',
+        result.warning ? 'error' : 'success',
+      )
     },
     onError: (err: Error) => toast.show(`删除失败：${err.message}`, 'error'),
   })
